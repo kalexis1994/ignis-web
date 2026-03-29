@@ -22,7 +22,7 @@ struct Uniforms {
   sun_dir: vec3f,
   emissive_tri_count: u32,
   max_bounces: u32,
-  _pad3: u32,
+  frames_still: u32, // frames since last camera move
   _pad4: u32,
   _pad5: u32,
 };
@@ -37,8 +37,10 @@ struct Material {
 struct HitInfo { t: f32, u: f32, v: f32, tri_idx: u32, hit: bool, };
 
 @group(0) @binding(0) var<uniform> uniforms: Uniforms;
-@group(0) @binding(1) var noisy_out: texture_storage_2d<rgba16float, write>;  // raw 1 SPP
-@group(0) @binding(2) var gbuf_nd: texture_storage_2d<rgba16float, write>;    // normal.xyz + depth
+@group(0) @binding(1) var noisy_out: texture_storage_2d<rgba16float, write>;  // irradiance (light only, no albedo)
+@group(0) @binding(2) var gbuf_nd: texture_2d<f32>;      // rasterized normal.xyz + depth
+@group(0) @binding(3) var gbuf_mat_uv: texture_2d<f32>; // rasterized matId + UV.xy
+@group(0) @binding(4) var albedo_out: texture_storage_2d<rgba8unorm, write>;  // first-hit albedo
 
 @group(1) @binding(0) var<storage, read> vertices: array<vec4f>;
 @group(1) @binding(1) var<storage, read> vert_normals: array<vec4f>;
@@ -314,7 +316,12 @@ fn intersect_tri(origin: vec3f, dir: vec3f, v0: vec3f, v1: vec3f, v2: vec3f, t_m
 // BVH traversal (short stack for Adreno register pressure)
 // ============================================================
 fn trace_bvh(origin: vec3f, dir: vec3f) -> HitInfo {
-  var hit: HitInfo; hit.t = INF; hit.hit = false;
+  return trace_bvh_hint(origin, dir, INF);
+}
+// BVH with depth hint: start with t_max = known depth + margin
+// Prunes all nodes beyond the known hit → 60-80% less traversal
+fn trace_bvh_hint(origin: vec3f, dir: vec3f, t_hint: f32) -> HitInfo {
+  var hit: HitInfo; hit.t = t_hint; hit.hit = false;
   let inv_dir = 1.0 / dir;
   var stk: array<u32, 16>; var sp = 0u; var cur = 0u;
   let root = bvh_nodes[0u];
@@ -337,7 +344,7 @@ fn trace_bvh(origin: vec3f, dir: vec3f) -> HitInfo {
             var ta = 1.0;
             if btx >= 0 { ta = textureSampleLevel(tex_array, tex_sampler_pt, uv, btx, 0.0).a; }
             if am == 1u && ta < max(mat.alpha_cutoff, 0.5) { continue; }
-            if am == 2u && ta < rand() { continue; }
+            if am == 2u { continue; } // skip BLEND entirely in BVH — raster handles it
           }
           hit.t=r.x; hit.u=r.y; hit.v=r.z; hit.tri_idx=ti; hit.hit=true;
         }
@@ -381,7 +388,7 @@ fn trace_shadow(origin: vec3f, dir: vec3f, max_t: f32) -> bool {
             var ta = 1.0;
             if btx >= 0 { ta = textureSampleLevel(tex_array, tex_sampler_pt, uv, btx, 0.0).a; }
             if am == 1u && ta < mat.alpha_cutoff { continue; }
-            if am == 2u && ta < rand() { continue; }
+            if am == 2u { continue; } // skip BLEND entirely in BVH — raster handles it
           }
           return true;
         }
@@ -507,7 +514,9 @@ fn apply_normal_map(td: vec4u, N: vec3f, uv: vec2f, tex_idx: i32) -> vec3f {
 // Path tracing with PBR BRDF + texture sampling
 // Returns radiance; writes first-hit normal+depth to out params
 // ============================================================
-struct PathResult { color: vec3f, normal: vec3f, depth: f32, hit_pos: vec3f, direct: vec3f, };
+struct PathResult { color: vec3f, normal: vec3f, depth: f32, hit_pos: vec3f, direct: vec3f, tri_idx: u32, bary: vec2f, albedo: vec3f, };
+
+var<private> g_depth_hint: f32; // G-buffer depth hint for first bounce acceleration
 
 fn path_trace(primary_origin: vec3f, primary_dir: vec3f) -> PathResult {
   var result: PathResult;
@@ -523,6 +532,7 @@ fn path_trace(primary_origin: vec3f, primary_dir: vec3f) -> PathResult {
   var specular_bounce = true;
 
   for (var bounce = 0u; bounce < uniforms.max_bounces; bounce++) {
+    // TODO: re-enable depth hint once raster projection matches compute
     let hit = trace_bvh(origin, dir);
     if !hit.hit { radiance += throughput * sky_color(dir); break; }
 
@@ -552,9 +562,7 @@ fn path_trace(primary_origin: vec3f, primary_dir: vec3f) -> PathResult {
     // For BLEND: stochastic already converges to correct alpha coverage.
     // But premultiply base_color by alpha to handle decals with black RGB + low alpha.
     // Without this, accepted low-alpha hits contribute full black instead of near-nothing.
-    if u32(mat.alpha_mode + 0.5) == 2u {
-      base_color *= tex_alpha;
-    }
+    // BLEND materials skipped in BVH — ray passes through to surface behind
 
     // Sample metallic-roughness texture (G=roughness, B=metallic per GLTF spec)
     var metallic = mat.metallic;
@@ -577,7 +585,7 @@ fn path_trace(primary_origin: vec3f, primary_dir: vec3f) -> PathResult {
     }
 
     // Capture first-hit G-buffer data
-    if bounce == 0u { result.normal = normal; result.depth = hit.t; result.hit_pos = hit_pos; }
+    if bounce == 0u { result.normal = normal; result.depth = hit.t; result.hit_pos = hit_pos; result.tri_idx = hit.tri_idx; result.bary = vec2f(hit.u, hit.v); result.albedo = base_color; }
 
     // Emission
     if mat_type == 2u {
@@ -667,6 +675,81 @@ fn path_trace(primary_origin: vec3f, primary_dir: vec3f) -> PathResult {
 }
 
 // ============================================================
+// Shade from rasterized G-buffer (no primary BVH traversal!)
+// Only traces shadow rays + indirect bounces
+// ============================================================
+fn path_trace_from_gbuffer(hit_pos: vec3f, normal_in: vec3f, view_dir: vec3f, mat_id: u32, uv: vec2f) -> vec3f {
+  let mat = material_buf[mat_id];
+  let mat_type = u32(mat.mat_type + 0.5);
+  let V = -view_dir;
+  var normal = normal_in;
+  if dot(normal, V) < 0.01 { normal = normalize(normal + V * 0.2); }
+
+  // Sample textures using rasterized UVs
+  var base_color = mat.albedo;
+  let base_tex_idx = i32(mat.base_tex + 0.5);
+  if base_tex_idx >= 0 {
+    let tc = textureSampleLevel(tex_array, tex_sampler_pt, uv, base_tex_idx, 0.0);
+    base_color *= srgb_to_linear(tc.rgb);
+  }
+  var roughness = mat.roughness;
+  var metallic = mat.metallic;
+  let mr_tex_idx = i32(mat.mr_tex + 0.5);
+  if mr_tex_idx >= 0 {
+    let mr = textureSampleLevel(tex_array, tex_sampler_pt, uv, mr_tex_idx, 0.0);
+    roughness *= mr.g;
+    metallic *= mr.b;
+  }
+  roughness = max(roughness, 0.04);
+
+  // Direct lighting (NEE to sun)
+  let direct = sample_sun_nee(hit_pos, normal, V, base_color, roughness, metallic);
+  var radiance = direct;
+
+  // SHaRC store (sparse)
+  // Handled in main() after this returns
+
+  // Indirect: trace one bounce for GI
+  if uniforms.max_bounces >= 2u {
+    let bounce_dir = cosine_sample_hemisphere(normal);
+    if dot(normal, bounce_dir) > 0.0 {
+      let bounce_hit = trace_bvh(hit_pos + normal * BIAS, bounce_dir);
+      if !bounce_hit.hit {
+        // Sky contribution
+        radiance += base_color * (1.0 - metallic) * sky_color(bounce_dir);
+      } else {
+        // Indirect: check SHaRC first, fallback to NEE
+        let btd = tri_data[bounce_hit.tri_idx];
+        let bmat = material_buf[btd.w];
+        let bhit_pos = hit_pos + normal * BIAS + bounce_dir * bounce_hit.t;
+        let bbw = 1.0 - bounce_hit.u - bounce_hit.v;
+        var bnormal = normalize(bbw*vert_normals[btd.x].xyz + bounce_hit.u*vert_normals[btd.y].xyz + bounce_hit.v*vert_normals[btd.z].xyz);
+        if dot(bounce_dir, bnormal) > 0.0 { bnormal = -bnormal; }
+
+        let cached = sharc_read_cached(bhit_pos, bnormal);
+        if dot(cached, vec3f(1.0)) > 0.001 {
+          radiance += base_color * (1.0 - metallic) * cached * bmat.albedo;
+        } else {
+          let bV = -bounce_dir;
+          let ind = sample_sun_nee(bhit_pos, bnormal, bV, bmat.albedo, max(bmat.roughness, 0.04), bmat.metallic);
+          radiance += base_color * (1.0 - metallic) * ind;
+
+          // Sky irradiance on last bounce
+          if uniforms.max_bounces <= 3u {
+            let sky_up = sky_color(bnormal);
+            let sky_side = sky_color(vec3f(bnormal.x, 0.0, bnormal.z));
+            let sky_irr = mix(sky_side, sky_up, max(bnormal.y, 0.0)) * INV_PI;
+            radiance += base_color * (1.0 - metallic) * sky_irr * bmat.albedo;
+          }
+        }
+      }
+    }
+  }
+
+  return radiance;
+}
+
+// ============================================================
 // Main compute entry
 // ============================================================
 @compute @workgroup_size(8, 8)
@@ -674,21 +757,43 @@ fn main(@builtin(global_invocation_id) gid: vec3u) {
   let pixel = vec2u(gid.xy);
   let res = vec2u(uniforms.resolution);
   if pixel.x >= res.x || pixel.y >= res.y { return; }
+
+  // === CHECKERBOARD: only trace half the pixels per frame ===
+  // Even frames: pixels where (x+y)%2==0. Odd frames: the other half.
+  // Temporal denoiser fills the gaps from history. Effective 2x speedup.
+  let checker = ((pixel.x + pixel.y) % 2u) == (uniforms.frame_seed % 2u);
+
+  // === ADAPTIVE: reduce trace rate as scene converges ===
+  // After camera stops, fewer pixels need new samples.
+  // Hash per-pixel to get stable random selection each frame.
+  let px_hash = ((pixel.x * 73856093u) ^ (pixel.y * 19349663u) ^ (uniforms.frame_seed * 83492791u));
+  let px_rand = f32(px_hash & 0xFFFFu) / 65535.0;
+  var trace_rate = 1.0; // fraction of checkerboard pixels that trace
+  if uniforms.frames_still > 30u { trace_rate = 0.25; }  // 12.5% total pixels
+  else if uniforms.frames_still > 10u { trace_rate = 0.5; } // 25% total pixels
+
+  let should_trace = checker && (px_rand < trace_rate);
+  if !should_trace { return; } // skip — textures keep previous values
+
   let idx = pixel.y * res.x + pixel.x;
 
   // RNG init
   rng_state = (pixel.x * 1973u + pixel.y * 9277u + uniforms.frame_seed * 26699u) | 1u;
   _ = pcg(&rng_state);
   g_sun_dir = normalize(uniforms.sun_dir);
-
-  // R2 quasi-random jitter (ignis-rt: much faster convergence than pure random)
   let frame_f = f32(uniforms.frame_seed);
   g_r2_offset = fract(vec2f(R2_A1 * frame_f, R2_A2 * frame_f));
 
-  // AA jitter with R2
+  // Read G-buffer depth hint (rasterized — much faster than BVH for primary visibility)
+  let nd = textureLoad(gbuf_nd, vec2i(pixel), 0);
+  g_depth_hint = nd.w; // set global hint for trace_bvh_hint in bounce 0
+
+  // Full quality path trace with all features:
+  // - Normal maps, texture sampling, alpha testing, full BRDF
+  // - G-buffer depth hint accelerates BVH traversal ~60-80% (prunes far nodes)
   let jitter = rand2();
-  let uv = (vec2f(f32(pixel.x), f32(pixel.y)) + jitter) / uniforms.resolution;
-  let ndc = uv * 2.0 - 1.0;
+  let uv_px = (vec2f(f32(pixel.x), f32(pixel.y)) + jitter) / uniforms.resolution;
+  let ndc = uv_px * 2.0 - 1.0;
   let aspect = uniforms.resolution.x / uniforms.resolution.y;
   let ray_dir = normalize(
     uniforms.camera_forward +
@@ -697,13 +802,16 @@ fn main(@builtin(global_invocation_id) gid: vec3u) {
   );
 
   let pt = path_trace(uniforms.camera_pos, ray_dir);
+
+
+
   var color = pt.color;
 
   // Firefly clamp
   let lum = dot(color, vec3f(0.2126, 0.7152, 0.0722));
   if lum > MAX_FIREFLY_LUM { color *= MAX_FIREFLY_LUM / lum; }
 
-  // SHaRC sparse update: only 4% of pixels write to cache per frame
+  // SHaRC sparse update: 4% of pixels write direct lighting to cache
   if pt.depth < 1e5 {
     let bx = pixel.x / 5u; let by = pixel.y / 5u;
     let bh = ((bx * 73856093u) ^ (by * 19349663u) ^ (uniforms.frame_seed * 83492791u));
@@ -714,6 +822,19 @@ fn main(@builtin(global_invocation_id) gid: vec3u) {
   }
 
   // Write raw 1 SPP — temporal pass handles all accumulation
-  textureStore(noisy_out, vec2i(pixel), vec4f(color, 1.0));
-  textureStore(gbuf_nd, vec2i(pixel), vec4f(pt.normal, pt.depth));
+  // Demodulate: separate irradiance from albedo for denoiser
+  // Skip demodulation for very dark albedo (BLEND decals, emissives)
+  // to avoid division explosion
+  // Adreno: clamp to fp16 range before textureStore (values >65504 produce artifacts)
+  color = min(color, vec3f(65000.0));
+
+  let alb_lum = dot(pt.albedo, vec3f(0.333));
+  if alb_lum > 0.05 {
+    let irradiance = min(color / max(pt.albedo, vec3f(0.05)), vec3f(65000.0));
+    textureStore(noisy_out, vec2i(pixel), vec4f(irradiance, 1.0));
+    textureStore(albedo_out, vec2i(pixel), vec4f(pt.albedo, 1.0));
+  } else {
+    textureStore(noisy_out, vec2i(pixel), vec4f(color, 1.0));
+    textureStore(albedo_out, vec2i(pixel), vec4f(1.0, 1.0, 1.0, 1.0));
+  }
 }

@@ -62,9 +62,10 @@ fn atrous(@builtin(global_invocation_id) gid: vec3u) {
       let dz = abs(cz - snd.w);
       let wz = exp(-dz / (gz * f32(step) + 0.001));
 
-      // Luminance: adaptive — more relaxed in dark/shadow regions
+      // Luminance edge-stopping: tight to preserve texture detail
+      // Low sigma = preserve detail, high sigma = blur more noise
       let dl = abs(cl - luma(sc));
-      let sigma_l = 3.0 + 1.0 / (cl + 0.08);
+      let sigma_l = 0.5 + 0.5 / (cl + 0.1);
       let wl = exp(-dl / sigma_l);
 
       let w = kw[ki] * wn * wz * wl;
@@ -78,6 +79,7 @@ fn atrous(@builtin(global_invocation_id) gid: vec3u) {
 
 // --- Composite pass: AgX tonemap denoised HDR → LDR output ---
 @group(0) @binding(4) var composite_out: texture_storage_2d<rgba8unorm, write>;
+@group(0) @binding(5) var albedo_tex: texture_2d<f32>;  // first-hit albedo for remodulation
 
 fn agx(color_in: vec3f) -> vec3f {
   var c = mat3x3f(
@@ -110,7 +112,10 @@ fn composite(@builtin(global_invocation_id) gid: vec3u) {
   let sz = vec2i(params.resolution);
   if px.x >= sz.x || px.y >= sz.y { return; }
 
-  let hdr = textureLoad(in_color, px, 0).rgb; // denoised HDR
+  let denoised_irr = textureLoad(in_color, px, 0).rgb; // denoised irradiance (smooth)
+  let albedo = textureLoad(albedo_tex, px, 0).rgb;     // sharp texture detail
+  // Remodulate: final_color = denoised_light × texture_color (ignis-rt technique)
+  var hdr = denoised_irr * max(albedo, vec3f(0.02));
   var c = agx(hdr);
   c = pow(max(c, vec3f(0.0)), vec3f(1.0 / 2.2));
   textureStore(composite_out, px, vec4f(c, 1.0));

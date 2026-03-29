@@ -43,8 +43,39 @@ async function init() {
     }
   });
   device.onuncapturederror = (e) => rlog('GPU_ERROR: ' + e.error.message);
-  rlog('Canvas format: ' + navigator.gpu.getPreferredCanvasFormat());
-  rlog('Max storage buffers/stage: ' + device.limits.maxStorageBuffersPerShaderStage);
+  // Adreno detection + GPU info logging
+  // GPU detection + profile matching
+  const adapterInfo = adapter.info || (adapter.requestAdapterInfo ? await adapter.requestAdapterInfo() : {});
+  const gpuStr = ((adapterInfo.vendor||'')+ ' ' +(adapterInfo.architecture||'')+' '+(adapterInfo.device||'')).toLowerCase();
+  rlog(`GPU: ${gpuStr}`);
+  rlog(`Format:${navigator.gpu.getPreferredCanvasFormat()} StorageBuf:${device.limits.maxStorageBuffersPerShaderStage} StorageTex:${device.limits.maxStorageTexturesPerShaderStage}`);
+
+  // Load GPU profiles and match
+  let gpuProfile = {};
+  try {
+    const profiles = await fetch('gpu-profiles.json').then(r => r.json());
+    const defaults = profiles.defaults;
+    for (const [name, prof] of Object.entries(profiles.profiles)) {
+      for (const pattern of prof.match) {
+        if (new RegExp(pattern, 'i').test(gpuStr)) {
+          gpuProfile = { ...defaults, ...prof, _name: name };
+          rlog(`GPU profile matched: ${name} (${prof.match[0]})`);
+          break;
+        }
+      }
+      if (gpuProfile._name) break;
+    }
+    if (!gpuProfile._name) {
+      gpuProfile = { ...defaults, _name: 'default' };
+      rlog('No GPU profile matched, using defaults');
+    }
+    if (gpuProfile.quirks?.length) rlog('Quirks: ' + gpuProfile.quirks.join(', '));
+  } catch(e) {
+    rlog('GPU profiles not loaded: ' + e.message);
+    gpuProfile = { _name: 'fallback' };
+  }
+  const isAdreno = gpuStr.includes('qualcomm') || gpuStr.includes('adreno');
+  device.onuncapturederror = (e) => rlog('GPU_ERROR: ' + e.error.message);
   device.lost.then(info => rlog('DEVICE_LOST: ' + info.message));
 
   // --- Load scene ---
@@ -57,9 +88,16 @@ async function init() {
     console.error(e);
     return;
   }
+  // Validate scene has rasterization data (invalidate stale cache)
+  if (!scene.rasterIndices || !scene.vertMatIds) {
+    rlog('Stale cache detected — clearing and reloading...');
+    try { indexedDB.deleteDatabase('ignis-scene-cache'); } catch(e) {}
+    info.textContent = 'Cache outdated, reloading...';
+    setTimeout(() => location.reload(), 500);
+    return;
+  }
   const stats = scene.stats;
   rlog('Scene loaded:', stats);
-  rlog('TriFlat:', scene.gpuTriFlat.byteLength, 'bytes | BVH:', scene.gpuBVHNodes.byteLength, 'bytes');
 
   // --- Resolution setup (FSR modes) ---
   const canvas = document.getElementById('canvas');
@@ -75,14 +113,16 @@ async function init() {
   };
   // Read config from splash screen (or defaults)
   const cfg = window.IGNIS_CONFIG || {};
-  let fsrMode = cfg.fsrMode || location.hash.replace('#','') || 'balanced';
+  const isMobile = isAdreno || /Android|iPhone|iPad/i.test(navigator.userAgent);
+  // User config overrides GPU profile, which overrides defaults
+  let fsrMode = cfg.fsrMode || gpuProfile.fsrMode || 'balanced';
   if (!FSR_MODES[fsrMode]) fsrMode = 'balanced';
-  const displayCap = cfg.displayCap || 1080;
-  const texSize = cfg.texSize ?? 512;
-  const denoiseMode = cfg.denoise || 'full';
-  const maxBounces = cfg.bounces || 2;
-  const sppPerFrame = cfg.spp || 1;
-  const sharcEnabled = cfg.sharc !== false;
+  const displayCap = cfg.displayCap || gpuProfile.displayCap || 1080;
+  const texSize = cfg.texSize ?? gpuProfile.texSize ?? 512;
+  const denoiseMode = cfg.denoise || gpuProfile.denoise || 'full';
+  const maxBounces = cfg.bounces || gpuProfile.maxBounces || 2;
+  const sppPerFrame = cfg.spp || gpuProfile.spp || 1;
+  const sharcEnabled = cfg.sharc !== undefined ? cfg.sharc : (gpuProfile.sharc !== false);
   rlog(`Config: fsr=${fsrMode} display=${displayCap}p tex=${texSize} denoise=${denoiseMode} bounces=${maxBounces} spp=${sppPerFrame} sharc=${sharcEnabled}`);
 
   // Display resolution — capped by user preference
@@ -103,21 +143,23 @@ async function init() {
 
   // --- Load shaders ---
   const v = Date.now(); // cache bust
-  const [ptCode, dispCode, fsrCode, dnCode, tmpCode] = await Promise.all([
+  const [ptCode, dispCode, fsrCode, dnCode, tmpCode, gbCode] = await Promise.all([
     fetch(`pathtracer.wgsl?v=${v}`).then(r => r.text()),
     fetch(`display.wgsl?v=${v}`).then(r => r.text()),
     fetch(`fsr.wgsl?v=${v}`).then(r => r.text()),
     fetch(`denoise.wgsl?v=${v}`).then(r => r.text()),
     fetch(`temporal.wgsl?v=${v}`).then(r => r.text()),
+    fetch(`gbuffer.wgsl?v=${v}`).then(r => r.text()),
   ]);
   const ptModule = device.createShaderModule({ code: ptCode });
   const dispModule = device.createShaderModule({ code: dispCode });
   const fsrModule = device.createShaderModule({ code: fsrCode });
   const dnModule = device.createShaderModule({ code: dnCode });
   const tmpModule = device.createShaderModule({ code: tmpCode });
+  const gbModule = device.createShaderModule({ code: gbCode });
 
   // Check shader compilation
-  for (const [name, mod] of [['pathtracer',ptModule],['display',dispModule],['fsr',fsrModule],['denoise',dnModule],['temporal',tmpModule]]) {
+  for (const [name, mod] of [['pathtracer',ptModule],['display',dispModule],['fsr',fsrModule],['denoise',dnModule],['temporal',tmpModule],['gbuffer',gbModule]]) {
     const ci = await mod.getCompilationInfo();
     for (const m of ci.messages) {
       if (m.type === 'error') {
@@ -142,8 +184,53 @@ async function init() {
   // --- Internal textures ---
   const F16 = GPUTextureUsage.STORAGE_BINDING | GPUTextureUsage.TEXTURE_BINDING;
   const F16C = F16 | GPUTextureUsage.COPY_SRC | GPUTextureUsage.COPY_DST; // copyable
-  const noisyTex = device.createTexture({ size:[width,height], format:'rgba16float', usage:F16 });   // PT 1spp raw
-  const ndTex    = device.createTexture({ size:[width,height], format:'rgba16float', usage:F16 });   // normal+depth
+  const F16R = F16 | GPUTextureUsage.RENDER_ATTACHMENT; // rasterization target
+  const noisyTex = device.createTexture({ size:[width,height], format:'rgba16float', usage:F16 }); // irradiance
+  const albedoTex = device.createTexture({ size:[width,height], format:'rgba8unorm',
+    usage: GPUTextureUsage.STORAGE_BINDING | GPUTextureUsage.TEXTURE_BINDING }); // first-hit albedo
+  const ndTex    = device.createTexture({ size:[width,height], format:'rgba16float', usage:F16R });  // raster writes normal+matId
+  const matIdTex = device.createTexture({ size:[width,height], format:'rgba16float',
+    usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.TEXTURE_BINDING }); // matId + fract(UV)
+  const zBuf = device.createTexture({ size:[width,height], format:'depth32float',
+    usage: GPUTextureUsage.RENDER_ATTACHMENT }); // Z-test only
+
+  // --- Rasterization pipeline (G-buffer) ---
+  const gbufUniformBuf = device.createBuffer({ size: 80, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST }); // mat4x4 + vec3 + pad = 80
+  const posVB = createGPUBuffer(device, scene.gpuPositions, GPUBufferUsage.VERTEX);
+  const nrmVB = createGPUBuffer(device, scene.gpuNormals, GPUBufferUsage.VERTEX);
+  const matIdVB = createGPUBuffer(device, scene.vertMatIds, GPUBufferUsage.VERTEX);
+  const indexBuf = createGPUBuffer(device, scene.rasterIndices, GPUBufferUsage.INDEX);
+  const triCount = stats.triangles;
+
+  const gbufBGL = device.createBindGroupLayout({ entries: [
+    { binding: 0, visibility: GPUShaderStage.VERTEX | GPUShaderStage.FRAGMENT, buffer: { type: 'uniform' } },
+    { binding: 1, visibility: GPUShaderStage.FRAGMENT, buffer: { type: 'read-only-storage' } },
+    { binding: 2, visibility: GPUShaderStage.FRAGMENT, texture: { sampleType: 'float', viewDimension: '2d-array' } },
+    { binding: 3, visibility: GPUShaderStage.FRAGMENT, sampler: { type: 'filtering' } },
+  ]});
+  // gbufBG created after texture array is loaded (below)
+
+  const gbufPipeline = device.createRenderPipeline({
+    layout: device.createPipelineLayout({ bindGroupLayouts: [gbufBGL] }),
+    vertex: {
+      module: gbModule, entryPoint: 'vs',
+      buffers: [
+        { arrayStride: 16, attributes: [{ shaderLocation: 0, offset: 0, format: 'float32x4' }] }, // pos.xyz + uv.x
+        { arrayStride: 16, attributes: [{ shaderLocation: 1, offset: 0, format: 'float32x4' }] }, // normal.xyz + uv.y
+        { arrayStride: 4,  attributes: [{ shaderLocation: 2, offset: 0, format: 'float32' }] },    // matId
+      ],
+    },
+    fragment: {
+      module: gbModule, entryPoint: 'fs',
+      targets: [
+        { format: 'rgba16float' },  // normal.xyz + depth
+        { format: 'rgba16float' },  // matId + fract(UV)
+      ],
+    },
+    depthStencil: { format: 'depth32float', depthWriteEnabled: true, depthCompare: 'less' },
+    primitive: { topology: 'triangle-list', cullMode: 'none' }, // double-sided
+  });
+  rlog(`Raster pipeline: ${triCount} tris, ${stats.vertices} verts`);
   const hdrTex   = device.createTexture({ size:[width,height], format:'rgba16float', usage:F16 });   // temporal accumulated
   const pingTex  = device.createTexture({ size:[width,height], format:'rgba16float', usage:F16 });   // à-trous ping
   const pongTex  = device.createTexture({ size:[width,height], format:'rgba16float', usage:F16 });   // à-trous pong
@@ -177,18 +264,19 @@ async function init() {
   device.queue.writeBuffer(fsrParamsBuf, 0, fsrParamsData);
 
   // --- Load textures into GPU texture array ---
-  const TEX_SIZE = texSize || 512;
   const texInfo = scene.textureInfo;
   const texCount = texInfo ? texInfo.count : 0;
   let texArray;
 
   if (texCount > 0) {
+    const TEX_SIZE = texSize || 512;
+
     texArray = device.createTexture({
       size: [TEX_SIZE, TEX_SIZE, texCount],
       format: 'rgba8unorm',
       usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST | GPUTextureUsage.RENDER_ATTACHMENT,
     });
-    const BATCH = 6;
+    const BATCH = TEX_SIZE >= 2048 ? 2 : 6; // smaller batches for large textures
     for (let b = 0; b < texCount; b += BATCH) {
       const batch = [];
       for (let i = b; i < Math.min(b + BATCH, texCount); i++) {
@@ -198,7 +286,7 @@ async function init() {
             .then(blob => createImageBitmap(blob, {
               resizeWidth: TEX_SIZE, resizeHeight: TEX_SIZE,
               resizeQuality: 'high',
-              colorSpaceConversion: 'none', // keep raw sRGB bytes, shader converts
+              colorSpaceConversion: 'none',
             }))
             .then(bmp => {
               device.queue.copyExternalImageToTexture(
@@ -222,6 +310,16 @@ async function init() {
     device.queue.writeTexture({ texture: texArray }, new Uint8Array([128,128,128,255]), { bytesPerRow: 4 }, [1,1,1]);
   }
 
+  // Create G-buffer bind group (now that texArray exists)
+  const matBufForGbuf = createGPUBuffer(device, scene.gpuMaterials, GPUBufferUsage.STORAGE);
+  const gbufSampler = device.createSampler({ magFilter: 'linear', minFilter: 'linear' });
+  const gbufBG = device.createBindGroup({ layout: gbufBGL, entries: [
+    { binding: 0, resource: { buffer: gbufUniformBuf } },
+    { binding: 1, resource: { buffer: matBufForGbuf } },
+    { binding: 2, resource: texArray.createView({ dimension: '2d-array' }) },
+    { binding: 3, resource: gbufSampler },
+  ]});
+
   // --- Scene GPU buffers ---
   info.textContent = 'Uploading to GPU...';
   const vtxBuf = createGPUBuffer(device, scene.gpuPositions, GPUBufferUsage.STORAGE);
@@ -236,7 +334,9 @@ async function init() {
     entries: [
       { binding: 0, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'uniform' } },
       { binding: 1, visibility: GPUShaderStage.COMPUTE, storageTexture: { access: 'write-only', format: 'rgba16float' } },
-      { binding: 2, visibility: GPUShaderStage.COMPUTE, storageTexture: { access: 'write-only', format: 'rgba16float' } },
+      { binding: 2, visibility: GPUShaderStage.COMPUTE, texture: { sampleType: 'float' } },
+      { binding: 3, visibility: GPUShaderStage.COMPUTE, texture: { sampleType: 'float' } },
+      { binding: 4, visibility: GPUShaderStage.COMPUTE, storageTexture: { access: 'write-only', format: 'rgba8unorm' } },
     ],
   });
   const bg0 = device.createBindGroup({
@@ -245,6 +345,8 @@ async function init() {
       { binding: 0, resource: { buffer: uniformBuffer } },
       { binding: 1, resource: noisyTex.createView() },
       { binding: 2, resource: ndTex.createView() },
+      { binding: 3, resource: matIdTex.createView() },
+      { binding: 4, resource: albedoTex.createView() },
     ],
   });
 
@@ -444,9 +546,10 @@ async function init() {
     entries: [
       { binding: 0, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'uniform' } },
       { binding: 1, visibility: GPUShaderStage.COMPUTE, texture: { sampleType: 'float' } },
-      { binding: 2, visibility: GPUShaderStage.COMPUTE, storageTexture: { access: 'write-only', format: 'rgba16float' } }, // unused but needed
+      { binding: 2, visibility: GPUShaderStage.COMPUTE, storageTexture: { access: 'write-only', format: 'rgba16float' } },
       { binding: 3, visibility: GPUShaderStage.COMPUTE, texture: { sampleType: 'float' } },
       { binding: 4, visibility: GPUShaderStage.COMPUTE, storageTexture: { access: 'write-only', format: 'rgba8unorm' } },
+      { binding: 5, visibility: GPUShaderStage.COMPUTE, texture: { sampleType: 'float' } }, // albedo for remodulation
     ],
   });
   const dnCompPipeline = device.createComputePipeline({
@@ -480,6 +583,7 @@ async function init() {
     { binding: 2, resource: pongTex.createView() },
     { binding: 3, resource: ndTex.createView() },
     { binding: 4, resource: ptOutputTex.createView() },
+    { binding: 5, resource: albedoTex.createView() },
   ]});
   // Spatial-only: first pass reads noisy directly
   const dnBG_noisy2ping = device.createBindGroup({ layout: dnAtrousLayout, entries: [
@@ -495,6 +599,7 @@ async function init() {
     { binding: 2, resource: pongTex.createView() },
     { binding: 3, resource: ndTex.createView() },
     { binding: 4, resource: ptOutputTex.createView() },
+    { binding: 5, resource: albedoTex.createView() },
   ]});
 
   // --- Display pipeline (reads FSR final output) ---
@@ -522,6 +627,14 @@ async function init() {
     layout: dispBGLayout,
     entries: [
       { binding: 0, resource: ptOutputTex.createView() },
+      { binding: 1, resource: sampler },
+    ],
+  });
+  // DEBUG: raw noisy HDR (no denoise, no FSR, no tonemap)
+  const dispBGRaw = device.createBindGroup({
+    layout: dispBGLayout,
+    entries: [
+      { binding: 0, resource: noisyTex.createView() },
       { binding: 1, resource: sampler },
     ],
   });
@@ -998,7 +1111,7 @@ async function init() {
   }
 
   // --- Render state ---
-  let frameIndex = 0, cameraMoved = false;
+  let frameIndex = 0, cameraMoved = false, framesStill = 0;
   let lastTime = performance.now(), fps = 0, fpsAccum = 0, fpsCount = 0;
 
   function getCameraVectors() {
@@ -1006,6 +1119,36 @@ async function init() {
     const rt = [Math.cos(camera.yaw), 0, -Math.sin(camera.yaw)];
     const up = [-Math.sin(camera.pitch)*Math.sin(camera.yaw), Math.cos(camera.pitch), -Math.sin(camera.pitch)*Math.cos(camera.yaw)];
     return { forward:fw, right:rt, up };
+  }
+
+  function buildViewProj(cam, fw, rt, up, w, h) {
+    // View matrix (column-major, WebGPU convention)
+    const p = cam.pos;
+    const view = new Float32Array([
+      rt[0], up[0], -fw[0], 0,
+      rt[1], up[1], -fw[1], 0,
+      rt[2], up[2], -fw[2], 0,
+      -(rt[0]*p[0]+rt[1]*p[1]+rt[2]*p[2]),
+      -(up[0]*p[0]+up[1]*p[1]+up[2]*p[2]),
+      (fw[0]*p[0]+fw[1]*p[1]+fw[2]*p[2]),
+      1,
+    ]);
+    // Perspective projection
+    const fov = cam.fov * Math.PI / 180;
+    const asp = w / h;
+    const near = 0.01, far = 200.0;
+    const f = 1 / Math.tan(fov / 2);
+    const proj = new Float32Array(16);
+    proj[0] = f / asp;
+    proj[5] = -f;  // negate Y: match compute shader convention (pixel Y=0 → ndc.y=-1 → camera_up)
+    proj[10] = far / (near - far); proj[11] = -1;
+    proj[14] = (near * far) / (near - far);
+    // viewProj = proj * view (column-major multiply)
+    const vp = new Float32Array(16);
+    for (let c = 0; c < 4; c++)
+      for (let r = 0; r < 4; r++)
+        vp[c*4+r] = proj[r]*view[c*4] + proj[4+r]*view[c*4+1] + proj[8+r]*view[c*4+2] + proj[12+r]*view[c*4+3];
+    return vp;
   }
 
   function updateCamera(dt) {
@@ -1040,13 +1183,42 @@ async function init() {
 
     updateCamera(dt);
 
-    if (cameraMoved) { cameraMoved = false; }
+    if (cameraMoved) { cameraMoved = false; framesStill = 0; } else { framesStill++; }
 
     const {forward, right, up} = getCameraVectors();
     const fovFactor = Math.tan((camera.fov * Math.PI / 180) * 0.5);
     const aspect = width / height;
 
     frameIndex++;
+
+    // --- G-buffer rasterization (replaces primary ray BVH traversal) ---
+    const viewProj = buildViewProj(camera, forward, right, up, width, height);
+    const gbufUd = new Float32Array(20); // mat4x4 + vec3 + pad = 20 floats = 80 bytes
+    gbufUd.set(viewProj, 0);
+    gbufUd[16] = camera.pos[0]; gbufUd[17] = camera.pos[1]; gbufUd[18] = camera.pos[2]; gbufUd[19] = 0;
+    device.queue.writeBuffer(gbufUniformBuf, 0, gbufUd);
+
+    {
+      const encoder = device.createCommandEncoder();
+      const rp = encoder.beginRenderPass({
+        colorAttachments: [
+          { view: ndTex.createView(), loadOp: 'clear', storeOp: 'store', clearValue: {r:0,g:0,b:0,a:65000} },
+          { view: matIdTex.createView(), loadOp: 'clear', storeOp: 'store', clearValue: {r:-1,g:0,b:0,a:0} },
+        ],
+        depthStencilAttachment: {
+          view: zBuf.createView(), depthLoadOp: 'clear', depthStoreOp: 'store', depthClearValue: 1.0,
+        },
+      });
+      rp.setPipeline(gbufPipeline);
+      rp.setBindGroup(0, gbufBG);
+      rp.setVertexBuffer(0, posVB);
+      rp.setVertexBuffer(1, nrmVB);
+      rp.setVertexBuffer(2, matIdVB);
+      rp.setIndexBuffer(indexBuf, 'uint32');
+      rp.drawIndexed(triCount * 3);
+      rp.end();
+      device.queue.submit([encoder.finish()]);
+    }
 
     // Write PT uniforms
     const ud = new ArrayBuffer(uniformBufferSize);
@@ -1062,6 +1234,7 @@ async function init() {
     f32[20] = sun[0]; f32[21] = sun[1]; f32[22] = sun[2];
     u32[23] = stats.emissiveTris;
     u32[24] = maxBounces;
+    u32[25] = framesStill;
     device.queue.writeBuffer(uniformBuffer, 0, ud);
 
     // Write temporal uniforms (current + previous camera)
@@ -1184,9 +1357,10 @@ async function init() {
 
     drawGizmo();
 
+    const tracePercent = framesStill > 30 ? 12 : framesStill > 10 ? 25 : 50;
     info.innerHTML =
       `<b>Ignis</b> | ${FSR_MODES[fsrMode].label}<br>` +
-      `${width}x${height}\u2192${displayWidth}x${displayHeight} FPS:${fps}<br>` +
+      `${width}x${height}\u2192${displayWidth}x${displayHeight} FPS:${fps} Trace:${tracePercent}%<br>` +
       `<span style="font-size:11px">ESC: options | TAB: debug</span>`;
 
     requestAnimationFrame(frame);

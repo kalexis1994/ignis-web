@@ -367,7 +367,7 @@ function buildBVH(positions, triDataArr, triCount, onProgress) {
 // ============================================================
 function openDB() {
   return new Promise((resolve, reject) => {
-    const req = indexedDB.open('ignis-scene-cache', 1);
+    const req = indexedDB.open('ignis-scene-cache', 2); // bump version to invalidate stale cache
     req.onupgradeneeded = () => req.result.createObjectStore('scenes');
     req.onsuccess = () => resolve(req.result);
     req.onerror = () => reject(req.error);
@@ -623,6 +623,34 @@ export async function loadScene(basePath, onProgress) {
 
   onProgress?.(`Scene ready: ${totalTris|0} tris, ${bvh.nodeCount} BVH nodes, ${textureInfo?.count || 0} textures`);
 
+  // --- Rasterization data: separate opaque + blend index buffers ---
+  onProgress?.('Building rasterization buffers...');
+  const opaqueIdx = [];
+  const blendIdx = [];
+  for (let i = 0; i < totalTris; i++) {
+    const td = bvh.sortedTriData;
+    const matIdx = td[i*4+3];
+    const tri = [td[i*4], td[i*4+1], td[i*4+2]];
+    if (matIdx < materials.length && materials[matIdx].alphaMode === 2) {
+      blendIdx.push(...tri);
+    } else {
+      opaqueIdx.push(...tri);
+    }
+  }
+  const rasterIndices = new Uint32Array([...opaqueIdx, ...blendIdx]);
+  const opaqueIndexCount = opaqueIdx.length;
+  const blendIndexCount = blendIdx.length;
+
+  // Per-vertex material ID
+  const vertMatIds = new Float32Array(totalVerts);
+  for (let i = 0; i < totalTris; i++) {
+    const td = bvh.sortedTriData;
+    const matIdx = td[i*4+3];
+    vertMatIds[td[i*4]]   = matIdx;
+    vertMatIds[td[i*4+1]] = matIdx;
+    vertMatIds[td[i*4+2]] = matIdx;
+  }
+
   const result = {
     gpuPositions,
     gpuNormals,
@@ -631,6 +659,8 @@ export async function loadScene(basePath, onProgress) {
     gpuBVHNodes: bvh.nodesF32,
     gpuMaterials,
     gpuEmissiveTris,
+    rasterIndices,
+    vertMatIds,
     textureInfo,
     materialNames,
     stats,

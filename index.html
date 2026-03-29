@@ -173,6 +173,11 @@
     <div class="splash-panel">
       <div class="splash-logo">IGNIS <span>WEB</span></div>
       <div class="splash-sub">WebGPU Path Tracer</div>
+      <div id="splash-gpu" style="text-align:center;margin-bottom:16px;padding:8px 12px;background:rgba(0,255,0,0.05);border:1px solid rgba(0,255,0,0.1);border-radius:6px;">
+        <div style="font-size:10px;text-transform:uppercase;letter-spacing:1px;color:#0a0;margin-bottom:4px;">Detected GPU</div>
+        <div id="splash-gpu-name" style="font-size:13px;color:#fff;">Detecting...</div>
+        <div id="splash-gpu-profile" style="font-size:10px;color:#555;margin-top:2px;"></div>
+      </div>
       <div class="splash-sec">
         <div class="menu-title">Quality Preset</div>
         <div class="splash-row">
@@ -202,6 +207,7 @@
             <option value="256">Low (256px)</option>
             <option value="512" selected>Medium (512px)</option>
             <option value="1024">High (1024px)</option>
+            <option value="2048">Ultra (2048px, original)</option>
           </select>
         </div>
         <div class="splash-row">
@@ -338,6 +344,45 @@
     _log('HTML loaded');
 
     // Splash: collect settings and start renderer on button click
+    // Detect GPU early and show in splash
+    (async function() {
+      try {
+        if (!navigator.gpu) { document.getElementById('splash-gpu-name').textContent = 'WebGPU not available'; return; }
+        var a = await navigator.gpu.requestAdapter({ powerPreference: 'high-performance' });
+        if (!a) { document.getElementById('splash-gpu-name').textContent = 'No GPU adapter'; return; }
+        var info = a.info || (a.requestAdapterInfo ? await a.requestAdapterInfo() : {});
+        var name = [info.vendor, info.architecture, info.device].filter(Boolean).join(' ') || 'Unknown GPU';
+        document.getElementById('splash-gpu-name').textContent = name;
+        // Match profile
+        var profiles = await fetch('gpu-profiles.json').then(function(r){return r.json();});
+        var gpuStr = name.toLowerCase();
+        var matched = null;
+        for (var pn in profiles.profiles) {
+          var p = profiles.profiles[pn];
+          for (var i = 0; i < p.match.length; i++) {
+            if (new RegExp(p.match[i], 'i').test(gpuStr)) { matched = pn; break; }
+          }
+          if (matched) break;
+        }
+        document.getElementById('splash-gpu-profile').textContent = matched
+          ? 'Profile: ' + matched.replace(/_/g, ' ').toUpperCase()
+          : 'No profile matched — using defaults';
+        // Auto-select splash defaults from profile
+        if (matched) {
+          var prof = profiles.profiles[matched];
+          var def = profiles.defaults;
+          var fsr = document.getElementById('splash-fsr');
+          if (prof.fsrMode && fsr) fsr.value = prof.fsrMode;
+          var tex = document.getElementById('splash-tex');
+          if (prof.texSize && tex) tex.value = String(prof.texSize);
+          var bounces = document.getElementById('splash-bounces');
+          if (prof.maxBounces && bounces) bounces.value = String(prof.maxBounces);
+          var display = document.getElementById('splash-display');
+          if (prof.displayCap && display) display.value = String(prof.displayCap);
+        }
+      } catch(e) { document.getElementById('splash-gpu-name').textContent = 'Detection failed'; }
+    })();
+
     document.getElementById('splash-clear-cache').addEventListener('click', function() {
       indexedDB.deleteDatabase('ignis-scene-cache');
       this.textContent = 'Cache cleared!';

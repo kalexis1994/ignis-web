@@ -1,0 +1,1353 @@
+{
+  "_metadata": {
+    "description": "Multi-vendor GPU WebGPU/Vulkan capabilities and limits reference",
+    "compiled": "2026-03-29",
+    "notes": [
+      "WebGPU limits are browser-reported tiers, not raw hardware limits (anti-fingerprinting).",
+      "Vulkan limits from vulkan.gpuinfo.org driver reports.",
+      "WebGPU maxBufferSize/maxStorageBufferBindingSize are spec defaults; request higher via requiredLimits.",
+      "shader-f16 requires VK_KHR_shader_float16_int8 + shaderFloat16 on Vulkan, or native Metal FP16 on Apple.",
+      "Wave/subgroup sizes reflect Vulkan subgroupSize; VK_EXT_subgroup_size_control may allow alternate sizes.",
+      "TFLOPS values are peak theoretical FP32 single-precision.",
+      "Memory bandwidth is peak theoretical."
+    ],
+    "sources": [
+      "https://vulkan.gpuinfo.org",
+      "https://developer.mozilla.org/en-US/docs/Web/API/GPUSupportedLimits",
+      "https://gpuweb.github.io/gpuweb/correspondence/",
+      "https://developer.chrome.com/blog/new-in-webgpu-120",
+      "https://developer.chrome.com/blog/new-in-webgpu-133",
+      "https://developer.chrome.com/blog/new-in-webgpu-146",
+      "https://github.com/gpuweb/gpuweb/issues/4235",
+      "https://github.com/gpuweb/gpuweb/issues/5103",
+      "https://github.com/gpuweb/gpuweb/issues/5006",
+      "https://gpuopen.com/learn/rdna-performance-guide/",
+      "https://developer.apple.com/metal/Metal-Feature-Set-Tables.pdf",
+      "https://dougallj.github.io/applegpu/docs.html",
+      "https://github.com/philipturner/metal-benchmarks",
+      "https://github.com/azhirnov/cpu-gpu-arch/blob/main/gpu/ARM-Mali-Valhall.md",
+      "https://www.arm.com/products/silicon-ip-multimedia/gpu/mali-g720",
+      "https://en.wikipedia.org/wiki/GeForce_RTX_40_series",
+      "https://en.wikipedia.org/wiki/GeForce_RTX_30_series",
+      "https://en.wikipedia.org/wiki/GeForce_RTX_20_series",
+      "https://en.wikipedia.org/wiki/Pascal_(microarchitecture)",
+      "https://medium.com/@marcelo.emmerich/webgpu-bugs-are-holding-back-the-browser-ai-revolution-27d5f8c1dfca"
+    ]
+  },
+
+  "webgpu_spec_defaults": {
+    "maxStorageBuffersPerShaderStage": {
+      "default": 8,
+      "requestable_chrome120": 10,
+      "requestable_chrome146": 16,
+      "note": "Browsers report tiered values for anti-fingerprinting. Sum of maxStorageBuffersPerShaderStage + maxStorageTexturesPerShaderStage + maxColorAttachments <= Vulkan maxFragmentCombinedOutputResources."
+    },
+    "maxStorageTexturesPerShaderStage": {
+      "default": 4,
+      "requestable": 8,
+      "note": "Part of the combined output resources budget."
+    },
+    "maxBufferSize": {
+      "default_bytes": 268435456,
+      "default_human": "256 MiB",
+      "requestable_bytes": 4294967296,
+      "requestable_human": "4 GiB",
+      "note": "Must explicitly request higher limit via requiredLimits at device creation."
+    },
+    "maxStorageBufferBindingSize": {
+      "default_bytes": 134217728,
+      "default_human": "128 MiB",
+      "requestable_bytes": 2147483648,
+      "requestable_human": "2 GiB",
+      "note": "Chrome often caps at 128 MiB unless explicitly requested. Some reports show ~2 GiB achievable on high-VRAM NVIDIA cards."
+    }
+  },
+
+  "vulkan_limits_nvidia_common": {
+    "_note": "These Vulkan limits are consistent across all NVIDIA desktop GPUs (Pascal through Ada Lovelace) with recent drivers.",
+    "maxPerStageDescriptorStorageBuffers": 1048576,
+    "maxPerStageDescriptorStorageImages": 1048576,
+    "maxStorageBufferRange": 4294967295,
+    "maxStorageBufferRange_human": "4 GiB (uint32 max)",
+    "maxBoundDescriptorSets": 32,
+    "maxPerStageResources": 4294967295,
+    "subgroupSize": 32,
+    "subgroupSize_note": "NVIDIA warp size is always 32 across all architectures."
+  },
+
+  "gpu_families": {
+    "ada_lovelace": {
+      "architecture": "Ada Lovelace",
+      "compute_capability": "8.9",
+      "process_node": "TSMC 4N",
+      "vulkan_version": "1.3",
+      "hw_ray_tracing": true,
+      "rt_core_generation": "3rd Gen",
+      "warp_size": 32,
+      "shader_f16_vulkan": true,
+      "shader_f16_webgpu": true,
+      "shader_f16_note": "Full VK_KHR_shader_float16_int8 shaderFloat16 support. WebGPU shader-f16 available in Chrome 120+.",
+
+      "gpus": {
+        "RTX_4090": {
+          "gpu_chip": "AD102",
+          "cuda_cores": 16384,
+          "tensor_cores": 512,
+          "rt_cores": 128,
+          "tflops_fp32": 82.6,
+          "tflops_fp16": 165.2,
+          "vram_gb": 24,
+          "vram_type": "GDDR6X",
+          "memory_bus_bits": 384,
+          "memory_bandwidth_gbs": 1008,
+          "tdp_watts": 450,
+          "webgpu_limits": {
+            "maxStorageBuffersPerShaderStage": 10,
+            "maxStorageTexturesPerShaderStage": 8,
+            "maxBufferSize_bytes": 4294967296,
+            "maxStorageBufferBindingSize_bytes": 2147483648,
+            "note": "Values achievable when explicitly requested via requiredLimits. Default tier values are lower."
+          }
+        },
+        "RTX_4080": {
+          "gpu_chip": "AD103",
+          "cuda_cores": 9728,
+          "tensor_cores": 304,
+          "rt_cores": 76,
+          "tflops_fp32": 48.7,
+          "tflops_fp16": 97.5,
+          "vram_gb": 16,
+          "vram_type": "GDDR6X",
+          "memory_bus_bits": 256,
+          "memory_bandwidth_gbs": 717,
+          "tdp_watts": 320,
+          "webgpu_limits": {
+            "maxStorageBuffersPerShaderStage": 10,
+            "maxStorageTexturesPerShaderStage": 8,
+            "maxBufferSize_bytes": 4294967296,
+            "maxStorageBufferBindingSize_bytes": 2147483648,
+            "note": "Values achievable when explicitly requested via requiredLimits."
+          }
+        },
+        "RTX_4070": {
+          "gpu_chip": "AD104",
+          "cuda_cores": 5888,
+          "tensor_cores": 184,
+          "rt_cores": 46,
+          "tflops_fp32": 29.1,
+          "tflops_fp16": 58.2,
+          "vram_gb": 12,
+          "vram_type": "GDDR6X",
+          "memory_bus_bits": 192,
+          "memory_bandwidth_gbs": 504,
+          "tdp_watts": 200,
+          "webgpu_limits": {
+            "maxStorageBuffersPerShaderStage": 10,
+            "maxStorageTexturesPerShaderStage": 8,
+            "maxBufferSize_bytes": 4294967296,
+            "maxStorageBufferBindingSize_bytes": 2147483648,
+            "note": "Values achievable when explicitly requested via requiredLimits."
+          }
+        },
+        "RTX_4060": {
+          "gpu_chip": "AD107",
+          "cuda_cores": 3072,
+          "tensor_cores": 96,
+          "rt_cores": 24,
+          "tflops_fp32": 15.1,
+          "tflops_fp16": 30.2,
+          "vram_gb": 8,
+          "vram_type": "GDDR6",
+          "memory_bus_bits": 128,
+          "memory_bandwidth_gbs": 272,
+          "tdp_watts": 115,
+          "webgpu_limits": {
+            "maxStorageBuffersPerShaderStage": 10,
+            "maxStorageTexturesPerShaderStage": 8,
+            "maxBufferSize_bytes": 4294967296,
+            "maxStorageBufferBindingSize_bytes": 2147483648,
+            "note": "8 GB VRAM constrains practical buffer sizes despite spec limits."
+          }
+        }
+      }
+    },
+
+    "ampere": {
+      "architecture": "Ampere",
+      "compute_capability": "8.6",
+      "process_node": "Samsung 8nm",
+      "vulkan_version": "1.3",
+      "hw_ray_tracing": true,
+      "rt_core_generation": "2nd Gen",
+      "warp_size": 32,
+      "shader_f16_vulkan": true,
+      "shader_f16_webgpu": true,
+      "shader_f16_note": "Full VK_KHR_shader_float16_int8 shaderFloat16 support. WebGPU shader-f16 available in Chrome 120+.",
+
+      "gpus": {
+        "RTX_3090": {
+          "gpu_chip": "GA102",
+          "cuda_cores": 10496,
+          "tensor_cores": 328,
+          "rt_cores": 82,
+          "tflops_fp32": 35.6,
+          "tflops_fp16": 71.2,
+          "vram_gb": 24,
+          "vram_type": "GDDR6X",
+          "memory_bus_bits": 384,
+          "memory_bandwidth_gbs": 936,
+          "tdp_watts": 350,
+          "webgpu_limits": {
+            "maxStorageBuffersPerShaderStage": 10,
+            "maxStorageTexturesPerShaderStage": 8,
+            "maxBufferSize_bytes": 4294967296,
+            "maxStorageBufferBindingSize_bytes": 2147483648,
+            "note": "Values achievable when explicitly requested via requiredLimits."
+          }
+        },
+        "RTX_3080": {
+          "gpu_chip": "GA102",
+          "cuda_cores": 8704,
+          "tensor_cores": 272,
+          "rt_cores": 68,
+          "tflops_fp32": 29.8,
+          "tflops_fp16": 59.5,
+          "vram_gb": 10,
+          "vram_type": "GDDR6X",
+          "memory_bus_bits": 320,
+          "memory_bandwidth_gbs": 760,
+          "tdp_watts": 320,
+          "webgpu_limits": {
+            "maxStorageBuffersPerShaderStage": 10,
+            "maxStorageTexturesPerShaderStage": 8,
+            "maxBufferSize_bytes": 4294967296,
+            "maxStorageBufferBindingSize_bytes": 2147483648,
+            "note": "10 GB VRAM model; 12 GB variant (RTX 3080 12GB) also exists."
+          }
+        },
+        "RTX_3070": {
+          "gpu_chip": "GA104",
+          "cuda_cores": 5888,
+          "tensor_cores": 184,
+          "rt_cores": 46,
+          "tflops_fp32": 20.3,
+          "tflops_fp16": 40.6,
+          "vram_gb": 8,
+          "vram_type": "GDDR6",
+          "memory_bus_bits": 256,
+          "memory_bandwidth_gbs": 448,
+          "tdp_watts": 220,
+          "webgpu_limits": {
+            "maxStorageBuffersPerShaderStage": 10,
+            "maxStorageTexturesPerShaderStage": 8,
+            "maxBufferSize_bytes": 4294967296,
+            "maxStorageBufferBindingSize_bytes": 2147483648,
+            "note": "8 GB VRAM constrains practical buffer sizes."
+          }
+        },
+        "RTX_3060": {
+          "gpu_chip": "GA106",
+          "cuda_cores": 3584,
+          "tensor_cores": 112,
+          "rt_cores": 28,
+          "tflops_fp32": 12.7,
+          "tflops_fp16": 25.5,
+          "vram_gb": 12,
+          "vram_type": "GDDR6",
+          "memory_bus_bits": 192,
+          "memory_bandwidth_gbs": 360,
+          "tdp_watts": 170,
+          "webgpu_limits": {
+            "maxStorageBuffersPerShaderStage": 10,
+            "maxStorageTexturesPerShaderStage": 8,
+            "maxBufferSize_bytes": 4294967296,
+            "maxStorageBufferBindingSize_bytes": 2147483648,
+            "note": "12 GB VRAM is generous for its tier; good for large scene data."
+          }
+        }
+      }
+    },
+
+    "turing": {
+      "architecture": "Turing",
+      "compute_capability": "7.5",
+      "process_node": "TSMC 12nm",
+      "vulkan_version": "1.3",
+      "hw_ray_tracing": true,
+      "rt_core_generation": "1st Gen",
+      "warp_size": 32,
+      "shader_f16_vulkan": true,
+      "shader_f16_webgpu": true,
+      "shader_f16_note": "VK_KHR_shader_float16_int8 supported with shaderFloat16=true on recent drivers. WebGPU shader-f16 available in Chrome 120+.",
+
+      "gpus": {
+        "RTX_2080": {
+          "gpu_chip": "TU104",
+          "cuda_cores": 2944,
+          "tensor_cores": 368,
+          "rt_cores": 46,
+          "tflops_fp32": 10.1,
+          "tflops_fp16": 20.2,
+          "vram_gb": 8,
+          "vram_type": "GDDR6",
+          "memory_bus_bits": 256,
+          "memory_bandwidth_gbs": 448,
+          "tdp_watts": 215,
+          "webgpu_limits": {
+            "maxStorageBuffersPerShaderStage": 10,
+            "maxStorageTexturesPerShaderStage": 8,
+            "maxBufferSize_bytes": 4294967296,
+            "maxStorageBufferBindingSize_bytes": 2147483648,
+            "note": "8 GB VRAM constrains practical buffer sizes."
+          }
+        },
+        "RTX_2070": {
+          "gpu_chip": "TU106",
+          "cuda_cores": 2304,
+          "tensor_cores": 288,
+          "rt_cores": 36,
+          "tflops_fp32": 7.5,
+          "tflops_fp16": 14.9,
+          "vram_gb": 8,
+          "vram_type": "GDDR6",
+          "memory_bus_bits": 256,
+          "memory_bandwidth_gbs": 448,
+          "tdp_watts": 175,
+          "webgpu_limits": {
+            "maxStorageBuffersPerShaderStage": 10,
+            "maxStorageTexturesPerShaderStage": 8,
+            "maxBufferSize_bytes": 4294967296,
+            "maxStorageBufferBindingSize_bytes": 2147483648,
+            "note": "8 GB VRAM constrains practical buffer sizes."
+          }
+        },
+        "RTX_2060": {
+          "gpu_chip": "TU106",
+          "cuda_cores": 1920,
+          "tensor_cores": 240,
+          "rt_cores": 30,
+          "tflops_fp32": 6.5,
+          "tflops_fp16": 12.9,
+          "vram_gb": 6,
+          "vram_type": "GDDR6",
+          "memory_bus_bits": 192,
+          "memory_bandwidth_gbs": 336,
+          "tdp_watts": 160,
+          "webgpu_limits": {
+            "maxStorageBuffersPerShaderStage": 10,
+            "maxStorageTexturesPerShaderStage": 8,
+            "maxBufferSize_bytes": 4294967296,
+            "maxStorageBufferBindingSize_bytes": 2147483648,
+            "note": "6 GB VRAM is the tightest constraint for path tracing workloads."
+          }
+        }
+      }
+    },
+
+    "pascal": {
+      "architecture": "Pascal",
+      "compute_capability": "6.1",
+      "process_node": "TSMC 16nm",
+      "vulkan_version": "1.3",
+      "hw_ray_tracing": false,
+      "hw_ray_tracing_note": "No dedicated RT cores. DXR ray tracing can be emulated on shader cores via driver, but performance is extremely poor (3-10x slower than RTX equivalent).",
+      "warp_size": 32,
+      "shader_f16_vulkan": true,
+      "shader_f16_vulkan_note": "VK_KHR_shader_float16_int8 extension supported since driver 417.23 (Dec 2018). shaderFloat16=true available, but no native FP16 ALU throughput advantage -- internally computed as FP32.",
+      "shader_f16_webgpu": true,
+      "shader_f16_webgpu_note": "WebGPU shader-f16 feature may be exposed via Chrome, but offers no performance benefit on Pascal since hardware lacks native FP16 compute units.",
+
+      "gpus": {
+        "GTX_1080": {
+          "gpu_chip": "GP104",
+          "cuda_cores": 2560,
+          "tensor_cores": 0,
+          "rt_cores": 0,
+          "tflops_fp32": 8.9,
+          "tflops_fp16_note": "No native FP16 throughput advantage; FP16 runs at FP32 rate.",
+          "vram_gb": 8,
+          "vram_type": "GDDR5X",
+          "memory_bus_bits": 256,
+          "memory_bandwidth_gbs": 320,
+          "tdp_watts": 180,
+          "webgpu_limits": {
+            "maxStorageBuffersPerShaderStage": 10,
+            "maxStorageTexturesPerShaderStage": 8,
+            "maxBufferSize_bytes": 4294967296,
+            "maxStorageBufferBindingSize_bytes": 2147483648,
+            "note": "8 GB VRAM. No hardware RT -- software path tracing only."
+          }
+        },
+        "GTX_1070": {
+          "gpu_chip": "GP104",
+          "cuda_cores": 1920,
+          "tensor_cores": 0,
+          "rt_cores": 0,
+          "tflops_fp32": 6.5,
+          "tflops_fp16_note": "No native FP16 throughput advantage.",
+          "vram_gb": 8,
+          "vram_type": "GDDR5",
+          "memory_bus_bits": 256,
+          "memory_bandwidth_gbs": 256,
+          "tdp_watts": 150,
+          "webgpu_limits": {
+            "maxStorageBuffersPerShaderStage": 10,
+            "maxStorageTexturesPerShaderStage": 8,
+            "maxBufferSize_bytes": 4294967296,
+            "maxStorageBufferBindingSize_bytes": 2147483648,
+            "note": "8 GB VRAM. No hardware RT."
+          }
+        },
+        "GTX_1060": {
+          "gpu_chip": "GP106",
+          "cuda_cores": 1280,
+          "tensor_cores": 0,
+          "rt_cores": 0,
+          "tflops_fp32": 4.4,
+          "tflops_fp16_note": "No native FP16 throughput advantage.",
+          "vram_gb": 6,
+          "vram_type": "GDDR5",
+          "vram_variants_note": "Also available in 3 GB variant with 1152 CUDA cores.",
+          "memory_bus_bits": 192,
+          "memory_bandwidth_gbs": 192,
+          "tdp_watts": 120,
+          "webgpu_limits": {
+            "maxStorageBuffersPerShaderStage": 10,
+            "maxStorageTexturesPerShaderStage": 8,
+            "maxBufferSize_bytes": 4294967296,
+            "maxStorageBufferBindingSize_bytes": 2147483648,
+            "note": "6 GB VRAM is minimum viable for path tracing. 3 GB variant likely too constrained."
+          }
+        }
+      }
+    }
+  },
+
+  "webgpu_known_bugs_and_workarounds": {
+    "nvidia_driver_crashes": {
+      "affected": "RTX 30/40 series",
+      "description": "NVIDIA 572.xx drivers cause WebGPU crashes. Symptoms: 'WebGPU: Software only, hardware acceleration unavailable'.",
+      "workaround": "Update to latest stable NVIDIA drivers. Check chrome://gpu for hardware acceleration status.",
+      "severity": "critical"
+    },
+    "maxStorageBufferBindingSize_128mb_cap": {
+      "affected": "All GPUs in Chrome",
+      "description": "Chrome caps maxStorageBufferBindingSize at 128 MiB by default even though hardware supports much more. Causes 'Binding size is larger than the maximum binding size' errors.",
+      "workaround": "Explicitly request higher limit via requiredLimits when calling requestDevice(). Check adapter.limits first.",
+      "severity": "high"
+    },
+    "canvas_resize_memory_leak": {
+      "affected": "All GPUs",
+      "description": "Canvas resizing triggers GPU memory leaks (Dawn issue #2520). Memory not released, causing gradual performance degradation.",
+      "workaround": "Minimize canvas resize operations. Consider fixed-size render target with CSS scaling.",
+      "severity": "medium"
+    },
+    "multi_gpu_limitation": {
+      "affected": "Laptops with discrete + integrated GPU",
+      "description": "Chrome issue #329211593 prevents using multiple GPU adapters simultaneously.",
+      "workaround": "Force discrete GPU via chrome://flags or OS GPU preference settings.",
+      "severity": "medium"
+    },
+    "storage_texture_breakage_windows": {
+      "affected": "NVIDIA on Windows (some driver versions)",
+      "description": "WebGPU context breaks when using storage textures on certain NVIDIA + Windows configurations.",
+      "workaround": "Test storage texture support at init; fall back to storage buffers if broken.",
+      "severity": "medium"
+    },
+    "linux_vulkan_flag_required": {
+      "affected": "All GPUs on Linux",
+      "description": "WebGPU on Linux requires explicit Vulkan flag to be enabled.",
+      "workaround": "Enable chrome://flags/#enable-vulkan. Requires Chrome 121+ on Android, Chrome 113+ on desktop.",
+      "severity": "low"
+    },
+    "timestamp_query_jitter": {
+      "affected": "All GPUs",
+      "description": "Timestamp query results are intentionally jittered by Chrome for security (timing attack mitigation). Resolution reduced to ~100 microseconds.",
+      "workaround": "Average multiple frames for profiling. Not suitable for sub-microsecond measurements.",
+      "severity": "low"
+    },
+    "maxFragmentCombinedOutputResources_misreport": {
+      "affected": "NVIDIA, AMD, Intel, Imagination",
+      "description": "Vulkan maxFragmentCombinedOutputResources incorrectly reported by many drivers, affecting how browsers compute WebGPU combined storage/texture/attachment limits.",
+      "workaround": "Browser implementations have their own workarounds. Test actual limits at runtime.",
+      "severity": "low"
+    }
+  },
+
+  "pathtracer_recommendations": {
+    "minimum_viable_gpu": "GTX 1060 6GB",
+    "recommended_gpu": "RTX 3060 12GB or better",
+    "storage_buffer_strategy": "Always request maxStorageBufferBindingSize and maxBufferSize via requiredLimits. Default 128 MiB is insufficient for scene BVH + geometry + textures.",
+    "vram_budget_guidance": {
+      "6gb": "Tight. Small scenes only. Compress textures aggressively.",
+      "8gb": "Moderate. Medium complexity scenes. Use BC/ASTC compressed textures.",
+      "12gb": "Comfortable. Most scenes fit without issue.",
+      "24gb": "Abundant. Large open-world scenes with many 4K textures."
+    },
+    "shader_f16_guidance": "Use shader-f16 for intersection math and color accumulation on Turing+ for ~25% ALU improvement and ~50% bandwidth improvement. No benefit on Pascal.",
+    "rt_core_note": "WebGPU does not expose hardware ray tracing (no equivalent to VK_KHR_ray_tracing_pipeline). All path tracing must be done in compute shaders regardless of GPU generation."
+  },
+
+  "amd_gpu_families": {
+    "rdna3": {
+      "architecture": "RDNA 3",
+      "process_node": "5nm + 6nm chiplet (discrete) / 4nm (APU)",
+      "vulkan_version": "1.3",
+      "hw_ray_tracing": true,
+      "rt_generation": "2nd Gen Ray Accelerator",
+      "rt_note": "1.5x ray throughput vs RDNA 2. Hardware BVH traversal + ray/box + ray/triangle intersection.",
+      "wave_size": 32,
+      "wave_size_supported": [32, 64],
+      "vulkan_default_subgroup_size": 64,
+      "vulkan_min_subgroup_size": 32,
+      "vulkan_max_subgroup_size": 64,
+      "wave_note": "RDNA 3 natively prefers Wave32. Wave64 can be better for VOPD dual-issue. VK_EXT_subgroup_size_control exposes both.",
+      "shader_f16_vulkan": true,
+      "shader_f16_webgpu": true,
+      "vulkan_limits_common": {
+        "maxPerStageDescriptorStorageBuffers": 4294967295,
+        "maxPerStageDescriptorStorageImages": 4294967295,
+        "maxStorageBufferRange": 4294967295,
+        "maxComputeWorkGroupInvocations": 1024,
+        "note": "AMD RADV and amdvlk both report very high descriptor limits."
+      },
+
+      "gpus": {
+        "RX_7900_XTX": {
+          "gpu_chip": "Navi 31",
+          "compute_units": 96,
+          "stream_processors": 6144,
+          "tflops_fp32": 61.4,
+          "tflops_fp16": 122.8,
+          "vram_gb": 24,
+          "vram_type": "GDDR6",
+          "memory_bus_bits": 384,
+          "memory_bandwidth_gbs": 960,
+          "infinity_cache_mb": 96,
+          "tdp_watts": 355,
+          "webgpu_limits": {
+            "maxStorageBuffersPerShaderStage": 10,
+            "maxStorageTexturesPerShaderStage": 8,
+            "maxBufferSize_bytes": 4294967296,
+            "maxStorageBufferBindingSize_bytes": 2147483644,
+            "note": "Vulkan backend on Windows/Linux. Very high hardware limits."
+          }
+        },
+        "RX_7900_XT": {
+          "gpu_chip": "Navi 31 (cut-down)",
+          "compute_units": 84,
+          "stream_processors": 5376,
+          "tflops_fp32": 51.48,
+          "tflops_fp16": 102.96,
+          "vram_gb": 20,
+          "vram_type": "GDDR6",
+          "memory_bus_bits": 320,
+          "memory_bandwidth_gbs": 800,
+          "infinity_cache_mb": 80,
+          "tdp_watts": 315,
+          "webgpu_limits": {
+            "maxStorageBuffersPerShaderStage": 10,
+            "maxStorageTexturesPerShaderStage": 8,
+            "maxBufferSize_bytes": 4294967296,
+            "maxStorageBufferBindingSize_bytes": 2147483644,
+            "note": "Same limits as 7900 XTX."
+          }
+        },
+        "Radeon_780M": {
+          "gpu_chip": "Phoenix (Ryzen 7040 series APU)",
+          "compute_units": 12,
+          "stream_processors": 768,
+          "tflops_fp32": 4.9,
+          "tflops_fp16": 9.8,
+          "vram_gb": 0,
+          "vram_type": "shared",
+          "shared_memory": "LPDDR5X / DDR5 (up to 8 GB allocated via Smart Access Memory)",
+          "memory_bandwidth_gbs": 89.6,
+          "memory_bandwidth_note": "DDR5-5600 dual-channel ~89.6 GB/s; LPDDR5X-7500 ~120 GB/s. Varies by OEM.",
+          "tdp_watts": 28,
+          "webgpu_limits": {
+            "maxStorageBuffersPerShaderStage": 10,
+            "maxStorageTexturesPerShaderStage": 8,
+            "maxBufferSize_bytes": 4294967296,
+            "maxStorageBufferBindingSize_bytes": 2147483644,
+            "note": "Same RDNA 3 limits but shared memory bandwidth is the bottleneck."
+          }
+        }
+      }
+    },
+
+    "rdna2": {
+      "architecture": "RDNA 2",
+      "process_node": "7nm (discrete) / 6nm (APU)",
+      "vulkan_version": "1.3",
+      "hw_ray_tracing": true,
+      "rt_generation": "1st Gen Ray Accelerator",
+      "rt_note": "BVH traversal + ray/box intersection in hardware. Ray/triangle intersection in shader. One RA per CU.",
+      "wave_size": 32,
+      "wave_size_supported": [32, 64],
+      "vulkan_default_subgroup_size": 64,
+      "vulkan_min_subgroup_size": 32,
+      "vulkan_max_subgroup_size": 64,
+      "wave_note": "RDNA 2 native Wave32. Wave64 emulated as 2x Wave32.",
+      "shader_f16_vulkan": true,
+      "shader_f16_webgpu": true,
+      "vulkan_limits_common": {
+        "maxPerStageDescriptorStorageBuffers": 4294967295,
+        "maxPerStageDescriptorStorageImages": 4294967295,
+        "maxStorageBufferRange": 4294967295,
+        "maxComputeWorkGroupInvocations": 1024
+      },
+
+      "gpus": {
+        "RX_6800_XT": {
+          "gpu_chip": "Navi 21",
+          "compute_units": 72,
+          "stream_processors": 4608,
+          "tflops_fp32": 20.74,
+          "tflops_fp16": 41.47,
+          "vram_gb": 16,
+          "vram_type": "GDDR6",
+          "memory_bus_bits": 256,
+          "memory_bandwidth_gbs": 512,
+          "infinity_cache_mb": 128,
+          "tdp_watts": 300,
+          "webgpu_limits": {
+            "maxStorageBuffersPerShaderStage": 10,
+            "maxStorageTexturesPerShaderStage": 8,
+            "maxBufferSize_bytes": 4294967296,
+            "maxStorageBufferBindingSize_bytes": 2147483644,
+            "note": "128 MB Infinity Cache very effective for path tracing working sets that fit."
+          }
+        },
+        "RX_6700_XT": {
+          "gpu_chip": "Navi 22",
+          "compute_units": 40,
+          "stream_processors": 2560,
+          "tflops_fp32": 13.21,
+          "tflops_fp16": 26.43,
+          "vram_gb": 12,
+          "vram_type": "GDDR6",
+          "memory_bus_bits": 192,
+          "memory_bandwidth_gbs": 384,
+          "infinity_cache_mb": 96,
+          "tdp_watts": 230,
+          "webgpu_limits": {
+            "maxStorageBuffersPerShaderStage": 10,
+            "maxStorageTexturesPerShaderStage": 8,
+            "maxBufferSize_bytes": 4294967296,
+            "maxStorageBufferBindingSize_bytes": 2147483644,
+            "note": "192-bit bus + 12 GB VRAM can be limiting for high-res path tracing. Infinity Cache (96 MB) mitigates."
+          }
+        },
+        "Radeon_680M": {
+          "gpu_chip": "Rembrandt (Ryzen 6000 series APU)",
+          "compute_units": 12,
+          "stream_processors": 768,
+          "tflops_fp32": 3.38,
+          "tflops_fp16": 6.76,
+          "vram_gb": 0,
+          "vram_type": "shared",
+          "shared_memory": "DDR5 / LPDDR5 (up to 8 GB allocated)",
+          "memory_bandwidth_gbs": 51.2,
+          "memory_bandwidth_note": "DDR5-3200 dual-channel ~51.2 GB/s typical.",
+          "tdp_watts": 28,
+          "webgpu_limits": {
+            "maxStorageBuffersPerShaderStage": 10,
+            "maxStorageTexturesPerShaderStage": 8,
+            "maxBufferSize_bytes": 4294967296,
+            "maxStorageBufferBindingSize_bytes": 2147483644,
+            "note": "Very limited bandwidth for path tracing."
+          }
+        }
+      }
+    },
+
+    "rdna1": {
+      "architecture": "RDNA 1",
+      "process_node": "7nm",
+      "vulkan_version": "1.3",
+      "hw_ray_tracing": false,
+      "rt_note": "No hardware ray tracing. Software-only ray tracing.",
+      "wave_size": 32,
+      "wave_size_supported": [32, 64],
+      "vulkan_default_subgroup_size": 64,
+      "vulkan_min_subgroup_size": 32,
+      "vulkan_max_subgroup_size": 64,
+      "wave_note": "First AMD GPU with native Wave32. Wave64 compatibility available.",
+      "shader_f16_vulkan": false,
+      "shader_f16_webgpu": false,
+      "shader_f16_note": "RDNA 1 does not support shaderFloat16 in Vulkan. No FP16 acceleration.",
+      "vulkan_limits_common": {
+        "maxPerStageDescriptorStorageBuffers": 4294967295,
+        "maxPerStageDescriptorStorageImages": 4294967295,
+        "maxStorageBufferRange": 4294967295,
+        "maxComputeWorkGroupInvocations": 1024
+      },
+
+      "gpus": {
+        "RX_5700_XT": {
+          "gpu_chip": "Navi 10",
+          "compute_units": 40,
+          "stream_processors": 2560,
+          "tflops_fp32": 9.75,
+          "tflops_fp16_note": "No native FP16 throughput advantage.",
+          "vram_gb": 8,
+          "vram_type": "GDDR6",
+          "memory_bus_bits": 256,
+          "memory_bandwidth_gbs": 448,
+          "infinity_cache_mb": 0,
+          "tdp_watts": 225,
+          "webgpu_limits": {
+            "maxStorageBuffersPerShaderStage": 10,
+            "maxStorageTexturesPerShaderStage": 8,
+            "maxBufferSize_bytes": 4294967296,
+            "maxStorageBufferBindingSize_bytes": 2147483644,
+            "note": "No HW RT, no shader-f16, no Infinity Cache. 8 GB VRAM limits scene complexity."
+          }
+        }
+      }
+    },
+
+    "amd_known_bugs_quirks": [
+      "Vulkan device lost errors under heavy RT + compute workloads (Godot, BG3, llama.cpp)",
+      "Infinity Cache thrashing causes performance cliffs with large working sets exceeding cache size",
+      "RADV vs amdvlk vs AMD proprietary driver can show different Vulkan limits and behavior on Linux",
+      "Performance dropoff at certain batch sizes in compute workloads (llama.cpp issue #10966)",
+      "Wave32 exposed via VK_EXT_subgroup_size_control; default Vulkan subgroup size is 64 (not native 32)",
+      "RDNA 1 (5700 XT): no shader-f16, no HW RT, no Infinity Cache -- most limited RDNA generation",
+      "APU variants (780M, 680M): shared memory bandwidth severely limits path tracing performance"
+    ],
+    "amd_texture_formats": {
+      "bc_formats": true,
+      "etc2_formats": false,
+      "astc_formats": false,
+      "note": "All desktop AMD GPUs support BC only. No ETC2 or ASTC."
+    },
+    "amd_optimal_workgroup_size": {
+      "general": 64,
+      "path_tracing": 64,
+      "note": "Wave32 native; 64 = 2 wavefronts for good occupancy. 256 works well for compute-heavy shaders."
+    }
+  },
+
+  "apple_gpu_families": {
+    "apple_family_9": {
+      "architecture": "Apple GPU 5th gen (G15/G16)",
+      "metal_gpu_family": "Apple 9",
+      "simd_group_size": 32,
+      "simd_note": "All Apple GPUs use 32-wide SIMD groups. Fixed, not configurable.",
+      "hw_ray_tracing": true,
+      "rt_note": "Hardware-accelerated ray/box and ray/triangle intersection. 4x faster than M1/M2 software RT. First in M3 and A17 Pro.",
+      "shader_f16": true,
+      "shader_f16_note": "Native FP16 support. 2x FP16 throughput per lane. WebGPU shader-f16 works via Metal backend.",
+      "metal_limits": {
+        "maxBufferLength": 4294967295,
+        "maxThreadsPerThreadgroup": 1024,
+        "maxTotalThreadgroupMemory": 32768,
+        "maxArgumentBufferEntries": 500000
+      },
+      "webgpu_limits_common": {
+        "maxStorageBuffersPerShaderStage": 8,
+        "maxStorageTexturesPerShaderStage": 4,
+        "maxStorageBufferBindingSize_bytes": 134217728,
+        "maxStorageBufferBindingSize_note": "Metal backend caps at 128 MiB in Chrome WebGPU.",
+        "maxBufferSize_bytes": 2147483648,
+        "maxComputeWorkGroupSizeX": 1024,
+        "maxComputeWorkGroupSizeY": 1024,
+        "maxComputeWorkGroupSizeZ": 1024,
+        "maxComputeInvocationsPerWorkGroup": 1024,
+        "maxComputeWorkGroupsPerDimension": 65535
+      },
+      "features": ["dynamic_caching", "hardware_ray_tracing", "mesh_shading"],
+
+      "gpus": {
+        "M3": {
+          "gpu_cores": 10,
+          "tflops_fp32": 4.1,
+          "tflops_fp16": 8.2,
+          "unified_memory_options_gb": [8, 16, 24],
+          "memory_bandwidth_gbs": 100,
+          "tdp_watts": 22,
+          "rt_note": "1st gen Apple hardware RT."
+        },
+        "M4": {
+          "gpu_cores": 10,
+          "tflops_fp32": 4.6,
+          "tflops_fp16": 9.2,
+          "unified_memory_options_gb": [16, 24, 32],
+          "memory_bandwidth_gbs": 120,
+          "tdp_watts": 22,
+          "rt_note": "2nd gen Apple hardware RT. Higher throughput than M3."
+        },
+        "A17_Pro": {
+          "gpu_cores": 6,
+          "tflops_fp32": 2.15,
+          "tflops_fp16": 4.3,
+          "unified_memory_gb": 8,
+          "memory_bandwidth_gbs": 68.25,
+          "tdp_watts": 7,
+          "device": "iPhone 15 Pro / Pro Max",
+          "rt_note": "Same HW RT as M3, mobile variant. First iPhone with HW ray tracing."
+        }
+      }
+    },
+
+    "apple_family_8": {
+      "architecture": "Apple GPU 4th gen (G14)",
+      "metal_gpu_family": "Apple 8",
+      "simd_group_size": 32,
+      "hw_ray_tracing": false,
+      "rt_note": "Metal RT API available but runs on shader cores (software). No dedicated RT hardware.",
+      "shader_f16": true,
+      "metal_limits": {
+        "maxBufferLength": 4294967295,
+        "maxThreadsPerThreadgroup": 1024,
+        "maxTotalThreadgroupMemory": 32768,
+        "maxArgumentBufferEntries": 500000
+      },
+      "webgpu_limits_common": {
+        "maxStorageBuffersPerShaderStage": 8,
+        "maxStorageTexturesPerShaderStage": 4,
+        "maxStorageBufferBindingSize_bytes": 134217728,
+        "maxBufferSize_bytes": 2147483648,
+        "maxComputeWorkGroupSizeX": 1024,
+        "maxComputeWorkGroupSizeY": 1024,
+        "maxComputeWorkGroupSizeZ": 1024,
+        "maxComputeInvocationsPerWorkGroup": 1024,
+        "maxComputeWorkGroupsPerDimension": 65535
+      },
+
+      "gpus": {
+        "M2": {
+          "gpu_cores": 10,
+          "tflops_fp32": 3.6,
+          "tflops_fp16": 7.2,
+          "unified_memory_options_gb": [8, 16, 24],
+          "memory_bandwidth_gbs": 100,
+          "tdp_watts": 22
+        },
+        "A16": {
+          "gpu_cores": 5,
+          "tflops_fp32": 1.79,
+          "tflops_fp16": 3.58,
+          "unified_memory_gb": 6,
+          "memory_bandwidth_gbs": 51.2,
+          "tdp_watts": 6,
+          "device": "iPhone 14 Pro / Pro Max"
+        }
+      }
+    },
+
+    "apple_family_7": {
+      "architecture": "Apple GPU 3rd gen (G13)",
+      "metal_gpu_family": "Apple 7",
+      "simd_group_size": 32,
+      "hw_ray_tracing": false,
+      "rt_note": "No hardware RT. Software ray tracing only.",
+      "shader_f16": true,
+      "webgpu_limits_common": {
+        "maxStorageBuffersPerShaderStage": 8,
+        "maxStorageTexturesPerShaderStage": 4,
+        "maxStorageBufferBindingSize_bytes": 134217728,
+        "maxBufferSize_bytes": 2147483648,
+        "maxComputeInvocationsPerWorkGroup": 1024
+      },
+
+      "gpus": {
+        "M1": {
+          "gpu_cores": 8,
+          "tflops_fp32": 2.6,
+          "tflops_fp16": 5.2,
+          "unified_memory_options_gb": [8, 16],
+          "memory_bandwidth_gbs": 68.25,
+          "tdp_watts": 20
+        }
+      }
+    },
+
+    "apple_known_bugs_quirks": [
+      "maxStorageBufferBindingSize capped at 128 MiB in Chrome WebGPU on Metal backend",
+      "Unified memory means GPU and CPU compete for bandwidth",
+      "Threadgroup memory limited to 32 KB",
+      "Metal 3 features (mesh shading, HW RT) not all exposed through WebGPU yet",
+      "M1/M2: no hardware RT -- software ray tracing only; M3+ has HW RT",
+      "iOS: WebGPU only in Safari (WebKit) or WKWebView apps. Chrome WebGPU NOT available on iOS.",
+      "iOS thermal throttling reduces sustained GPU performance by 30-40%",
+      "A16: only 6 GB unified memory shared with system -- very limited for complex scenes"
+    ],
+    "apple_texture_formats": {
+      "macos": {
+        "bc_formats": true,
+        "etc2_formats": false,
+        "astc_formats": false,
+        "note": "macOS Metal: BC supported. NO ETC2 or ASTC."
+      },
+      "ios": {
+        "bc_formats": false,
+        "etc2_formats": true,
+        "astc_formats": true,
+        "note": "iOS Metal: ETC2 + ASTC supported. NO BC. Must ship ASTC variants for iPhone."
+      }
+    },
+    "apple_optimal_workgroup_size": {
+      "general": 64,
+      "path_tracing_desktop": 64,
+      "path_tracing_mobile": 32,
+      "note": "32 SIMD width; 64 = 2 SIMD groups. Apple recommends multiples of 32. On mobile (A-series), 32 reduces register pressure."
+    }
+  },
+
+  "mobile_gpu_families": {
+    "qualcomm_adreno": {
+      "wave_size": 64,
+      "wave_size_supported": [64, 128],
+      "wave_note": "Adreno 7xx uses 64-wide waves. Some modes support 128-wide.",
+      "shader_f16_webgpu": false,
+      "shader_f16_blocker": "Adreno devices cannot surface 16-bit values in uniform/storage buffers. This blocks the WebGPU shader-f16 feature entirely (gpuweb issue #5006). ALL Qualcomm Adreno GPUs are affected.",
+      "texture_formats": {
+        "bc_formats": false,
+        "etc2_formats": true,
+        "astc_formats": true,
+        "note": "Mobile Android: ETC2 + ASTC. No BC."
+      },
+      "webgpu_limits_common": {
+        "maxStorageBuffersPerShaderStage": 8,
+        "maxStorageTexturesPerShaderStage": 4,
+        "maxStorageBufferBindingSize_bytes": 134217728,
+        "maxBufferSize_bytes": 2147483648,
+        "maxComputeWorkGroupSizeX": 1024,
+        "maxComputeWorkGroupSizeY": 1024,
+        "maxComputeWorkGroupSizeZ": 64,
+        "maxComputeWorkGroupSizeZ_note": "Adreno limits Z dimension to 64, not 1024.",
+        "maxComputeInvocationsPerWorkGroup": 1024,
+        "maxComputeWorkGroupsPerDimension": 65535,
+        "note": "Android Chrome WebGPU. Requires Chrome 121+ and Android 12+."
+      },
+      "vulkan_limits_common": {
+        "maxPerStageDescriptorStorageBuffers": 24,
+        "maxPerStageDescriptorStorageImages": 24,
+        "maxStorageBufferRange": 2147483647,
+        "maxComputeWorkGroupInvocations": 1024
+      },
+
+      "gpus": {
+        "Adreno_750": {
+          "soc": "Snapdragon 8 Gen 3",
+          "hw_ray_tracing": true,
+          "rt_generation": "2nd gen Adreno RT",
+          "tflops_fp32": 2.77,
+          "tflops_fp16": 5.54,
+          "shared_memory_type": "LPDDR5X",
+          "typical_ram_gb": 12,
+          "memory_bandwidth_gbs": 76.8,
+          "tdp_watts": 12
+        },
+        "Adreno_740": {
+          "soc": "Snapdragon 8 Gen 2",
+          "hw_ray_tracing": true,
+          "rt_generation": "1st gen Adreno RT",
+          "rt_note": "First Qualcomm GPU with hardware ray tracing.",
+          "tflops_fp32": 2.36,
+          "tflops_fp16": 4.72,
+          "shared_memory_type": "LPDDR5X",
+          "typical_ram_gb": 8,
+          "memory_bandwidth_gbs": 67.2,
+          "tdp_watts": 11
+        },
+        "Adreno_730": {
+          "soc": "Snapdragon 8 Gen 1",
+          "hw_ray_tracing": false,
+          "rt_note": "No hardware ray tracing. Software RT only.",
+          "tflops_fp32": 2.24,
+          "tflops_fp16": 4.47,
+          "shared_memory_type": "LPDDR5",
+          "typical_ram_gb": 8,
+          "memory_bandwidth_gbs": 51.2,
+          "tdp_watts": 10
+        }
+      },
+
+      "known_bugs_quirks": [
+        "shader-f16 NOT available on ANY Qualcomm Adreno device in WebGPU",
+        "Buffer size limitations (128 MiB) make large model/scene deployment impossible",
+        "maxComputeWorkGroupSizeZ limited to 64 -- avoid deep Z workgroups",
+        "Snapdragon 8 Gen 1 (Adreno 730) notorious for thermal throttling and power inefficiency",
+        "Qualcomm Vulkan drivers historically buggier than desktop vendors",
+        "Some early driver versions incorrectly report Vulkan feature support",
+        "Thermal throttling reduces sustained performance by 40-60% on phones"
+      ]
+    },
+
+    "arm_mali": {
+      "wave_size": 16,
+      "wave_note": "Arm Valhall and 5th Gen GPUs use 16-wide warps. FMA and SVT pipelines are 16-wide. SFU pipeline is 4-wide (sin/cos/rsqrt 4x slower).",
+      "shader_f16_webgpu": true,
+      "shader_f16_note": "Mali GPUs have native FP16 support. 2x FP16 throughput per lane. Can use 32x fp16 ops per clock per warp.",
+      "texture_formats": {
+        "bc_formats": false,
+        "etc2_formats": true,
+        "astc_formats": true,
+        "note": "Mobile Mali: ETC2 + ASTC. ASTC hardware decoding is very efficient."
+      },
+      "webgpu_limits_common": {
+        "maxStorageBuffersPerShaderStage": 8,
+        "maxStorageTexturesPerShaderStage": 4,
+        "maxStorageBufferBindingSize_bytes": 134217728,
+        "maxBufferSize_bytes": 2147483648,
+        "maxComputeWorkGroupSizeX": 512,
+        "maxComputeWorkGroupSizeY": 512,
+        "maxComputeWorkGroupSizeZ": 512,
+        "maxComputeInvocationsPerWorkGroup": 512,
+        "maxComputeInvocationsPerWorkGroup_note": "Mali GPUs have 512 max invocations per workgroup, NOT 1024. Critical for path tracer workgroup sizing.",
+        "maxComputeWorkGroupsPerDimension": 65535
+      },
+      "vulkan_limits_common": {
+        "maxPerStageDescriptorStorageBuffers": 16,
+        "maxPerStageDescriptorStorageImages": 16,
+        "maxStorageBufferRange": 2147483647,
+        "maxComputeWorkGroupInvocations": 512
+      },
+
+      "gpus": {
+        "Mali_G720_Immortalis": {
+          "full_name": "Arm Immortalis-G720",
+          "generation": "5th Gen GPU",
+          "soc": "MediaTek Dimensity 9300",
+          "shader_cores": 12,
+          "execution_units_per_core": 2,
+          "hw_ray_tracing": true,
+          "rt_note": "2nd gen Arm hardware RT. Immortalis variant ONLY -- Mali-G720 without Immortalis has NO RT.",
+          "tflops_fp32": 2.3,
+          "tflops_fp32_note": "Estimated: 12 cores x 2 EUs x 256 FP32 ops/cycle x ~940 MHz. Varies by SoC.",
+          "tflops_fp16": 4.6,
+          "shared_memory_type": "LPDDR5T",
+          "typical_ram_gb": 12,
+          "memory_bandwidth_gbs": 76.8,
+          "tdp_watts": 10
+        },
+        "Mali_G715_Immortalis": {
+          "full_name": "Arm Immortalis-G715",
+          "generation": "4th Gen Valhall",
+          "soc": "MediaTek Dimensity 9200",
+          "shader_cores": 11,
+          "execution_units_per_core": 2,
+          "hw_ray_tracing": true,
+          "rt_note": "1st gen Arm hardware RT (Immortalis variant). First Arm GPU with HW ray tracing. Mali-G715 without Immortalis has NO RT.",
+          "tflops_fp32": 1.9,
+          "tflops_fp32_note": "Estimated: 11 cores x 2 EUs x 256 FP32 ops/cycle x ~850 MHz.",
+          "tflops_fp16": 3.8,
+          "shared_memory_type": "LPDDR5X",
+          "typical_ram_gb": 8,
+          "memory_bandwidth_gbs": 68.3,
+          "tdp_watts": 9
+        }
+      },
+
+      "known_bugs_quirks": [
+        "maxComputeInvocationsPerWorkGroup is 512, NOT 1024 -- size workgroups accordingly",
+        "16-wide subgroup size means subgroup operations behave differently than 32/64-wide GPUs",
+        "Arm proprietary Mali driver vs PanVK open-source driver can have different behavior",
+        "SFU pipeline only 4-wide -- sin/cos/rsqrt are 4x slower than FMA operations",
+        "Immortalis vs Mali branding: ONLY Immortalis variants have hardware ray tracing",
+        "Thermal throttling on mobile; sustained performance ~50-60% of peak",
+        "Mali-G720 is 15% faster than G715 architecturally, plus 40% less memory bandwidth usage"
+      ]
+    },
+
+    "samsung_xclipse": {
+      "wave_size": 32,
+      "wave_size_supported": [32, 64],
+      "wave_note": "RDNA 3 based -- same Wave32/64 as desktop AMD. Likely defaults to Wave32 on mobile.",
+      "shader_f16_webgpu": true,
+      "shader_f16_note": "RDNA 3 has native FP16. Samsung driver should expose it, but WebGPU availability depends on Chrome/Android implementation.",
+      "texture_formats": {
+        "bc_formats": false,
+        "etc2_formats": true,
+        "astc_formats": true,
+        "note": "Android device: ETC2 + ASTC. Despite being RDNA 3 architecture, follows Android norms."
+      },
+      "webgpu_limits_common": {
+        "maxStorageBuffersPerShaderStage": 8,
+        "maxStorageTexturesPerShaderStage": 4,
+        "maxStorageBufferBindingSize_bytes": 134217728,
+        "maxBufferSize_bytes": 2147483648,
+        "maxComputeWorkGroupSizeX": 1024,
+        "maxComputeWorkGroupSizeY": 1024,
+        "maxComputeWorkGroupSizeZ": 1024,
+        "maxComputeInvocationsPerWorkGroup": 1024,
+        "note": "RDNA 3 architecture means same compute limits as desktop AMD."
+      },
+      "vulkan_limits_common": {
+        "maxPerStageDescriptorStorageBuffers": 4294967295,
+        "maxPerStageDescriptorStorageImages": 4294967295,
+        "maxStorageBufferRange": 4294967295,
+        "maxComputeWorkGroupInvocations": 1024,
+        "note": "Samsung's Vulkan driver for RDNA 3 -- may differ from AMD's desktop driver in practice."
+      },
+
+      "gpus": {
+        "Xclipse_940": {
+          "soc": "Samsung Exynos 2400",
+          "architecture_detail": "AMD RDNA 3 (mobile custom)",
+          "shader_units": 768,
+          "hw_ray_tracing": true,
+          "rt_note": "RDNA 3 Ray Accelerator, mobile variant. Hardware BVH traversal + intersections.",
+          "tflops_fp32": 1.69,
+          "tflops_fp32_note": "768 shaders at ~1.1 GHz. ~70% faster than Xclipse 920.",
+          "tflops_fp16": 3.38,
+          "shared_memory_type": "LPDDR5X",
+          "typical_ram_gb": 12,
+          "memory_bandwidth_gbs": 68.3,
+          "tdp_watts": 10,
+          "device_note": "Exynos 2400 used in Galaxy S24 in some regions (not global)."
+        }
+      },
+
+      "known_bugs_quirks": [
+        "Samsung's custom RDNA 3 Vulkan driver is NOT the same as AMD's desktop driver",
+        "Driver quality historically worse than AMD desktop or Qualcomm mobile",
+        "10% slower than Adreno 750 in Vulkan benchmarks",
+        "FidelityFX Super Resolution support (AMD technology)",
+        "Thermal throttling significant on Galaxy S24",
+        "VK_EXT_subgroup_size_control exposure uncertain on Samsung's RDNA 3 driver",
+        "Exynos-only markets (not US) -- limited testing coverage in WebGPU implementations"
+      ]
+    },
+
+    "mobile_optimal_workgroup_size": {
+      "adreno": 64,
+      "mali": 64,
+      "xclipse": 64,
+      "note": "64 is safe across all mobile GPUs. Mali max is 512 total invocations. Adreno Z-dim max is 64."
+    }
+  },
+
+  "intel_gpu_families": {
+    "xe_hpg_alchemist": {
+      "architecture": "Xe-HPG (Alchemist)",
+      "process_node": "TSMC N6",
+      "vulkan_version": "1.3",
+      "hw_ray_tracing": true,
+      "rt_note": "Hardware BVH traversal and ray/box intersection per Xe-core. Competitive with RDNA 2 RT.",
+      "wave_size": 16,
+      "wave_size_supported": [8, 16, 32],
+      "vulkan_default_subgroup_size": 16,
+      "vulkan_min_subgroup_size": 8,
+      "vulkan_max_subgroup_size": 32,
+      "wave_note": "Xe-HPG supports SIMD8, SIMD16, SIMD32 via VK_EXT_subgroup_size_control. Default is SIMD16.",
+      "shader_f16_vulkan": true,
+      "shader_f16_webgpu": true,
+      "vulkan_limits_common": {
+        "maxPerStageDescriptorStorageBuffers": 65535,
+        "maxPerStageDescriptorStorageImages": 65535,
+        "maxStorageBufferRange": 2147483647,
+        "maxImageDimension1D": 16384,
+        "maxImageDimension2D": 16384,
+        "maxImageDimension3D": 2048,
+        "maxComputeWorkGroupInvocations": 1024
+      },
+      "webgpu_limits_common": {
+        "maxStorageBuffersPerShaderStage": 8,
+        "maxStorageTexturesPerShaderStage": 4,
+        "maxStorageBufferBindingSize_bytes": 1073741824,
+        "maxStorageBufferBindingSize_note": "Arc GPUs may report up to 1 GiB binding size.",
+        "maxBufferSize_bytes": 2147483648,
+        "maxComputeWorkGroupSizeX": 1024,
+        "maxComputeWorkGroupSizeY": 1024,
+        "maxComputeWorkGroupSizeZ": 64,
+        "maxComputeInvocationsPerWorkGroup": 1024,
+        "maxComputeWorkGroupsPerDimension": 65535,
+        "note": "D3D12 backend on Windows, Vulkan on Linux."
+      },
+
+      "gpus": {
+        "Arc_A770": {
+          "gpu_chip": "ACM-G10",
+          "xe_cores": 32,
+          "execution_units": 512,
+          "tflops_fp32": 19.66,
+          "tflops_fp16": 39.32,
+          "vram_gb": 16,
+          "vram_type": "GDDR6",
+          "memory_bus_bits": 256,
+          "memory_bandwidth_gbs": 560,
+          "tdp_watts": 225
+        },
+        "Arc_A750": {
+          "gpu_chip": "ACM-G10 (cut-down)",
+          "xe_cores": 28,
+          "execution_units": 448,
+          "tflops_fp32": 17.2,
+          "tflops_fp16": 34.4,
+          "vram_gb": 8,
+          "vram_type": "GDDR6",
+          "memory_bus_bits": 256,
+          "memory_bandwidth_gbs": 512,
+          "tdp_watts": 225
+        }
+      }
+    },
+
+    "xe_lp_integrated": {
+      "architecture": "Xe-LP",
+      "process_node": "Intel 7 (10nm SuperFin)",
+      "vulkan_version": "1.3",
+      "hw_ray_tracing": false,
+      "rt_note": "Xe-LP has no hardware ray tracing. Only Xe-HPG (Arc) has RT hardware.",
+      "wave_size": 16,
+      "wave_size_supported": [8, 16, 32],
+      "vulkan_default_subgroup_size": 16,
+      "vulkan_min_subgroup_size": 8,
+      "vulkan_max_subgroup_size": 32,
+      "wave_note": "Same Xe subgroup sizes as Xe-HPG.",
+      "shader_f16_vulkan": true,
+      "shader_f16_webgpu": true,
+      "vulkan_limits_common": {
+        "maxPerStageDescriptorStorageBuffers": 65535,
+        "maxPerStageDescriptorStorageImages": 65535,
+        "maxStorageBufferRange": 2147483647,
+        "maxComputeWorkGroupInvocations": 1024,
+        "note": "Some Tiger Lake configs report 512 maxComputeWorkGroupInvocations."
+      },
+      "webgpu_limits_common": {
+        "maxStorageBuffersPerShaderStage": 8,
+        "maxStorageTexturesPerShaderStage": 4,
+        "maxStorageBufferBindingSize_bytes": 134217728,
+        "maxBufferSize_bytes": 2147483648,
+        "maxComputeWorkGroupSizeX": 1024,
+        "maxComputeWorkGroupSizeY": 1024,
+        "maxComputeWorkGroupSizeZ": 64,
+        "maxComputeInvocationsPerWorkGroup": 1024,
+        "note": "Integrated GPU. D3D12 on Windows, Vulkan on Linux."
+      },
+
+      "gpus": {
+        "Iris_Xe_TigerLake_96EU": {
+          "generation": "Tiger Lake (11th Gen)",
+          "execution_units": 96,
+          "eu_note": "96 EUs in i7 models. 80 EUs in i5. 48 in some i5/i3.",
+          "tflops_fp32": 2.07,
+          "tflops_fp16": 4.15,
+          "vram_gb": 0,
+          "vram_type": "shared",
+          "shared_memory_type": "DDR4 / LPDDR4X / LPDDR5",
+          "memory_bandwidth_gbs": 68.3,
+          "memory_bandwidth_note": "LPDDR4X-4267 ~68 GB/s. DDR4-3200 ~51.2 GB/s. Varies by system.",
+          "tdp_watts": 28
+        },
+        "Iris_Xe_AlderLake_96EU": {
+          "generation": "Alder Lake (12th Gen)",
+          "execution_units": 96,
+          "eu_note": "96 EUs in i7-12700H etc. 80 EUs in some i5 configs.",
+          "tflops_fp32": 2.2,
+          "tflops_fp16": 4.4,
+          "vram_gb": 0,
+          "vram_type": "shared",
+          "shared_memory_type": "DDR4 / DDR5 / LPDDR5",
+          "memory_bandwidth_gbs": 76.8,
+          "memory_bandwidth_note": "DDR5-4800 dual-channel ~76.8 GB/s. DDR4-3200 ~51.2 GB/s.",
+          "tdp_watts": 28
+        }
+      }
+    },
+
+    "intel_known_bugs_quirks": [
+      "4 GB per-buffer allocation limit on Arc GPUs (compute-runtime issue #627)",
+      "shaderStorageImageMultisample not supported on Arc -- blocks some applications",
+      "Vulkan driver maturity behind AMD/NVIDIA -- occasional device lost errors",
+      "ReBAR (Resizable BAR) strongly recommended for Arc performance",
+      "D3D9/DX11 translation layer on Arc (D3D12 underneath) causes compatibility issues",
+      "Subgroup matrix operations available via experimental chromium extension (chromium_experimental_subgroup_matrix)",
+      "Intel ANV driver (Linux) vs Windows Intel driver may expose different limits",
+      "Iris Xe integrated: shared memory severely limits path tracing bandwidth",
+      "Some Tiger Lake configs report 512 maxComputeWorkGroupInvocations",
+      "Keep drivers current -- Intel Arc driver updates significantly improve stability"
+    ],
+    "intel_texture_formats": {
+      "bc_formats": true,
+      "etc2_formats": false,
+      "astc_formats": false,
+      "note": "Desktop Intel (both Arc and Iris Xe): BC only."
+    },
+    "intel_optimal_workgroup_size": {
+      "general": 64,
+      "path_tracing_arc": 64,
+      "path_tracing_iris_xe": 32,
+      "note": "SIMD16 default. 64 = 4 subgroups for Arc. Iris Xe integrated: 32 to reduce register pressure."
+    }
+  },
+
+  "cross_platform_summary": {
+    "texture_format_matrix": {
+      "bc_formats": {
+        "desktop_windows_amd": true,
+        "desktop_windows_nvidia": true,
+        "desktop_windows_intel": true,
+        "desktop_macos": true,
+        "desktop_linux": true,
+        "ios": false,
+        "android": false,
+        "note": "BC (S3TC/DXT) on all desktop. NOT on mobile."
+      },
+      "etc2_astc_formats": {
+        "desktop_windows": false,
+        "desktop_macos": false,
+        "desktop_linux_varies": true,
+        "ios": true,
+        "android": true,
+        "note": "ETC2 + ASTC on all mobile. Not on desktop macOS/Windows."
+      },
+      "recommendation": "Use Basis Universal / KTX2 supercompressed textures that transcode to BC on desktop and ASTC on mobile."
+    },
+
+    "shader_f16_support_matrix": {
+      "nvidia_turing_plus": true,
+      "nvidia_pascal": "exposed but no perf benefit (runs at FP32 rate)",
+      "amd_rdna2_rdna3": true,
+      "amd_rdna1": false,
+      "apple_all": true,
+      "intel_arc": true,
+      "intel_iris_xe": true,
+      "qualcomm_adreno_all": false,
+      "arm_mali": true,
+      "samsung_xclipse": true,
+      "note": "Qualcomm Adreno is the ONLY major GPU family that CANNOT use shader-f16 in WebGPU. The blocker is lack of 16-bit value support in uniform/storage buffers."
+    },
+
+    "subgroup_size_summary": {
+      "nvidia_all": { "fixed": 32 },
+      "amd_rdna": { "default_vulkan": 64, "native": 32, "range": [32, 64] },
+      "apple_all": { "fixed": 32 },
+      "qualcomm_adreno": { "default": 64, "range": [64, 128] },
+      "arm_mali": { "fixed": 16 },
+      "intel_xe": { "default": 16, "range": [8, 16, 32] },
+      "samsung_xclipse": { "default": 32, "range": [32, 64] },
+      "note": "Write shaders that work with any subgroup size for portability. Subgroup operations in WebGPU still experimental."
+    },
+
+    "browser_support_status": {
+      "chrome_desktop": "Stable since Chrome 113 (May 2023). All platforms.",
+      "chrome_android": "Stable since Chrome 121 (Jan 2024). Requires Android 12+.",
+      "safari": "Stable since Safari 18 (Sep 2024). macOS and iOS.",
+      "firefox": "Nightly only as of early 2026. ~90% spec compliance. 3 full-time devs.",
+      "edge": "Same as Chrome (Chromium-based)."
+    },
+
+    "common_pitfalls_for_path_tracers": [
+      "maxStorageBufferBindingSize is 128 MiB default -- BVH/scene data may exceed this. Request higher limit.",
+      "maxStorageBuffersPerShaderStage is 8 default -- path tracers often need more. Request up to 10 (Chrome 120+) or 16 (Chrome 146+).",
+      "Mali GPUs have 512 maxComputeInvocationsPerWorkGroup, not 1024. Size workgroups accordingly.",
+      "Adreno maxComputeWorkGroupSizeZ is 64, not 1024. Avoid deep Z workgroups on mobile.",
+      "Intel Arc maxComputeWorkGroupSizeZ is 64.",
+      "No shader-f16 on Qualcomm -- cannot use f16 for perf optimization on most Android flagships.",
+      "iOS has NO BC textures. Must ship ASTC variants for iPhone.",
+      "Texture sampling in compute shaders: performance varies wildly across vendors.",
+      "Chrome on laptops may use integrated GPU instead of discrete. powerPreference hint does not always work.",
+      "Thermal throttling on mobile reduces sustained path tracing performance by 30-60%.",
+      "Buffer size limits on mobile (128 MiB) can prevent loading complex scenes.",
+      "WebGPU does NOT expose hardware ray tracing -- all path tracing must be in compute shaders regardless of GPU.",
+      "AMD Vulkan default subgroup size is 64 (not native 32) -- test both via VK_EXT_subgroup_size_control.",
+      "Mali SFU pipeline is 4-wide -- sin/cos/rsqrt are 4x slower than FMA. Minimize transcendentals on Mali."
+    ]
+  }
+}
