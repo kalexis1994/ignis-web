@@ -73,13 +73,22 @@ async function init() {
     quality:     { scale: 0.67, label: 'Quality (1.5x)' },
     dlaa:        { scale: 1.00, label: 'DLAA (1x, AA only)' },
   };
-  const hashMode = location.hash.replace('#', '');
-  let fsrMode = FSR_MODES[hashMode] ? hashMode : 'balanced';
+  // Read config from splash screen (or defaults)
+  const cfg = window.IGNIS_CONFIG || {};
+  let fsrMode = cfg.fsrMode || location.hash.replace('#','') || 'balanced';
+  if (!FSR_MODES[fsrMode]) fsrMode = 'balanced';
+  const displayCap = cfg.displayCap || 1080;
+  const texSize = cfg.texSize ?? 512;
+  const denoiseMode = cfg.denoise || 'full';
+  const maxBounces = cfg.bounces || 2;
+  const sppPerFrame = cfg.spp || 1;
+  const sharcEnabled = cfg.sharc !== false;
+  rlog(`Config: fsr=${fsrMode} display=${displayCap}p tex=${texSize} denoise=${denoiseMode} bounces=${maxBounces} spp=${sppPerFrame} sharc=${sharcEnabled}`);
 
-  // Display resolution — native device resolution
-  const dpr = window.devicePixelRatio || 1;
-  const displayWidth = Math.ceil(Math.floor(window.innerWidth * dpr) / 8) * 8;
-  const displayHeight = Math.ceil(Math.floor(window.innerHeight * dpr) / 8) * 8;
+  // Display resolution — capped by user preference
+  const dispScale = Math.min(1.0, displayCap / Math.max(window.innerWidth, window.innerHeight));
+  const displayWidth = Math.ceil(Math.floor(window.innerWidth * dispScale) / 8) * 8;
+  const displayHeight = Math.ceil(Math.floor(window.innerHeight * dispScale) / 8) * 8;
   canvas.width = displayWidth;
   canvas.height = displayHeight;
   context.configure({ device, format, alphaMode: 'opaque' });
@@ -168,7 +177,7 @@ async function init() {
   device.queue.writeBuffer(fsrParamsBuf, 0, fsrParamsData);
 
   // --- Load textures into GPU texture array ---
-  const TEX_SIZE = 1024;
+  const TEX_SIZE = texSize || 512;
   const texInfo = scene.textureInfo;
   const texCount = texInfo ? texInfo.count : 0;
   let texArray;
@@ -189,6 +198,7 @@ async function init() {
             .then(blob => createImageBitmap(blob, {
               resizeWidth: TEX_SIZE, resizeHeight: TEX_SIZE,
               resizeQuality: 'high',
+              colorSpaceConversion: 'none', // keep raw sRGB bytes, shader converts
             }))
             .then(bmp => {
               device.queue.copyExternalImageToTexture(
@@ -471,6 +481,21 @@ async function init() {
     { binding: 3, resource: ndTex.createView() },
     { binding: 4, resource: ptOutputTex.createView() },
   ]});
+  // Spatial-only: first pass reads noisy directly
+  const dnBG_noisy2ping = device.createBindGroup({ layout: dnAtrousLayout, entries: [
+    { binding: 0, resource: { buffer: dnParamBufs[0] } },
+    { binding: 1, resource: noisyTex.createView() },
+    { binding: 2, resource: pingTex.createView() },
+    { binding: 3, resource: ndTex.createView() },
+  ]});
+  // Raw mode: composite reads noisy directly (no denoise)
+  const dnBG_comp_noisy = device.createBindGroup({ layout: dnCompLayout, entries: [
+    { binding: 0, resource: { buffer: dnCompParamBuf } },
+    { binding: 1, resource: noisyTex.createView() },
+    { binding: 2, resource: pongTex.createView() },
+    { binding: 3, resource: ndTex.createView() },
+    { binding: 4, resource: ptOutputTex.createView() },
+  ]});
 
   // --- Display pipeline (reads FSR final output) ---
   const dispBGLayout = device.createBindGroupLayout({
@@ -625,25 +650,97 @@ async function init() {
       bw*pos[v0+3]+bestBary[0]*pos[v1+3]+bestBary[1]*pos[v2+3],
       bw*nrm[v0+3]+bestBary[0]*nrm[v1+3]+bestBary[1]*nrm[v2+3],
     ];
-    return { triIdx:bestTri, matIdx:mi, uv:huv, t:bestT };
+    const hn = [
+      bw*nrm[v0]+bestBary[0]*nrm[v1]+bestBary[1]*nrm[v2],
+      bw*nrm[v0+1]+bestBary[0]*nrm[v1+1]+bestBary[1]*nrm[v2+1],
+      bw*nrm[v0+2]+bestBary[0]*nrm[v1+2]+bestBary[1]*nrm[v2+2],
+    ];
+    const nl = Math.sqrt(hn[0]*hn[0]+hn[1]*hn[1]+hn[2]*hn[2]) || 1;
+    const hitPos = [orig[0]+dir[0]*bestT, orig[1]+dir[1]*bestT, orig[2]+dir[2]*bestT];
+    return { triIdx:bestTri, matIdx:mi, uv:huv, t:bestT, normal:[hn[0]/nl,hn[1]/nl,hn[2]/nl], hitPos };
   }
+
+  const pickModal = document.getElementById('pick-modal');
+  const pickTitle = document.getElementById('pick-title');
+  const pickProps = document.getElementById('pick-props');
+  const pickTextures = document.getElementById('pick-textures');
+  document.getElementById('pick-close').addEventListener('click', () => { pickModal.style.display = 'none'; });
+  pickModal.addEventListener('click', (e) => { if (e.target === pickModal) pickModal.style.display = 'none'; });
 
   function showPickInfo(pick) {
     if (!pick) { debugContent.textContent = 'No hit (sky)'; return; }
     const m = scene.gpuMaterials, o = pick.matIdx * 16;
     const names = scene.materialNames || [];
-    const types = ['PBR','','Emissive','Glass'];
-    debugContent.textContent = [
-      `Mat #${pick.matIdx}: "${names[pick.matIdx] || '?'}"`,
-      `Type: ${types[Math.round(m[o+3])] || 'Unknown'}`,
-      `Albedo: [${m[o].toFixed(3)}, ${m[o+1].toFixed(3)}, ${m[o+2].toFixed(3)}]`,
-      `Metallic: ${m[o+8].toFixed(2)}  Rough: ${m[o+7].toFixed(2)}`,
-      `Tex: base=${m[o+9]}  mr=${m[o+10]}  nrm=${m[o+11]}`,
-      `Alpha: mode=${m[o+12]}  cutoff=${m[o+13].toFixed(2)}`,
-      `IoR: ${m[o+14].toFixed(2)}`,
-      `UV: [${pick.uv[0].toFixed(4)}, ${pick.uv[1].toFixed(4)}]`,
-      `Tri: #${pick.triIdx}  Dist: ${pick.t.toFixed(3)}`,
-    ].join('\n');
+    const types = ['PBR','Metal','Emissive','Glass'];
+    const alphaModes = ['Opaque','Mask','Blend'];
+    const name = names[pick.matIdx] || 'unknown';
+
+    // Short info in debug panel
+    debugContent.textContent = `${name} | Tri #${pick.triIdx} | d=${pick.t.toFixed(2)}`;
+
+    // Full info in modal
+    pickTitle.textContent = `#${pick.matIdx} "${name}"`;
+
+    const albR = m[o], albG = m[o+1], albB = m[o+2];
+    const albHex = '#' + [albR,albG,albB].map(v => Math.round(v*255).toString(16).padStart(2,'0')).join('');
+
+    pickProps.innerHTML = `
+      <div style="margin-bottom:10px;">
+        <span style="color:#888;">Type:</span> <span style="color:#fff;">${types[Math.round(m[o+3])] || '?'}</span>
+        &nbsp;&nbsp;<span style="color:#888;">Alpha:</span> ${alphaModes[Math.round(m[o+12])] || '?'} (cutoff ${m[o+13].toFixed(2)})
+      </div>
+      <div style="margin-bottom:8px;">
+        <span style="color:#888;">Albedo:</span>
+        <span style="display:inline-block;width:14px;height:14px;border-radius:3px;vertical-align:middle;border:1px solid #444;background:${albHex};"></span>
+        <span style="color:#fff;">${albHex}</span>
+        <span style="color:#555;">[${albR.toFixed(2)}, ${albG.toFixed(2)}, ${albB.toFixed(2)}]</span>
+      </div>
+      <div style="margin-bottom:8px;">
+        <span style="color:#888;">Metallic:</span> <span style="color:#fff;">${m[o+8].toFixed(2)}</span>
+        &nbsp;&nbsp;<span style="color:#888;">Roughness:</span> <span style="color:#fff;">${m[o+7].toFixed(2)}</span>
+        &nbsp;&nbsp;<span style="color:#888;">IoR:</span> <span style="color:#fff;">${m[o+14].toFixed(2)}</span>
+      </div>
+      <div style="margin-bottom:8px;">
+        <span style="color:#888;">UV:</span> [${pick.uv[0].toFixed(4)}, ${pick.uv[1].toFixed(4)}]
+        &nbsp;&nbsp;<span style="color:#888;">Tri:</span> #${pick.triIdx}
+        &nbsp;&nbsp;<span style="color:#888;">Dist:</span> ${pick.t.toFixed(3)}
+      </div>
+      <div style="margin-bottom:4px;">
+        <span style="color:#888;">Normal:</span> [${pick.normal[0].toFixed(3)}, ${pick.normal[1].toFixed(3)}, ${pick.normal[2].toFixed(3)}]
+      </div>
+    `;
+
+    // Texture previews
+    const texInfo = scene.textureInfo;
+    const texIds = { base: m[o+9], mr: m[o+10], normal: m[o+11] };
+    const texLabels = { base: 'Base Color', mr: 'Metal/Rough', normal: 'Normal' };
+    let texHTML = '';
+
+    if (texInfo) {
+      for (const [key, idx] of Object.entries(texIds)) {
+        const ti = Math.round(idx);
+        if (ti >= 0 && ti < texInfo.count) {
+          const uri = texInfo.imageURIs[ti];
+          texHTML += `
+            <div style="margin-bottom:12px;">
+              <div style="font-size:10px; text-transform:uppercase; letter-spacing:1px; color:#0a0; margin-bottom:4px;">${texLabels[key]} <span style="color:#444;">(#${ti})</span></div>
+              <img src="scene/${uri}" style="width:100%; max-height:180px; object-fit:contain; border-radius:4px; border:1px solid rgba(255,255,255,0.08); background:#111;">
+            </div>
+          `;
+        } else {
+          texHTML += `
+            <div style="margin-bottom:8px;">
+              <span style="font-size:10px; text-transform:uppercase; letter-spacing:1px; color:#333;">${texLabels[key]}: none</span>
+            </div>
+          `;
+        }
+      }
+    } else {
+      texHTML = '<div style="color:#444;">No textures loaded</div>';
+    }
+
+    pickTextures.innerHTML = texHTML;
+    pickModal.style.display = 'flex';
   }
 
   document.addEventListener('keydown', e => {
@@ -717,15 +814,50 @@ async function init() {
 
   let threeFingerStart = null;
 
+  // Long-press debug pick (hold 600ms without moving)
+  let longPressTimer = null;
+  let longPressPos = null;
+  let longPressFired = false;
+
+  function startLongPress(x, y) {
+    longPressPos = { x, y };
+    longPressFired = false;
+    clearTimeout(longPressTimer);
+    longPressTimer = setTimeout(() => {
+      longPressFired = true;
+      // Activate debug mode and pick
+      if (!debugMode) {
+        debugMode = true;
+        debugPanel.classList.add('open');
+        debugCrosshair.style.display = 'block';
+      }
+      showPickInfo(debugPick(x, y));
+      // Haptic feedback if available
+      if (navigator.vibrate) navigator.vibrate(30);
+    }, 600);
+  }
+
+  function cancelLongPress() {
+    clearTimeout(longPressTimer);
+    longPressTimer = null;
+  }
+
   document.addEventListener('touchstart', e => {
     if (e.touches.length >= 3) {
       threeFingerStart = performance.now();
+      cancelLongPress();
       hideStick(stickLeft);
       hideStick(stickRight);
       e.preventDefault();
       return;
     }
     if (menuOpen) return;
+
+    // Start long-press detection on single touch
+    if (e.touches.length === 1) {
+      startLongPress(e.touches[0].clientX, e.touches[0].clientY);
+    }
+
     for (const t of e.changedTouches) {
       const isLeft = t.clientX < halfW();
       const stick = isLeft ? stickLeft : stickRight;
@@ -740,7 +872,13 @@ async function init() {
 
   document.addEventListener('touchmove', e => {
     if (threeFingerStart !== null && e.touches.length >= 3) {
-      threeFingerStart = null; // drag, not a tap
+      threeFingerStart = null;
+    }
+    // Cancel long-press if finger moves more than 10px
+    if (longPressPos && e.touches.length === 1) {
+      const dx = e.touches[0].clientX - longPressPos.x;
+      const dy = e.touches[0].clientY - longPressPos.y;
+      if (dx*dx + dy*dy > 100) cancelLongPress();
     }
     if (menuOpen) return;
     for (const t of e.changedTouches) {
@@ -750,11 +888,14 @@ async function init() {
   }, {passive: false});
 
   function onTouchEnd(e) {
+    cancelLongPress();
     if (threeFingerStart !== null && e.touches.length === 0) {
       const elapsed = performance.now() - threeFingerStart;
       threeFingerStart = null;
       if (elapsed < 500) { toggleMenu(); return; }
     }
+    // If long-press just fired, don't process as stick release
+    if (longPressFired) { longPressFired = false; return; }
     for (const t of e.changedTouches) {
       if (t.identifier === stickLeft.touchId) hideStick(stickLeft);
       if (t.identifier === stickRight.touchId) hideStick(stickRight);
@@ -912,7 +1053,7 @@ async function init() {
     const f32 = new Float32Array(ud);
     const u32 = new Uint32Array(ud);
     f32[0] = width; f32[1] = height;
-    u32[2] = 1; u32[3] = frameIndex; // always SPP=1
+    u32[2] = 1; u32[3] = frameIndex;
     f32[4] = camera.pos[0]; f32[5] = camera.pos[1]; f32[6] = camera.pos[2]; f32[7] = 0;
     f32[8] = forward[0]; f32[9] = forward[1]; f32[10] = forward[2]; f32[11] = 0;
     f32[12] = right[0]; f32[13] = right[1]; f32[14] = right[2]; f32[15] = 0;
@@ -920,6 +1061,7 @@ async function init() {
     const sun = getSunDir();
     f32[20] = sun[0]; f32[21] = sun[1]; f32[22] = sun[2];
     u32[23] = stats.emissiveTris;
+    u32[24] = maxBounces;
     device.queue.writeBuffer(uniformBuffer, 0, ud);
 
     // Write temporal uniforms (current + previous camera)
@@ -950,45 +1092,61 @@ async function init() {
       spF[4] = camera.pos[0]; spF[5] = camera.pos[1]; spF[6] = camera.pos[2]; spF[7] = 0;
       device.queue.writeBuffer(sharcParamBuf, 0, sp);
 
-      // Pass 1: Path trace + SHaRC store/lookup
-      const ptPass = encoder.beginComputePass();
-      ptPass.setPipeline(computePipeline);
-      ptPass.setBindGroup(0, bg0);
-      ptPass.setBindGroup(1, bg1);
-      ptPass.setBindGroup(2, bg2);
-      ptPass.setBindGroup(3, bg3);
-      ptPass.dispatchWorkgroups(Math.ceil(width/8), Math.ceil(height/8));
-      ptPass.end();
-
-      // SHaRC resolve (merge accumulation → resolved cache)
-      const sharcPass = encoder.beginComputePass();
-      sharcPass.setPipeline(sharcResolvePipeline);
-      sharcPass.setBindGroup(0, bg2Resolve);
-      sharcPass.dispatchWorkgroups(Math.ceil(SHARC_CAPACITY / 256));
-      sharcPass.end();
-
-      // Pass 2: Temporal reprojection (blend noisy + reprojected history → hdrTex)
-      const tmpPass = encoder.beginComputePass();
-      tmpPass.setPipeline(tmpPipeline);
-      tmpPass.setBindGroup(0, historyFrame === 0 ? tmpBG_A : tmpBG_B);
-      tmpPass.dispatchWorkgroups(Math.ceil(width/8), Math.ceil(height/8));
-      tmpPass.end();
-      historyFrame = 1 - historyFrame; // swap double buffer
-
-      // Pass 3-5: À-trous spatial denoise (3 iterations, step 1→2→4)
-      const dnBGs = [dnBG_hdr2ping, dnBG_ping2pong, dnBG_pong2ping];
-      for (let di = 0; di < 3; di++) {
-        const dp = encoder.beginComputePass();
-        dp.setPipeline(dnAtrousPipeline);
-        dp.setBindGroup(0, dnBGs[di]);
-        dp.dispatchWorkgroups(Math.ceil(width/8), Math.ceil(height/8));
-        dp.end();
+      // Multi-SPP loop: trace multiple samples per frame
+      for (let spp = 0; spp < sppPerFrame; spp++) {
+        if (spp > 0) {
+          frameIndex++;
+          u32[3] = frameIndex; // update seed for different noise pattern
+          device.queue.writeBuffer(uniformBuffer, 0, ud);
+        }
+        const ptPass = encoder.beginComputePass();
+        ptPass.setPipeline(computePipeline);
+        ptPass.setBindGroup(0, bg0);
+        ptPass.setBindGroup(1, bg1);
+        ptPass.setBindGroup(2, bg2);
+        ptPass.setBindGroup(3, bg3);
+        ptPass.dispatchWorkgroups(Math.ceil(width/8), Math.ceil(height/8));
+        ptPass.end();
       }
 
-      // Pass 5: Composite (tonemap denoised HDR → LDR ptOutputTex)
+      // SHaRC resolve
+      if (sharcEnabled) {
+        const sharcPass = encoder.beginComputePass();
+        sharcPass.setPipeline(sharcResolvePipeline);
+        sharcPass.setBindGroup(0, bg2Resolve);
+        sharcPass.dispatchWorkgroups(Math.ceil(SHARC_CAPACITY / 256));
+        sharcPass.end();
+      }
+
+      if (denoiseMode === 'full') {
+        // Temporal reprojection
+        const tmpPass = encoder.beginComputePass();
+        tmpPass.setPipeline(tmpPipeline);
+        tmpPass.setBindGroup(0, historyFrame === 0 ? tmpBG_A : tmpBG_B);
+        tmpPass.dispatchWorkgroups(Math.ceil(width/8), Math.ceil(height/8));
+        tmpPass.end();
+        historyFrame = 1 - historyFrame;
+      }
+
+      if (denoiseMode !== 'off') {
+        // À-trous spatial denoise (3 iterations)
+        // If no temporal, first pass reads noisyTex instead of hdrTex
+        const dnBGs = (denoiseMode === 'full')
+          ? [dnBG_hdr2ping, dnBG_ping2pong, dnBG_pong2ping]
+          : [dnBG_noisy2ping, dnBG_ping2pong, dnBG_pong2ping];
+        for (let di = 0; di < 3; di++) {
+          const dp = encoder.beginComputePass();
+          dp.setPipeline(dnAtrousPipeline);
+          dp.setBindGroup(0, dnBGs[di]);
+          dp.dispatchWorkgroups(Math.ceil(width/8), Math.ceil(height/8));
+          dp.end();
+        }
+      }
+
+      // Composite (tonemap → LDR)
       const compPass = encoder.beginComputePass();
       compPass.setPipeline(dnCompPipeline);
-      compPass.setBindGroup(0, dnBG_comp);
+      compPass.setBindGroup(0, denoiseMode !== 'off' ? dnBG_comp : dnBG_comp_noisy);
       compPass.dispatchWorkgroups(Math.ceil(width/8), Math.ceil(height/8));
       compPass.end();
 

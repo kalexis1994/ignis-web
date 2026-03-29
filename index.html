@@ -114,9 +114,131 @@
     }
     #debug-crosshair::before { top: 0; left: 50%; width: 1px; height: 100%; transform: translateX(-50%); }
     #debug-crosshair::after { left: 0; top: 50%; height: 1px; width: 100%; transform: translateY(-50%); }
+    /* Splash / initial setup screen */
+    #splash {
+      position: fixed; inset: 0; z-index: 100;
+      background: linear-gradient(135deg, #0a0a0f 0%, #111118 50%, #0a0a0f 100%);
+      display: flex; justify-content: center; align-items: center;
+      transition: opacity 0.4s;
+    }
+    #splash.hidden { opacity: 0; pointer-events: none; }
+    .splash-panel {
+      width: 380px; max-width: 92vw;
+      background: rgba(18,18,22,0.97);
+      border: 1px solid rgba(255,255,255,0.06);
+      border-radius: 12px;
+      padding: 28px 28px 20px;
+      box-shadow: 0 12px 48px rgba(0,0,0,0.6);
+    }
+    .splash-logo {
+      text-align: center; margin-bottom: 20px;
+      font-size: 22px; font-weight: bold; color: #fff;
+      letter-spacing: 2px;
+    }
+    .splash-logo span { color: #0c0; }
+    .splash-sub {
+      text-align: center; font-size: 11px; color: #555;
+      margin-top: -14px; margin-bottom: 20px;
+    }
+    .splash-sec { margin-bottom: 14px; }
+    .splash-sec .menu-title { font-size: 10px; text-transform: uppercase; letter-spacing: 1.2px; color: #0c0; margin-bottom: 10px; padding-bottom: 4px; border-bottom: 1px solid rgba(255,255,255,0.05); }
+    .splash-row {
+      display: flex; align-items: center; margin-bottom: 10px; gap: 8px;
+      color: #aaa; font-size: 12px;
+    }
+    .splash-row label { flex: 0 0 120px; }
+    .splash-row select {
+      flex: 1; background: rgba(255,255,255,0.08); color: #ddd;
+      border: 1px solid rgba(255,255,255,0.12); border-radius: 4px;
+      padding: 6px 10px; font-size: 12px; font-family: 'Courier New', monospace;
+    }
+    .splash-row .splash-val { flex: 0 0 40px; text-align: right; font-size: 11px; color: #555; }
+    .splash-row input[type="checkbox"] { accent-color: #0c0; width: 16px; height: 16px; }
+    #splash-start {
+      display: block; width: 100%; margin-top: 18px;
+      padding: 12px; font-size: 14px; font-weight: bold;
+      font-family: 'Courier New', monospace;
+      background: #0c0; color: #000; border: none;
+      border-radius: 6px; cursor: pointer;
+      letter-spacing: 1px;
+      transition: background 0.15s;
+    }
+    #splash-start:hover { background: #0e0; }
+    #splash-start:active { background: #0a0; }
+    .splash-footer { text-align: center; font-size: 9px; color: #333; margin-top: 12px; }
   </style>
 </head>
 <body>
+  <div id="splash">
+    <div class="splash-panel">
+      <div class="splash-logo">IGNIS <span>WEB</span></div>
+      <div class="splash-sub">WebGPU Path Tracer</div>
+      <div class="splash-sec">
+        <div class="menu-title">Quality Preset</div>
+        <div class="splash-row">
+          <label>FSR Mode</label>
+          <select id="splash-fsr">
+            <option value="performance">Performance (2x)</option>
+            <option value="balanced" selected>Balanced (1.7x)</option>
+            <option value="quality">Quality (1.5x)</option>
+            <option value="dlaa">DLAA (native)</option>
+          </select>
+        </div>
+        <div class="splash-row">
+          <label>Display Scale</label>
+          <select id="splash-display">
+            <option value="720">720p</option>
+            <option value="1080" selected>1080p</option>
+            <option value="1440">1440p (native)</option>
+          </select>
+        </div>
+      </div>
+      <div class="splash-sec">
+        <div class="menu-title">Rendering</div>
+        <div class="splash-row">
+          <label>Textures</label>
+          <select id="splash-tex">
+            <option value="0">Off (flat colors)</option>
+            <option value="256">Low (256px)</option>
+            <option value="512" selected>Medium (512px)</option>
+            <option value="1024">High (1024px)</option>
+          </select>
+        </div>
+        <div class="splash-row">
+          <label>Denoiser</label>
+          <select id="splash-denoise">
+            <option value="full" selected>Full (temporal + spatial)</option>
+            <option value="spatial">Spatial only</option>
+            <option value="off">Off (raw)</option>
+          </select>
+        </div>
+        <div class="splash-row">
+          <label>Bounces</label>
+          <select id="splash-bounces">
+            <option value="1">1 (direct only)</option>
+            <option value="2" selected>2 (1 indirect)</option>
+            <option value="3">3 (2 indirect)</option>
+            <option value="4">4 (3 indirect)</option>
+          </select>
+        </div>
+        <div class="splash-row">
+          <label>SPP / frame</label>
+          <select id="splash-spp">
+            <option value="1" selected>1 (real-time)</option>
+            <option value="2">2 (smoother)</option>
+            <option value="4">4 (quality)</option>
+          </select>
+        </div>
+        <div class="splash-row">
+          <label>SHaRC GI Cache</label>
+          <input type="checkbox" id="splash-sharc" checked>
+        </div>
+      </div>
+      <button id="splash-start">START RENDERING</button>
+      <button id="splash-clear-cache" style="display:block;width:100%;margin-top:8px;padding:8px;font-size:11px;font-family:'Courier New',monospace;background:rgba(255,60,60,0.15);color:#f66;border:1px solid rgba(255,60,60,0.3);border-radius:6px;cursor:pointer;">Clear Scene Cache</button>
+      <div class="splash-footer">Sponza &bull; 3.7M triangles &bull; Adreno / Desktop GPU</div>
+    </div>
+  </div>
   <canvas id="canvas"></canvas>
   <canvas id="gizmo" width="120" height="120"></canvas>
   <div id="info">Initializing WebGPU...</div>
@@ -125,6 +247,16 @@
   <div id="debug-panel">
     <div class="dbg-title">Debug Pick</div>
     <div id="debug-content">Click to inspect...</div>
+  </div>
+  <div id="pick-modal" style="display:none; position:fixed; inset:0; z-index:30; background:rgba(0,0,0,0.6); backdrop-filter:blur(6px); -webkit-backdrop-filter:blur(6px); justify-content:center; align-items:center;">
+    <div style="background:rgba(18,18,22,0.97); border:1px solid rgba(255,255,255,0.08); border-radius:10px; padding:20px; width:360px; max-width:92vw; max-height:85vh; overflow-y:auto; color:#ccc; font-size:12px; font-family:'Courier New',monospace; box-shadow:0 8px 32px rgba(0,0,0,0.5);">
+      <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:14px;">
+        <span style="font-size:14px; font-weight:bold; color:#fff;" id="pick-title">Material</span>
+        <button id="pick-close" style="background:none; border:none; color:#666; font-size:20px; cursor:pointer; padding:2px 8px; border-radius:4px;">&times;</button>
+      </div>
+      <div id="pick-props" style="line-height:1.8; margin-bottom:14px;"></div>
+      <div id="pick-textures"></div>
+    </div>
   </div>
   <div id="options-menu">
     <div class="menu-panel">
@@ -204,10 +336,36 @@
     }
     window.onerror = function(msg,src,line){ _log('ERR:'+msg+' @'+src+':'+line, true); };
     _log('HTML loaded');
-  </script>
-  <script type="module">
-    import('./renderer.js').catch(function(e) {
-      _log('MODULE_FAIL: ' + e.message, true);
+
+    // Splash: collect settings and start renderer on button click
+    document.getElementById('splash-clear-cache').addEventListener('click', function() {
+      indexedDB.deleteDatabase('ignis-scene-cache');
+      this.textContent = 'Cache cleared!';
+      this.style.color = '#0c0';
+      this.style.borderColor = 'rgba(0,255,0,0.3)';
+      this.style.background = 'rgba(0,255,0,0.1)';
+      setTimeout(function() { location.reload(); }, 800);
+    });
+
+    document.getElementById('splash-start').addEventListener('click', function() {
+      // Store settings in global for renderer to read
+      window.IGNIS_CONFIG = {
+        fsrMode:    document.getElementById('splash-fsr').value,
+        displayCap: parseInt(document.getElementById('splash-display').value),
+        texSize:    parseInt(document.getElementById('splash-tex').value),
+        denoise:    document.getElementById('splash-denoise').value,
+        bounces:    parseInt(document.getElementById('splash-bounces').value),
+        spp:        parseInt(document.getElementById('splash-spp').value),
+        sharc:      document.getElementById('splash-sharc').checked,
+      };
+      _log('Config: ' + JSON.stringify(window.IGNIS_CONFIG));
+      // Fade out splash
+      document.getElementById('splash').classList.add('hidden');
+      setTimeout(function() { document.getElementById('splash').style.display = 'none'; }, 400);
+      // Load renderer module
+      import('./renderer.js').catch(function(e) {
+        _log('MODULE_FAIL: ' + e.message, true);
+      });
     });
   </script>
 </body>

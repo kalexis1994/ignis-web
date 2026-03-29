@@ -21,6 +21,10 @@ struct Uniforms {
   fov_factor: f32,
   sun_dir: vec3f,
   emissive_tri_count: u32,
+  max_bounces: u32,
+  _pad3: u32,
+  _pad4: u32,
+  _pad5: u32,
 };
 
 struct BVHNode { aabb_min: vec3f, left_first: u32, aabb_max: vec3f, tri_count: u32, };
@@ -59,7 +63,7 @@ const INV_PI: f32 = 0.31830988618;
 const INF: f32 = 1e30;
 const T_MIN: f32 = 0.00001;    // minimum ray t (intersection test)
 const BIAS: f32 = 0.0002;     // shadow/bounce ray offset
-const MAX_BOUNCES: u32 = 2u;
+// MAX_BOUNCES now comes from uniforms.max_bounces
 
 const SUN_COLOR: vec3f = vec3f(8.0, 7.2, 5.5);
 const SKY_COLOR: vec3f = vec3f(0.8, 0.9, 1.2);
@@ -321,7 +325,22 @@ fn trace_bvh(origin: vec3f, dir: vec3f) -> HitInfo {
       for (var i = 0u; i < nd.tri_count; i++) {
         let ti = nd.left_first + i; let td = tri_data[ti];
         let r = intersect_tri(origin, dir, vertices[td.x].xyz, vertices[td.y].xyz, vertices[td.z].xyz, hit.t);
-        if r.x < hit.t { hit.t=r.x; hit.u=r.y; hit.v=r.z; hit.tri_idx=ti; hit.hit=true; }
+        if r.x < hit.t {
+          // Inline alpha test: reject transparent hits without updating hit.t
+          // BVH naturally continues to find the next opaque hit behind
+          let mat = material_buf[td.w];
+          let am = u32(mat.alpha_mode + 0.5);
+          if am >= 1u {
+            let bw = 1.0 - r.y - r.z;
+            let uv = get_uv(td, bw, r.y, r.z);
+            let btx = i32(mat.base_tex + 0.5);
+            var ta = 1.0;
+            if btx >= 0 { ta = textureSampleLevel(tex_array, tex_sampler_pt, uv, btx, 0.0).a; }
+            if am == 1u && ta < max(mat.alpha_cutoff, 0.5) { continue; }
+            if am == 2u && ta < rand() { continue; }
+          }
+          hit.t=r.x; hit.u=r.y; hit.v=r.z; hit.tri_idx=ti; hit.hit=true;
+        }
       }
       if sp==0u{break;} sp--; cur=stk[sp]; continue;
     }
@@ -351,7 +370,21 @@ fn trace_shadow(origin: vec3f, dir: vec3f, max_t: f32) -> bool {
       for (var i = 0u; i < nd.tri_count; i++) {
         let ti = nd.left_first+i; let td = tri_data[ti];
         let r = intersect_tri(origin, dir, vertices[td.x].xyz, vertices[td.y].xyz, vertices[td.z].xyz, max_t);
-        if r.x < max_t { return true; }
+        if r.x < max_t {
+          // Inline alpha test — transparent surfaces don't block light
+          let mat = material_buf[td.w];
+          let am = u32(mat.alpha_mode + 0.5);
+          if am >= 1u {
+            let bw = 1.0 - r.y - r.z;
+            let uv = get_uv(td, bw, r.y, r.z);
+            let btx = i32(mat.base_tex + 0.5);
+            var ta = 1.0;
+            if btx >= 0 { ta = textureSampleLevel(tex_array, tex_sampler_pt, uv, btx, 0.0).a; }
+            if am == 1u && ta < mat.alpha_cutoff { continue; }
+            if am == 2u && ta < rand() { continue; }
+          }
+          return true;
+        }
       }
       if sp==0u{break;} sp--; cur=stk[sp]; continue;
     }
@@ -489,7 +522,7 @@ fn path_trace(primary_origin: vec3f, primary_dir: vec3f) -> PathResult {
   var dir = primary_dir;
   var specular_bounce = true;
 
-  for (var bounce = 0u; bounce < MAX_BOUNCES; bounce++) {
+  for (var bounce = 0u; bounce < uniforms.max_bounces; bounce++) {
     let hit = trace_bvh(origin, dir);
     if !hit.hit { radiance += throughput * sky_color(dir); break; }
 
@@ -516,10 +549,11 @@ fn path_trace(primary_origin: vec3f, primary_dir: vec3f) -> PathResult {
       tex_alpha = tc.a;
     }
 
-    // Alpha test (MASK mode)
-    if u32(mat.alpha_mode + 0.5) == 1u && tex_alpha < mat.alpha_cutoff {
-      origin = hit_pos + dir * BIAS;
-      continue;
+    // For BLEND: stochastic already converges to correct alpha coverage.
+    // But premultiply base_color by alpha to handle decals with black RGB + low alpha.
+    // Without this, accepted low-alpha hits contribute full black instead of near-nothing.
+    if u32(mat.alpha_mode + 0.5) == 2u {
+      base_color *= tex_alpha;
     }
 
     // Sample metallic-roughness texture (G=roughness, B=metallic per GLTF spec)
@@ -557,11 +591,28 @@ fn path_trace(primary_origin: vec3f, primary_dir: vec3f) -> PathResult {
 
     if bounce == 0u { result.direct = direct; }
 
-    // Bounce 1+: SHaRC cache for indirect GI
+    // Bounce 1+: try SHaRC cache for indirect GI
     if bounce >= 1u && mat_type != 3u {
       let cached_gi = sharc_read_cached(hit_pos, normal);
-      radiance += throughput * cached_gi * base_color;
-      break;
+      let has_cache = dot(cached_gi, vec3f(1.0)) > 0.001;
+      if has_cache {
+        radiance += throughput * cached_gi * base_color;
+        break;
+      }
+      // No cache — do NEE at indirect point
+      let indirect_direct = sample_sun_nee(hit_pos, normal, V, base_color, roughness, metallic);
+      radiance += throughput * indirect_direct;
+
+      // Last bounce: add sky hemisphere irradiance instead of letting energy die
+      // This is the integral of sky_color over the visible hemisphere, weighted by cos(theta)
+      // Physically correct — it's what the ray would collect if we had infinite bounces
+      if bounce >= uniforms.max_bounces - 1u {
+        let sky_up = sky_color(normal);       // sky in normal direction
+        let sky_side = sky_color(vec3f(normal.x, 0.0, normal.z)); // horizon contribution
+        let sky_irr = mix(sky_side, sky_up, max(normal.y, 0.0)) * INV_PI;
+        radiance += throughput * sky_irr * base_color * (1.0 - metallic);
+        break;
+      }
     }
 
     // BRDF sampling

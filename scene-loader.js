@@ -140,8 +140,10 @@ function extractMaterials(gltf) {
     if (mat.alphaMode === 'MASK') alphaMode = 1;
     else if (mat.alphaMode === 'BLEND') alphaMode = 2;
     let alphaCutoff = mat.alphaCutoff ?? 0.5;
-    // MASK with cutoff 0: discard fully transparent pixels (alpha=0 would pass < 0.0 check)
-    if (alphaMode === 1 && alphaCutoff < 0.001) alphaCutoff = 0.001;
+    // MASK with cutoff 0 or near-zero: treat as BLEND (stochastic)
+    // Authors often set cutoff=0 for decals/foliage that should be alpha-blended
+    // A true MASK material would have cutoff ~0.5
+    if (alphaMode === 1 && alphaCutoff < 0.1) { alphaMode = 2; }
 
     return { albedo, type, emission, roughness, metallic, baseTex, mrTex, normalTex, alphaMode, alphaCutoff, ior };
   });
