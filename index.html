@@ -1,0 +1,83 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>WebGPU Monte Carlo Path Tracer</title>
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    body { background: #000; overflow: hidden; font-family: 'Courier New', monospace; touch-action: none; }
+    canvas#canvas { display: block; width: 100vw; height: 100vh; touch-action: none; }
+    #gizmo {
+      position: fixed; top: 12px; right: 12px;
+      width: 120px; height: 120px;
+      pointer-events: none; z-index: 10;
+    }
+    #info {
+      position: fixed; top: 12px; left: 12px;
+      color: #0f0; font-size: 13px;
+      background: rgba(0,0,0,0.7); padding: 8px 12px;
+      border-radius: 4px; pointer-events: none;
+      line-height: 1.6; z-index: 10;
+    }
+    #error {
+      position: fixed; top: 50%; left: 50%; transform: translate(-50%, -50%);
+      color: #f44; font-size: 18px; text-align: center;
+      display: none; max-width: 600px; line-height: 1.5; z-index: 10;
+    }
+    /* Virtual joysticks — relative positioning, appear where you touch */
+    .stick-zone {
+      position: fixed; width: 140px; height: 140px;
+      border-radius: 50%; z-index: 5;
+      background: rgba(255,255,255,0.08);
+      border: 2px solid rgba(255,255,255,0.15);
+      display: none; /* shown by JS on touch */
+      pointer-events: none;
+    }
+    .stick-knob {
+      position: absolute; width: 52px; height: 52px;
+      border-radius: 50%;
+      background: rgba(255,255,255,0.25);
+      border: 2px solid rgba(255,255,255,0.4);
+      top: 50%; left: 50%;
+      transform: translate(-50%, -50%);
+      pointer-events: none;
+      transition: background 0.1s;
+    }
+    .stick-knob.active {
+      background: rgba(255,255,255,0.45);
+    }
+    .stick-label { display: none; }
+  </style>
+</head>
+<body>
+  <canvas id="canvas"></canvas>
+  <canvas id="gizmo" width="120" height="120"></canvas>
+  <div id="info">Initializing WebGPU...</div>
+  <div id="error"></div>
+  <div class="stick-zone left" id="stick-left">
+    <div class="stick-knob" id="knob-left"></div>
+    <div class="stick-label">MOVE</div>
+  </div>
+  <div class="stick-zone right" id="stick-right">
+    <div class="stick-knob" id="knob-right"></div>
+    <div class="stick-label">LOOK</div>
+  </div>
+  <script>
+    function _log(m, isErr) {
+      fetch('/log', { method:'POST', body: m }).catch(function(){});
+      if (isErr) {
+        var e = document.getElementById('error');
+        if (e) { e.style.display='block'; e.textContent=m; }
+      }
+    }
+    window.onerror = function(msg,src,line){ _log('ERR:'+msg+' @'+src+':'+line, true); };
+    _log('HTML loaded');
+  </script>
+  <script type="module">
+    import('./renderer.js').catch(function(e) {
+      _log('MODULE_FAIL: ' + e.message, true);
+    });
+  </script>
+</body>
+</html>

@@ -1,0 +1,10 @@
+# Scene data (too large for git — download separately)
+scene/scene.bin
+scene/textures/
+
+# Runtime
+client.log
+*.log
+__pycache__/
+.DS_Store
+node_modules/
