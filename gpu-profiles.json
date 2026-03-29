@@ -1,7 +1,6 @@
 {
   "_version": 2,
   "_note": "GPU profiles for ignis-web renderer. Match by vendor+architecture from adapter.info.",
-
   "defaults": {
     "fsrMode": "balanced",
     "maxBounces": 2,
@@ -12,6 +11,7 @@
     "checkerboard": true,
     "workgroupSize": 64,
     "shadowRays": 2,
+    "denoisePasses": 3,
     "displayCap": 1080,
     "waveSize": 32,
     "hwRT": false,
@@ -20,10 +20,13 @@
     "maxStorageTextures": 4,
     "quirks": []
   },
-
   "profiles": {
     "nvidia_ada": {
-      "match": ["nvidia.*ada", "nvidia.*rtx.*40", "geforce.*rtx.*40"],
+      "match": [
+        "nvidia.*ada",
+        "nvidia.*rtx.*40",
+        "geforce.*rtx.*40"
+      ],
       "fsrMode": "quality",
       "maxBounces": 3,
       "texSize": 1024,
@@ -34,10 +37,17 @@
       "maxStorageBuffers": 10,
       "shadowRays": 2,
       "checkerboard": false,
-      "quirks": ["driver_572_crash"]
+      "quirks": [
+        "driver_572_crash"
+      ],
+      "denoisePasses": 5
     },
     "nvidia_ampere": {
-      "match": ["nvidia.*ampere", "nvidia.*rtx.*30", "geforce.*rtx.*30"],
+      "match": [
+        "nvidia.*ampere",
+        "nvidia.*rtx.*30",
+        "geforce.*rtx.*30"
+      ],
       "fsrMode": "quality",
       "maxBounces": 3,
       "texSize": 1024,
@@ -48,10 +58,18 @@
       "maxStorageBuffers": 10,
       "shadowRays": 2,
       "checkerboard": false,
-      "quirks": ["driver_572_crash"]
+      "quirks": [
+        "driver_572_crash"
+      ],
+      "denoisePasses": 5
     },
     "nvidia_turing": {
-      "match": ["nvidia.*turing", "nvidia.*rtx.*20", "geforce.*rtx.*20", "geforce.*1660"],
+      "match": [
+        "nvidia.*turing",
+        "nvidia.*rtx.*20",
+        "geforce.*rtx.*20",
+        "geforce.*1660"
+      ],
       "fsrMode": "balanced",
       "maxBounces": 3,
       "texSize": 1024,
@@ -61,10 +79,15 @@
       "f16": true,
       "maxStorageBuffers": 10,
       "checkerboard": false,
-      "quirks": []
+      "quirks": [],
+      "denoisePasses": 5
     },
     "nvidia_pascal": {
-      "match": ["nvidia.*pascal", "geforce.*10[0-9]0", "geforce.*1050"],
+      "match": [
+        "nvidia.*pascal",
+        "geforce.*10[0-9]0",
+        "geforce.*1050"
+      ],
       "fsrMode": "balanced",
       "maxBounces": 2,
       "texSize": 512,
@@ -74,11 +97,14 @@
       "f16": false,
       "maxStorageBuffers": 10,
       "checkerboard": true,
-      "quirks": []
+      "quirks": [],
+      "denoisePasses": 4
     },
-
     "amd_rdna3": {
-      "match": ["amd.*rdna.*3", "radeon.*rx.*7[0-9]00"],
+      "match": [
+        "amd.*rdna.*3",
+        "radeon.*rx.*7[0-9]00"
+      ],
       "fsrMode": "quality",
       "maxBounces": 3,
       "texSize": 1024,
@@ -88,10 +114,14 @@
       "f16": true,
       "maxStorageBuffers": 10,
       "checkerboard": false,
-      "quirks": []
+      "quirks": [],
+      "denoisePasses": 5
     },
     "amd_rdna2": {
-      "match": ["amd.*rdna.*2", "radeon.*rx.*6[0-9]00"],
+      "match": [
+        "amd.*rdna.*2",
+        "radeon.*rx.*6[0-9]00"
+      ],
       "fsrMode": "balanced",
       "maxBounces": 3,
       "texSize": 1024,
@@ -101,10 +131,14 @@
       "f16": true,
       "maxStorageBuffers": 10,
       "checkerboard": false,
-      "quirks": []
+      "quirks": [],
+      "denoisePasses": 5
     },
     "amd_rdna1": {
-      "match": ["amd.*rdna.*1", "radeon.*rx.*5[0-9]00"],
+      "match": [
+        "amd.*rdna.*1",
+        "radeon.*rx.*5[0-9]00"
+      ],
       "fsrMode": "balanced",
       "maxBounces": 2,
       "texSize": 512,
@@ -112,10 +146,16 @@
       "waveSize": 64,
       "hwRT": false,
       "f16": true,
-      "quirks": []
+      "quirks": [],
+      "denoisePasses": 4
     },
     "amd_integrated": {
-      "match": ["amd.*radeon.*780m", "amd.*radeon.*680m", "amd.*rembrandt", "amd.*phoenix"],
+      "match": [
+        "amd.*radeon.*780m",
+        "amd.*radeon.*680m",
+        "amd.*rembrandt",
+        "amd.*phoenix"
+      ],
       "fsrMode": "performance",
       "maxBounces": 2,
       "texSize": 512,
@@ -126,9 +166,12 @@
       "checkerboard": true,
       "quirks": []
     },
-
     "intel_arc": {
-      "match": ["intel.*arc", "intel.*alchemist", "intel.*a7[0-9]0"],
+      "match": [
+        "intel.*arc",
+        "intel.*alchemist",
+        "intel.*a7[0-9]0"
+      ],
       "fsrMode": "balanced",
       "maxBounces": 2,
       "texSize": 1024,
@@ -137,10 +180,18 @@
       "hwRT": true,
       "f16": true,
       "maxStorageBuffers": 10,
-      "quirks": ["intel_different_wave"]
+      "quirks": [
+        "intel_different_wave"
+      ],
+      "denoisePasses": 5
     },
     "intel_xe": {
-      "match": ["intel.*iris.*xe", "intel.*uhd.*7[0-9]0", "intel.*tiger", "intel.*alder"],
+      "match": [
+        "intel.*iris.*xe",
+        "intel.*uhd.*7[0-9]0",
+        "intel.*tiger",
+        "intel.*alder"
+      ],
       "fsrMode": "performance",
       "maxBounces": 2,
       "texSize": 256,
@@ -149,11 +200,15 @@
       "hwRT": false,
       "f16": false,
       "checkerboard": true,
-      "quirks": ["intel_low_bandwidth"]
+      "quirks": [
+        "intel_low_bandwidth"
+      ]
     },
-
     "apple_m3": {
-      "match": ["apple.*m3", "apple.*a17"],
+      "match": [
+        "apple.*m3",
+        "apple.*a17"
+      ],
       "fsrMode": "quality",
       "maxBounces": 3,
       "texSize": 1024,
@@ -162,10 +217,16 @@
       "hwRT": true,
       "f16": true,
       "maxStorageBuffers": 10,
-      "quirks": ["metal_backend"]
+      "quirks": [
+        "metal_backend"
+      ],
+      "denoisePasses": 5
     },
     "apple_m2": {
-      "match": ["apple.*m2", "apple.*a16"],
+      "match": [
+        "apple.*m2",
+        "apple.*a16"
+      ],
       "fsrMode": "balanced",
       "maxBounces": 2,
       "texSize": 1024,
@@ -173,10 +234,17 @@
       "waveSize": 32,
       "hwRT": true,
       "f16": true,
-      "quirks": ["metal_backend"]
+      "quirks": [
+        "metal_backend"
+      ],
+      "denoisePasses": 4
     },
     "apple_m1": {
-      "match": ["apple.*m1", "apple.*a15", "apple.*a14"],
+      "match": [
+        "apple.*m1",
+        "apple.*a15",
+        "apple.*a14"
+      ],
       "fsrMode": "balanced",
       "maxBounces": 2,
       "texSize": 512,
@@ -184,11 +252,16 @@
       "waveSize": 32,
       "hwRT": false,
       "f16": true,
-      "quirks": ["metal_backend"]
+      "quirks": [
+        "metal_backend"
+      ],
+      "denoisePasses": 4
     },
-
     "adreno_750": {
-      "match": ["qualcomm.*adreno.*750", "qualcomm.*8.*gen.*3"],
+      "match": [
+        "qualcomm.*adreno.*750",
+        "qualcomm.*8.*gen.*3"
+      ],
       "fsrMode": "performance",
       "maxBounces": 2,
       "spp": 1,
@@ -201,10 +274,19 @@
       "maxStorageTextures": 4,
       "checkerboard": true,
       "shadowRays": 1,
-      "quirks": ["adreno_split_cmd_buffer", "adreno_no_f16_buffers", "adreno_fp16_clamp", "adreno_pow_guard", "adreno_small_l2"]
+      "quirks": [
+        "adreno_split_cmd_buffer",
+        "adreno_no_f16_buffers",
+        "adreno_fp16_clamp",
+        "adreno_pow_guard",
+        "adreno_small_l2"
+      ]
     },
     "adreno_740": {
-      "match": ["qualcomm.*adreno.*740", "qualcomm.*8.*gen.*2"],
+      "match": [
+        "qualcomm.*adreno.*740",
+        "qualcomm.*8.*gen.*2"
+      ],
       "fsrMode": "performance",
       "maxBounces": 2,
       "texSize": 512,
@@ -215,10 +297,17 @@
       "maxStorageBuffers": 8,
       "checkerboard": true,
       "shadowRays": 1,
-      "quirks": ["adreno_split_cmd_buffer", "adreno_no_f16_buffers", "adreno_fp16_clamp"]
+      "quirks": [
+        "adreno_split_cmd_buffer",
+        "adreno_no_f16_buffers",
+        "adreno_fp16_clamp"
+      ]
     },
     "adreno_730": {
-      "match": ["qualcomm.*adreno.*730", "qualcomm.*8.*gen.*1"],
+      "match": [
+        "qualcomm.*adreno.*730",
+        "qualcomm.*8.*gen.*1"
+      ],
       "fsrMode": "performance",
       "maxBounces": 2,
       "texSize": 256,
@@ -229,11 +318,16 @@
       "maxStorageBuffers": 8,
       "checkerboard": true,
       "shadowRays": 1,
-      "quirks": ["adreno_split_cmd_buffer", "adreno_no_f16_buffers"]
+      "quirks": [
+        "adreno_split_cmd_buffer",
+        "adreno_no_f16_buffers"
+      ]
     },
-
     "mali_g720": {
-      "match": ["arm.*mali.*g720", "arm.*immortalis"],
+      "match": [
+        "arm.*mali.*g720",
+        "arm.*immortalis"
+      ],
       "fsrMode": "performance",
       "maxBounces": 2,
       "texSize": 256,
@@ -244,10 +338,14 @@
       "maxStorageBuffers": 8,
       "checkerboard": true,
       "shadowRays": 1,
-      "quirks": ["mali_small_wave"]
+      "quirks": [
+        "mali_small_wave"
+      ]
     },
     "mali_g715": {
-      "match": ["arm.*mali.*g715"],
+      "match": [
+        "arm.*mali.*g715"
+      ],
       "fsrMode": "performance",
       "maxBounces": 2,
       "texSize": 256,
@@ -257,11 +355,15 @@
       "f16": false,
       "checkerboard": true,
       "shadowRays": 1,
-      "quirks": ["mali_small_wave"]
+      "quirks": [
+        "mali_small_wave"
+      ]
     },
-
     "xclipse": {
-      "match": ["samsung.*xclipse", "samsung.*rdna"],
+      "match": [
+        "samsung.*xclipse",
+        "samsung.*rdna"
+      ],
       "fsrMode": "performance",
       "maxBounces": 2,
       "texSize": 512,
@@ -270,10 +372,11 @@
       "hwRT": true,
       "f16": true,
       "checkerboard": true,
-      "quirks": ["xclipse_rdna2_mobile"]
+      "quirks": [
+        "xclipse_rdna2_mobile"
+      ]
     }
   },
-
   "quirk_descriptions": {
     "driver_572_crash": "NVIDIA driver 572.xx crashes with RTX 30/40 series on WebGPU. Update to 573+.",
     "adreno_split_cmd_buffer": "Dawn splits command buffers between render and compute passes on Adreno. Use separate submits.",

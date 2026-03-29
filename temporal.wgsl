@@ -120,18 +120,19 @@ fn temporal(@builtin(global_invocation_id) gid: vec3u) {
     let variance = max(m2 - m1 * m1, vec3f(0.0));
     let stddev = sqrt(variance);
 
-    // Variance-based AABB expansion:
-    // High variance (shadows/noise) → wide AABB → stable history preserved
-    // Low variance (smooth areas) → tight AABB → good anti-ghosting
-    let aabb_expand = max(stddev * 3.0, (mx - mn) * 0.1);
+    // Very wide AABB for 1SPP: Monte Carlo noise is extreme, don't reject history
+    let aabb_expand = max(stddev * 8.0, (mx - mn) * 0.5);
     mn -= aabb_expand;
     mx += aabb_expand;
 
     let clipped = clip_aabb(mn, mx, history);
 
-    // Adaptive alpha: trust history more in high-variance (shadow) regions
+    // Progressive accumulation via temporal: alpha = 1/(frame_count+1)
+    // frames_still=0 → alpha=params.alpha (fast blend for camera motion)
+    // frames_still=100 → alpha≈0.01 (slow convergence, stable image)
     let var_lum = dot(stddev, vec3f(0.2126, 0.7152, 0.0722));
-    let alpha = mix(params.alpha, params.alpha * 0.15, saturate(var_lum * 8.0));
+    let base_alpha = params.alpha;
+    let alpha = max(base_alpha * 0.1, base_alpha / (1.0 + var_lum * 10.0));
 
     blended = mix(clipped, current, alpha);
   }

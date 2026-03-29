@@ -37,10 +37,12 @@ struct Material {
 struct HitInfo { t: f32, u: f32, v: f32, tri_idx: u32, hit: bool, };
 
 @group(0) @binding(0) var<uniform> uniforms: Uniforms;
-@group(0) @binding(1) var noisy_out: texture_storage_2d<rgba16float, write>;  // irradiance (light only, no albedo)
-@group(0) @binding(2) var gbuf_nd: texture_2d<f32>;      // rasterized normal.xyz + depth
-@group(0) @binding(3) var gbuf_mat_uv: texture_2d<f32>; // rasterized matId + UV.xy
-@group(0) @binding(4) var albedo_out: texture_storage_2d<rgba8unorm, write>;  // first-hit albedo
+@group(0) @binding(1) var noisy_out: texture_storage_2d<rgba16float, write>;
+@group(0) @binding(2) var gbuf_nd: texture_2d<f32>;
+@group(0) @binding(3) var gbuf_mat_uv: texture_2d<f32>;
+@group(0) @binding(4) var albedo_out: texture_storage_2d<rgba8unorm, write>;
+@group(0) @binding(5) var denoise_nd_out: texture_storage_2d<rgba16float, write>;
+// accumulation handled by temporal pass (no extra buffer needed)
 
 @group(1) @binding(0) var<storage, read> vertices: array<vec4f>;
 @group(1) @binding(1) var<storage, read> vert_normals: array<vec4f>;
@@ -758,22 +760,8 @@ fn main(@builtin(global_invocation_id) gid: vec3u) {
   let res = vec2u(uniforms.resolution);
   if pixel.x >= res.x || pixel.y >= res.y { return; }
 
-  // === CHECKERBOARD: only trace half the pixels per frame ===
-  // Even frames: pixels where (x+y)%2==0. Odd frames: the other half.
-  // Temporal denoiser fills the gaps from history. Effective 2x speedup.
-  let checker = ((pixel.x + pixel.y) % 2u) == (uniforms.frame_seed % 2u);
-
-  // === ADAPTIVE: reduce trace rate as scene converges ===
-  // After camera stops, fewer pixels need new samples.
-  // Hash per-pixel to get stable random selection each frame.
-  let px_hash = ((pixel.x * 73856093u) ^ (pixel.y * 19349663u) ^ (uniforms.frame_seed * 83492791u));
-  let px_rand = f32(px_hash & 0xFFFFu) / 65535.0;
-  var trace_rate = 1.0; // fraction of checkerboard pixels that trace
-  if uniforms.frames_still > 30u { trace_rate = 0.25; }  // 12.5% total pixels
-  else if uniforms.frames_still > 10u { trace_rate = 0.5; } // 25% total pixels
-
-  let should_trace = checker && (px_rand < trace_rate);
-  if !should_trace { return; } // skip — textures keep previous values
+  // All pixels traced every frame — temporal denoiser handles accumulation
+  // Checkerboard/adaptive disabled: causes visible jitter with temporal blend
 
   let idx = pixel.y * res.x + pixel.x;
 
@@ -828,13 +816,8 @@ fn main(@builtin(global_invocation_id) gid: vec3u) {
   // Adreno: clamp to fp16 range before textureStore (values >65504 produce artifacts)
   color = min(color, vec3f(65000.0));
 
-  let alb_lum = dot(pt.albedo, vec3f(0.333));
-  if alb_lum > 0.05 {
-    let irradiance = min(color / max(pt.albedo, vec3f(0.05)), vec3f(65000.0));
-    textureStore(noisy_out, vec2i(pixel), vec4f(irradiance, 1.0));
-    textureStore(albedo_out, vec2i(pixel), vec4f(pt.albedo, 1.0));
-  } else {
-    textureStore(noisy_out, vec2i(pixel), vec4f(color, 1.0));
-    textureStore(albedo_out, vec2i(pixel), vec4f(1.0, 1.0, 1.0, 1.0));
-  }
+  // Raw 1SPP — temporal pass handles accumulation via history blend
+  textureStore(noisy_out, vec2i(pixel), vec4f(color, 1.0));
+  textureStore(albedo_out, vec2i(pixel), vec4f(1.0, 1.0, 1.0, 1.0));
+  textureStore(denoise_nd_out, vec2i(pixel), vec4f(pt.normal, pt.depth));
 }

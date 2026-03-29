@@ -188,6 +188,9 @@ async function init() {
   const noisyTex = device.createTexture({ size:[width,height], format:'rgba16float', usage:F16 }); // irradiance
   const albedoTex = device.createTexture({ size:[width,height], format:'rgba8unorm',
     usage: GPUTextureUsage.STORAGE_BINDING | GPUTextureUsage.TEXTURE_BINDING }); // first-hit albedo
+  const denoiseNdTex = device.createTexture({ size:[width,height], format:'rgba16float',
+    usage: GPUTextureUsage.STORAGE_BINDING | GPUTextureUsage.TEXTURE_BINDING });
+  // accumulation handled by temporal pass (no extra buffer — 8 storage buf limit on Adreno)
   const ndTex    = device.createTexture({ size:[width,height], format:'rgba16float', usage:F16R });  // raster writes normal+matId
   const matIdTex = device.createTexture({ size:[width,height], format:'rgba16float',
     usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.TEXTURE_BINDING }); // matId + fract(UV)
@@ -337,6 +340,7 @@ async function init() {
       { binding: 2, visibility: GPUShaderStage.COMPUTE, texture: { sampleType: 'float' } },
       { binding: 3, visibility: GPUShaderStage.COMPUTE, texture: { sampleType: 'float' } },
       { binding: 4, visibility: GPUShaderStage.COMPUTE, storageTexture: { access: 'write-only', format: 'rgba8unorm' } },
+      { binding: 5, visibility: GPUShaderStage.COMPUTE, storageTexture: { access: 'write-only', format: 'rgba16float' } },
     ],
   });
   const bg0 = device.createBindGroup({
@@ -347,6 +351,7 @@ async function init() {
       { binding: 2, resource: ndTex.createView() },
       { binding: 3, resource: matIdTex.createView() },
       { binding: 4, resource: albedoTex.createView() },
+      { binding: 5, resource: denoiseNdTex.createView() },
     ],
   });
 
@@ -499,7 +504,7 @@ async function init() {
     { binding:0, resource:{buffer:tmpBuf} },
     { binding:1, resource:noisyTex.createView() },
     { binding:2, resource:historyA.createView() },
-    { binding:3, resource:ndTex.createView() },
+    { binding:3, resource:denoiseNdTex.createView() },
     { binding:4, resource:hdrTex.createView() },
     { binding:5, resource:historyB.createView() },
     { binding:6, resource:sampler },
@@ -508,7 +513,7 @@ async function init() {
     { binding:0, resource:{buffer:tmpBuf} },
     { binding:1, resource:noisyTex.createView() },
     { binding:2, resource:historyB.createView() },
-    { binding:3, resource:ndTex.createView() },
+    { binding:3, resource:denoiseNdTex.createView() },
     { binding:4, resource:hdrTex.createView() },
     { binding:5, resource:historyA.createView() },
     { binding:6, resource:sampler },
@@ -520,10 +525,13 @@ async function init() {
 
   // --- Denoiser pipelines ---
   // 3 separate param buffers for the 3 à-trous steps (avoid writeBuffer during encoding)
-  const dnParamBufs = [0,1,2].map(() => device.createBuffer({ size: 16, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST }));
-  device.queue.writeBuffer(dnParamBufs[0], 0, new Float32Array([width, height, 1, 0]));
-  device.queue.writeBuffer(dnParamBufs[1], 0, new Float32Array([width, height, 2, 0]));
-  device.queue.writeBuffer(dnParamBufs[2], 0, new Float32Array([width, height, 4, 0]));
+  const denoisePasses = gpuProfile.denoisePasses || 3;
+  const dnSteps = [1, 2, 4, 8, 16]; // up to 5 passes
+  const dnParamBufs = dnSteps.map((s, i) => {
+    const buf = device.createBuffer({ size: 16, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
+    device.queue.writeBuffer(buf, 0, new Float32Array([width, height, s, i]));
+    return buf;
+  });
   const dnCompParamBuf = device.createBuffer({ size: 16, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
   device.queue.writeBuffer(dnCompParamBuf, 0, new Float32Array([width, height, 0, 0]));
 
@@ -558,46 +566,45 @@ async function init() {
   });
 
   // À-trous ping-pong bind groups:
-  // Pass 1: hdr → ping
-  const dnBG_hdr2ping = device.createBindGroup({ layout: dnAtrousLayout, entries: [
-    { binding: 0, resource: { buffer: dnParamBufs[0] } },
-    { binding: 1, resource: hdrTex.createView() },
-    { binding: 2, resource: pingTex.createView() },
-    { binding: 3, resource: ndTex.createView() },
-  ]});
-  const dnBG_ping2pong = device.createBindGroup({ layout: dnAtrousLayout, entries: [
-    { binding: 0, resource: { buffer: dnParamBufs[1] } },
-    { binding: 1, resource: pingTex.createView() },
-    { binding: 2, resource: pongTex.createView() },
-    { binding: 3, resource: ndTex.createView() },
-  ]});
-  const dnBG_pong2ping = device.createBindGroup({ layout: dnAtrousLayout, entries: [
-    { binding: 0, resource: { buffer: dnParamBufs[2] } },
-    { binding: 1, resource: pongTex.createView() },
-    { binding: 2, resource: pingTex.createView() },
-    { binding: 3, resource: ndTex.createView() },
-  ]});
-  const dnBG_comp = device.createBindGroup({ layout: dnCompLayout, entries: [
-    { binding: 0, resource: { buffer: dnCompParamBuf } },
-    { binding: 1, resource: pingTex.createView() },
-    { binding: 2, resource: pongTex.createView() },
-    { binding: 3, resource: ndTex.createView() },
-    { binding: 4, resource: ptOutputTex.createView() },
-    { binding: 5, resource: albedoTex.createView() },
-  ]});
-  // Spatial-only: first pass reads noisy directly
-  const dnBG_noisy2ping = device.createBindGroup({ layout: dnAtrousLayout, entries: [
+  // À-trous ping-pong bind groups for up to 5 passes
+  // Pass 0: hdr→ping, 1: ping→pong, 2: pong→ping, 3: ping→pong, 4: pong→ping
+  const dnBGs = [];
+  for (let i = 0; i < 5; i++) {
+    const isFirst = (i === 0);
+    const readFromPing = (i % 2 === 1); // odd passes read ping
+    const inTex = isFirst ? hdrTex : (readFromPing ? pingTex : pongTex);
+    const outTex = isFirst ? pingTex : (readFromPing ? pongTex : pingTex);
+    dnBGs.push(device.createBindGroup({ layout: dnAtrousLayout, entries: [
+      { binding: 0, resource: { buffer: dnParamBufs[i] } },
+      { binding: 1, resource: inTex.createView() },
+      { binding: 2, resource: outTex.createView() },
+      { binding: 3, resource: denoiseNdTex.createView() },
+    ]}));
+  }
+  // For spatial-only: first pass reads noisy instead of hdr
+  const dnBG_noisy_first = device.createBindGroup({ layout: dnAtrousLayout, entries: [
     { binding: 0, resource: { buffer: dnParamBufs[0] } },
     { binding: 1, resource: noisyTex.createView() },
     { binding: 2, resource: pingTex.createView() },
-    { binding: 3, resource: ndTex.createView() },
+    { binding: 3, resource: denoiseNdTex.createView() },
   ]});
-  // Raw mode: composite reads noisy directly (no denoise)
+  // Final output is in ping (even passes) or pong (odd passes)
+  const dnFinalInPing = (denoisePasses % 2 === 1); // 3 passes → ping, 4 → pong, 5 → ping
+  // Composite reads from the final denoised buffer (ping or pong depending on pass count)
+  const dnBG_comp = device.createBindGroup({ layout: dnCompLayout, entries: [
+    { binding: 0, resource: { buffer: dnCompParamBuf } },
+    { binding: 1, resource: (dnFinalInPing ? pingTex : pongTex).createView() },
+    { binding: 2, resource: pongTex.createView() },
+    { binding: 3, resource: denoiseNdTex.createView() },
+    { binding: 4, resource: ptOutputTex.createView() },
+    { binding: 5, resource: albedoTex.createView() },
+  ]});
+  // Raw mode: composite reads noisy directly
   const dnBG_comp_noisy = device.createBindGroup({ layout: dnCompLayout, entries: [
     { binding: 0, resource: { buffer: dnCompParamBuf } },
     { binding: 1, resource: noisyTex.createView() },
     { binding: 2, resource: pongTex.createView() },
-    { binding: 3, resource: ndTex.createView() },
+    { binding: 3, resource: denoiseNdTex.createView() },
     { binding: 4, resource: ptOutputTex.createView() },
     { binding: 5, resource: albedoTex.createView() },
   ]});
@@ -884,7 +891,7 @@ async function init() {
 
   document.addEventListener('mousemove', e => {
     if (!pointerLocked || menuOpen || debugMode) return;
-    camera.yaw += e.movementX * camera.sensitivity;
+    camera.yaw -= e.movementX * camera.sensitivity;
     camera.pitch -= e.movementY * camera.sensitivity;
     camera.pitch = Math.max(-Math.PI * 0.49, Math.min(Math.PI * 0.49, camera.pitch));
     cameraMoved = true;
@@ -1116,7 +1123,7 @@ async function init() {
 
   function getCameraVectors() {
     const fw = [Math.cos(camera.pitch)*Math.sin(camera.yaw), Math.sin(camera.pitch), Math.cos(camera.pitch)*Math.cos(camera.yaw)];
-    const rt = [Math.cos(camera.yaw), 0, -Math.sin(camera.yaw)];
+    const rt = [-Math.cos(camera.yaw), 0, Math.sin(camera.yaw)];
     const up = [-Math.sin(camera.pitch)*Math.sin(camera.yaw), Math.cos(camera.pitch), -Math.sin(camera.pitch)*Math.cos(camera.yaw)];
     return { forward:fw, right:rt, up };
   }
@@ -1140,7 +1147,7 @@ async function init() {
     const f = 1 / Math.tan(fov / 2);
     const proj = new Float32Array(16);
     proj[0] = f / asp;
-    proj[5] = -f;  // negate Y: match compute shader convention (pixel Y=0 → ndc.y=-1 → camera_up)
+    proj[5] = -f;  // negate Y: match compute shader convention
     proj[10] = far / (near - far); proj[11] = -1;
     proj[14] = (near * far) / (near - far);
     // viewProj = proj * view (column-major multiply)
@@ -1166,7 +1173,7 @@ async function init() {
     const lx=Math.abs(stickLeft.dx)>DZ?stickLeft.dx:0, ly=Math.abs(stickLeft.dy)>DZ?stickLeft.dy:0;
     if(lx||ly){camera.pos[0]+=forward[0]*(-ly)*speed+right[0]*lx*speed;camera.pos[1]+=forward[1]*(-ly)*speed;camera.pos[2]+=forward[2]*(-ly)*speed+right[2]*lx*speed;moved=true;}
     const rx=Math.abs(stickRight.dx)>DZ?stickRight.dx:0, ry=Math.abs(stickRight.dy)>DZ?stickRight.dy:0;
-    if(rx||ry){const ls=2.5*dt;camera.yaw+=rx*ls;camera.pitch-=ry*ls;camera.pitch=Math.max(-Math.PI*0.49,Math.min(Math.PI*0.49,camera.pitch));moved=true;}
+    if(rx||ry){const ls=2.5*dt;camera.yaw-=rx*ls;camera.pitch-=ry*ls;camera.pitch=Math.max(-Math.PI*0.49,Math.min(Math.PI*0.49,camera.pitch));moved=true;}
     if(moved) cameraMoved=true;
   }
 
@@ -1292,7 +1299,6 @@ async function init() {
       }
 
       if (denoiseMode === 'full') {
-        // Temporal reprojection
         const tmpPass = encoder.beginComputePass();
         tmpPass.setPipeline(tmpPipeline);
         tmpPass.setBindGroup(0, historyFrame === 0 ? tmpBG_A : tmpBG_B);
@@ -1302,15 +1308,12 @@ async function init() {
       }
 
       if (denoiseMode !== 'off') {
-        // À-trous spatial denoise (3 iterations)
-        // If no temporal, first pass reads noisyTex instead of hdrTex
-        const dnBGs = (denoiseMode === 'full')
-          ? [dnBG_hdr2ping, dnBG_ping2pong, dnBG_pong2ping]
-          : [dnBG_noisy2ping, dnBG_ping2pong, dnBG_pong2ping];
-        for (let di = 0; di < 3; di++) {
+        // Variance-guided à-trous (GPU profile controls pass count: 3-5)
+        for (let di = 0; di < denoisePasses; di++) {
+          const bg = (di === 0 && denoiseMode !== 'full') ? dnBG_noisy_first : dnBGs[di];
           const dp = encoder.beginComputePass();
           dp.setPipeline(dnAtrousPipeline);
-          dp.setBindGroup(0, dnBGs[di]);
+          dp.setBindGroup(0, bg);
           dp.dispatchWorkgroups(Math.ceil(width/8), Math.ceil(height/8));
           dp.end();
         }
