@@ -101,27 +101,39 @@ fn temporal(@builtin(global_invocation_id) gid: vec3u) {
     // Sample previous denoised frame with bilinear
     let history = textureSampleLevel(prev_denoised, tex_sampler, prev_uv_z.xy, 0.0).rgb;
 
-    // Neighborhood clamping: compute 3x3 AABB of current noisy frame
+    // Neighborhood statistics: min/max + variance for adaptive clamping
     var mn = current;
     var mx = current;
+    var m1 = vec3f(0.0);
+    var m2 = vec3f(0.0);
     for (var dy = -1; dy <= 1; dy++) {
       for (var dx = -1; dx <= 1; dx++) {
         let sp = clamp(px + vec2i(dx, dy), vec2i(0), sz - 1);
         let sc = textureLoad(current_hdr, sp, 0).rgb;
         mn = min(mn, sc); mx = max(mx, sc);
+        m1 += sc;
+        m2 += sc * sc;
       }
     }
+    m1 /= 9.0;
+    m2 /= 9.0;
+    let variance = max(m2 - m1 * m1, vec3f(0.0));
+    let stddev = sqrt(variance);
 
-    // Expand AABB slightly to reduce flickering
-    let aabb_expand = (mx - mn) * 0.15;
+    // Variance-based AABB expansion:
+    // High variance (shadows/noise) → wide AABB → stable history preserved
+    // Low variance (smooth areas) → tight AABB → good anti-ghosting
+    let aabb_expand = max(stddev * 3.0, (mx - mn) * 0.1);
     mn -= aabb_expand;
     mx += aabb_expand;
 
-    // Clip history to AABB
     let clipped = clip_aabb(mn, mx, history);
 
-    // Blend: keep most of history, add small amount of new sample
-    blended = mix(clipped, current, params.alpha);
+    // Adaptive alpha: trust history more in high-variance (shadow) regions
+    let var_lum = dot(stddev, vec3f(0.2126, 0.7152, 0.0722));
+    let alpha = mix(params.alpha, params.alpha * 0.15, saturate(var_lum * 8.0));
+
+    blended = mix(clipped, current, alpha);
   }
 
   textureStore(accum_out, px, vec4f(blended, 1.0));

@@ -87,73 +87,66 @@ function readAccessor(gltf, bin, accIdx) {
 }
 
 // ============================================================
-// Material extraction
+// Material extraction (PBR metallic-roughness from GLTF)
 // ============================================================
-const FALLBACK_COLORS = {
-  'roof_tiles_01': [0.55, 0.30, 0.15],
-  'stones_01_tile': [0.65, 0.62, 0.55],
-  'metal_door': [0.30, 0.28, 0.25],
-  'brickwall_02': [0.60, 0.42, 0.32],
-  'brickwall_01': [0.65, 0.48, 0.35],
-  'window_frame_01': [0.28, 0.26, 0.23],
-  'glass': [0.92, 0.92, 0.95],
-  'door_stoneframe_02': [0.65, 0.60, 0.50],
-  'door_stoneframe_01': [0.67, 0.62, 0.52],
-  'stones_2ndfloor': [0.62, 0.58, 0.50],
-  'ornament_lion': [0.65, 0.60, 0.50],
-  'arch_stone_wall_01': [0.70, 0.67, 0.60],
-  'stone_trims_01': [0.67, 0.65, 0.58],
-  'ornament_01': [0.63, 0.58, 0.50],
-  'floor_01': [0.60, 0.57, 0.50],
-  'wood_01': [0.50, 0.32, 0.18],
-  'wood_door_01': [0.45, 0.28, 0.15],
-  'ceiling_plaster_02': [0.78, 0.76, 0.70],
-  'ceiling_plaster_01': [0.80, 0.78, 0.72],
-  'stone_trims_02': [0.65, 0.63, 0.55],
-  'dirt_decal': [0.30, 0.25, 0.18],
-  'column_head_1stfloor': [0.67, 0.63, 0.55],
-  'column_1stfloor': [0.70, 0.67, 0.60],
-  'column_head_2ndfloor_03': [0.65, 0.62, 0.55],
-  'column_brickwall_01': [0.63, 0.50, 0.38],
-  'column_head_2ndfloor_02': [0.65, 0.62, 0.55],
-};
-
 function extractMaterials(gltf) {
-  if (!gltf.materials) return [{ albedo:[0.7,0.7,0.7], type:0, emission:[0,0,0], roughness:1, ior:1.5 }];
+  const defaultMat = {
+    albedo:[0.7,0.7,0.7], type:0, emission:[0,0,0], roughness:1,
+    metallic:0, baseTex:-1, mrTex:-1, normalTex:-1,
+    alphaMode:0, alphaCutoff:0.5, ior:1.5,
+  };
+  if (!gltf.materials) return [defaultMat];
 
   return gltf.materials.map(mat => {
     const pbr = mat.pbrMetallicRoughness || {};
     const name = mat.name || '';
-    let albedo = [0.7, 0.7, 0.7];
-    const factor = pbr.baseColorFactor;
 
-    if (factor && (factor[0] !== 1 || factor[1] !== 1 || factor[2] !== 1)) {
-      albedo = [factor[0], factor[1], factor[2]];
-    } else if (pbr.baseColorTexture && FALLBACK_COLORS[name]) {
-      albedo = FALLBACK_COLORS[name];
-    } else if (factor) {
-      albedo = [factor[0], factor[1], factor[2]];
-    }
+    // Base color factor (multiplied with texture in shader)
+    const bcf = pbr.baseColorFactor || [1, 1, 1, 1];
+    const albedo = [bcf[0], bcf[1], bcf[2]];
 
     const metallic = pbr.metallicFactor ?? 1.0;
     const roughness = pbr.roughnessFactor ?? 1.0;
 
-    let type = 0; // diffuse
+    // Texture indices: material → gltf.textures[].source → image index
+    const baseTex = pbr.baseColorTexture != null
+      ? gltf.textures[pbr.baseColorTexture.index].source : -1;
+    const mrTex = pbr.metallicRoughnessTexture != null
+      ? gltf.textures[pbr.metallicRoughnessTexture.index].source : -1;
+    const normalTex = mat.normalTexture != null
+      ? gltf.textures[mat.normalTexture.index].source : -1;
+
+    let type = 0; // 0=PBR, 2=emissive, 3=glass
     let emission = [0, 0, 0];
     let ior = 1.5;
+
+    if (mat.emissiveFactor) {
+      emission = [mat.emissiveFactor[0], mat.emissiveFactor[1], mat.emissiveFactor[2]];
+    }
 
     if (name === 'light_bulb') {
       type = 2; emission = [8.0, 7.5, 6.0];
     } else if (name === 'lamp_glass_01') {
       type = 2; emission = [5.0, 3.0, 1.0];
-    } else if (name === 'glass') {
-      type = 3; albedo = [0.97, 0.97, 0.98]; ior = 1.5;
-    } else if (metallic > 0.5 && !pbr.metallicRoughnessTexture) {
-      type = 1; // metal
+    } else if (name === 'glass' || mat.extensions?.KHR_materials_transmission) {
+      type = 3; ior = 1.5;
+    } else if (emission[0] > 0.1 || emission[1] > 0.1 || emission[2] > 0.1) {
+      type = 2;
     }
 
-    return { albedo, type, emission, roughness, ior };
+    let alphaMode = 0; // OPAQUE
+    if (mat.alphaMode === 'MASK') alphaMode = 1;
+    else if (mat.alphaMode === 'BLEND') alphaMode = 2;
+    const alphaCutoff = mat.alphaCutoff ?? 0.5;
+
+    return { albedo, type, emission, roughness, metallic, baseTex, mrTex, normalTex, alphaMode, alphaCutoff, ior };
   });
+}
+
+// Inverse-transpose of upper-left 3x3 for correct normal transform
+function normalMatrix3x3(m) {
+  const a=m[0],b=m[4],c=m[8], d=m[1],e=m[5],f=m[9], g=m[2],h=m[6],k=m[10];
+  return [e*k-f*h, f*g-d*k, d*h-e*g, c*h-b*k, a*k-c*g, b*g-a*h, b*f-c*e, c*d-a*f, a*e-b*d];
 }
 
 // ============================================================
@@ -416,7 +409,7 @@ export async function loadScene(basePath, onProgress) {
     db = await openDB();
     // Hash based on gltf file size + accessor count (changes if scene changes)
     const gltfSig = `${JSON.stringify(gltf.accessors?.length)}-${gltf.buffers?.[0]?.byteLength}`;
-    cacheKey = 'scene-' + gltfSig;
+    cacheKey = 'scene-v3-' + gltfSig;
     cached = await dbGet(db, cacheKey);
   } catch(e) { /* IndexedDB not available, proceed without cache */ }
 
@@ -463,6 +456,7 @@ export async function loadScene(basePath, onProgress) {
   // Allocate flat arrays
   const allPos = new Float32Array(totalVerts * 3);
   const allNrm = new Float32Array(totalVerts * 3);
+  const allUV  = new Float32Array(totalVerts * 2);
   const allTriData = new Uint32Array(totalTris * 4);
   let vOff = 0, tOff = 0;
 
@@ -470,41 +464,45 @@ export async function loadScene(basePath, onProgress) {
     const node = gltf.nodes[ni];
     if (node.mesh === undefined) continue;
     const mesh = gltf.meshes[node.mesh];
-    const mat = worldMats[ni];
+    const wm = worldMats[ni];
+    const nm = normalMatrix3x3(wm);
 
     for (const prim of mesh.primitives) {
       if (prim.mode !== undefined && prim.mode !== 4) continue;
 
       const positions = readAccessor(gltf, bin, prim.attributes.POSITION);
-      const hasNormals = prim.attributes.NORMAL !== undefined;
-      const normals = hasNormals ? readAccessor(gltf, bin, prim.attributes.NORMAL) : null;
+      const normals = prim.attributes.NORMAL != null ? readAccessor(gltf, bin, prim.attributes.NORMAL) : null;
+      const uvs = prim.attributes.TEXCOORD_0 != null ? readAccessor(gltf, bin, prim.attributes.TEXCOORD_0) : null;
       const indices = readAccessor(gltf, bin, prim.indices);
       const matIdx = prim.material ?? 0;
       const vertCount = gltf.accessors[prim.attributes.POSITION].count;
 
-      // Transform and store vertices
       for (let v = 0; v < vertCount; v++) {
         const sx = positions[v*3], sy = positions[v*3+1], sz = positions[v*3+2];
         // Transform position
-        allPos[(vOff+v)*3]   = mat[0]*sx + mat[4]*sy + mat[8]*sz + mat[12];
-        allPos[(vOff+v)*3+1] = mat[1]*sx + mat[5]*sy + mat[9]*sz + mat[13];
-        allPos[(vOff+v)*3+2] = mat[2]*sx + mat[6]*sy + mat[10]*sz + mat[14];
-        // Transform normal
+        allPos[(vOff+v)*3]   = wm[0]*sx + wm[4]*sy + wm[8]*sz + wm[12];
+        allPos[(vOff+v)*3+1] = wm[1]*sx + wm[5]*sy + wm[9]*sz + wm[13];
+        allPos[(vOff+v)*3+2] = wm[2]*sx + wm[6]*sy + wm[10]*sz + wm[14];
+        // Transform normal (inverse-transpose for non-uniform scale)
         if (normals) {
           const nx = normals[v*3], ny = normals[v*3+1], nz = normals[v*3+2];
-          const rx = mat[0]*nx + mat[4]*ny + mat[8]*nz;
-          const ry = mat[1]*nx + mat[5]*ny + mat[9]*nz;
-          const rz = mat[2]*nx + mat[6]*ny + mat[10]*nz;
+          const rx = nm[0]*nx + nm[1]*ny + nm[2]*nz;
+          const ry = nm[3]*nx + nm[4]*ny + nm[5]*nz;
+          const rz = nm[6]*nx + nm[7]*ny + nm[8]*nz;
           const len = Math.sqrt(rx*rx + ry*ry + rz*rz) || 1;
           allNrm[(vOff+v)*3]   = rx/len;
           allNrm[(vOff+v)*3+1] = ry/len;
           allNrm[(vOff+v)*3+2] = rz/len;
         } else {
-          allNrm[(vOff+v)*3+1] = 1; // default up
+          allNrm[(vOff+v)*3+1] = 1;
+        }
+        // UV coordinates
+        if (uvs) {
+          allUV[(vOff+v)*2]   = uvs[v*2];
+          allUV[(vOff+v)*2+1] = uvs[v*2+1];
         }
       }
 
-      // Store triangle data (re-index to global vertex offset)
       const triCountPrim = indices.length / 3;
       for (let t = 0; t < triCountPrim; t++) {
         allTriData[(tOff+t)*4]   = indices[t*3]   + vOff;
@@ -540,33 +538,41 @@ export async function loadScene(basePath, onProgress) {
     gpuTriFlat[base+11] = 0;
   }
 
-  // Keep indexed normals + tri_data for post-hit normal lookup only
+  // Pack vertex data: position.xyz + UV.x, normal.xyz + UV.y
   const gpuPositions = new Float32Array(totalVerts * 4);
   const gpuNormals = new Float32Array(totalVerts * 4);
   for (let v = 0; v < totalVerts; v++) {
     gpuPositions[v*4]   = allPos[v*3];
     gpuPositions[v*4+1] = allPos[v*3+1];
     gpuPositions[v*4+2] = allPos[v*3+2];
-    gpuPositions[v*4+3] = 0;
+    gpuPositions[v*4+3] = allUV[v*2];     // UV.x packed in position.w
     gpuNormals[v*4]   = allNrm[v*3];
     gpuNormals[v*4+1] = allNrm[v*3+1];
     gpuNormals[v*4+2] = allNrm[v*3+2];
-    gpuNormals[v*4+3] = 0;
+    gpuNormals[v*4+3] = allUV[v*2+1];    // UV.y packed in normal.w
   }
 
-  // Materials -> GPU format (32 bytes per material)
+  // Materials -> GPU format (64 bytes / 16 floats per material)
   const materials = extractMaterials(gltf);
-  const gpuMaterials = new Float32Array(materials.length * 8);
+  const gpuMaterials = new Float32Array(materials.length * 16);
   for (let i = 0; i < materials.length; i++) {
-    const m = materials[i];
-    gpuMaterials[i*8]   = m.albedo[0];
-    gpuMaterials[i*8+1] = m.albedo[1];
-    gpuMaterials[i*8+2] = m.albedo[2];
-    gpuMaterials[i*8+3] = m.type;       // mat_type
-    gpuMaterials[i*8+4] = m.emission[0];
-    gpuMaterials[i*8+5] = m.emission[1];
-    gpuMaterials[i*8+6] = m.emission[2];
-    gpuMaterials[i*8+7] = m.roughness;
+    const m = materials[i], o = i * 16;
+    gpuMaterials[o]    = m.albedo[0];
+    gpuMaterials[o+1]  = m.albedo[1];
+    gpuMaterials[o+2]  = m.albedo[2];
+    gpuMaterials[o+3]  = m.type;
+    gpuMaterials[o+4]  = m.emission[0];
+    gpuMaterials[o+5]  = m.emission[1];
+    gpuMaterials[o+6]  = m.emission[2];
+    gpuMaterials[o+7]  = m.roughness;
+    gpuMaterials[o+8]  = m.metallic;
+    gpuMaterials[o+9]  = m.baseTex;
+    gpuMaterials[o+10] = m.mrTex;
+    gpuMaterials[o+11] = m.normalTex;
+    gpuMaterials[o+12] = m.alphaMode;
+    gpuMaterials[o+13] = m.alphaCutoff;
+    gpuMaterials[o+14] = m.ior;
+    gpuMaterials[o+15] = 0;
   }
 
   // Collect emissive triangle indices for NEE
@@ -588,6 +594,15 @@ export async function loadScene(basePath, onProgress) {
     }
   }
 
+  // Texture info for renderer (image URIs for async loading)
+  let textureInfo = null;
+  if (gltf.images && gltf.images.length > 0) {
+    textureInfo = {
+      imageURIs: gltf.images.map(img => img.uri),
+      count: gltf.images.length,
+    };
+  }
+
   const stats = {
     triangles: totalTris,
     vertices: totalVerts,
@@ -597,7 +612,7 @@ export async function loadScene(basePath, onProgress) {
     sceneMin, sceneMax,
   };
 
-  onProgress?.(`Scene ready: ${totalTris|0} tris, ${bvh.nodeCount} BVH nodes`);
+  onProgress?.(`Scene ready: ${totalTris|0} tris, ${bvh.nodeCount} BVH nodes, ${textureInfo?.count || 0} textures`);
 
   const result = {
     gpuPositions,
@@ -607,6 +622,7 @@ export async function loadScene(basePath, onProgress) {
     gpuBVHNodes: bvh.nodesF32,
     gpuMaterials,
     gpuEmissiveTris,
+    textureInfo,
     stats,
   };
 

@@ -24,7 +24,12 @@ struct Uniforms {
 };
 
 struct BVHNode { aabb_min: vec3f, left_first: u32, aabb_max: vec3f, tri_count: u32, };
-struct Material { albedo: vec3f, mat_type: f32, emission: vec3f, roughness: f32, };
+struct Material {
+  albedo: vec3f, mat_type: f32,
+  emission: vec3f, roughness: f32,
+  metallic: f32, base_tex: f32, mr_tex: f32, normal_tex: f32,
+  alpha_mode: f32, alpha_cutoff: f32, ior: f32, _pad: f32,
+};
 struct HitInfo { t: f32, u: f32, v: f32, tri_idx: u32, hit: bool, };
 
 @group(0) @binding(0) var<uniform> uniforms: Uniforms;
@@ -44,6 +49,9 @@ struct SharcParams { capacity: u32, frame_index: u32, scene_scale: f32, stale_ma
 @group(2) @binding(0) var<uniform> sharc_params: SharcParams;
 @group(2) @binding(1) var<storage, read_write> sharc_keys_accum: array<atomic<u32>>;
 @group(2) @binding(2) var<storage, read> sharc_resolved: array<u32>;
+
+@group(3) @binding(0) var tex_array: texture_2d_array<f32>;
+@group(3) @binding(1) var tex_sampler_pt: sampler;
 
 const PI: f32 = 3.14159265359;
 const TWO_PI: f32 = 6.28318530718;
@@ -430,7 +438,40 @@ fn agx_tonemap(color_in: vec3f) -> vec3f {
 }
 
 // ============================================================
-// Path tracing with PBR BRDF
+// Texture helpers
+// ============================================================
+fn srgb_to_linear(c: vec3f) -> vec3f {
+  return pow(max(c, vec3f(0.0)), vec3f(2.2));
+}
+
+fn get_uv(td: vec4u, bw: f32, u: f32, v: f32) -> vec2f {
+  return bw * vec2f(vertices[td.x].w, vert_normals[td.x].w)
+       + u * vec2f(vertices[td.y].w, vert_normals[td.y].w)
+       + v * vec2f(vertices[td.z].w, vert_normals[td.z].w);
+}
+
+fn apply_normal_map(td: vec4u, N: vec3f, uv: vec2f, tex_idx: i32) -> vec3f {
+  if tex_idx < 0 { return N; }
+  let ns = textureSampleLevel(tex_array, tex_sampler_pt, uv, tex_idx, 0.0);
+  let tn = ns.rgb * 2.0 - 1.0;
+  // Compute tangent frame from UV deltas (no stored tangents needed)
+  let v0 = vertices[td.x].xyz; let v1 = vertices[td.y].xyz; let v2 = vertices[td.z].xyz;
+  let uv0 = vec2f(vertices[td.x].w, vert_normals[td.x].w);
+  let uv1 = vec2f(vertices[td.y].w, vert_normals[td.y].w);
+  let uv2 = vec2f(vertices[td.z].w, vert_normals[td.z].w);
+  let dp1 = v1 - v0; let dp2 = v2 - v0;
+  let duv1 = uv1 - uv0; let duv2 = uv2 - uv0;
+  let det = duv1.x * duv2.y - duv2.x * duv1.y;
+  if abs(det) < 1e-8 { return N; }
+  let inv_det = 1.0 / det;
+  var T = normalize((dp1 * duv2.y - dp2 * duv1.y) * inv_det);
+  T = normalize(T - N * dot(N, T)); // Gram-Schmidt orthogonalization
+  let B = cross(N, T);
+  return normalize(T * tn.x + B * tn.y + N * tn.z);
+}
+
+// ============================================================
+// Path tracing with PBR BRDF + texture sampling
 // Returns radiance; writes first-hit normal+depth to out params
 // ============================================================
 struct PathResult { color: vec3f, normal: vec3f, depth: f32, hit_pos: vec3f, direct: vec3f, };
@@ -462,10 +503,42 @@ fn path_trace(primary_origin: vec3f, primary_dir: vec3f) -> PathResult {
     let hit_pos = origin + dir * hit.t;
     let V = -dir;
 
-    // Prevent dark faces from bad interpolated normals
-    let raw_NdotV = dot(normal, V);
-    // If interpolated normal faces away from viewer, blend toward view direction
-    if raw_NdotV < 0.1 {
+    // Interpolate UV
+    let uv = get_uv(td, bw, hit.u, hit.v);
+
+    // Sample base color texture
+    var base_color = mat.albedo;
+    var tex_alpha = 1.0;
+    let base_tex_idx = i32(mat.base_tex + 0.5);
+    if base_tex_idx >= 0 {
+      let tc = textureSampleLevel(tex_array, tex_sampler_pt, uv, base_tex_idx, 0.0);
+      base_color *= srgb_to_linear(tc.rgb);
+      tex_alpha = tc.a;
+    }
+
+    // Alpha test (MASK mode)
+    if u32(mat.alpha_mode + 0.5) == 1u && tex_alpha < mat.alpha_cutoff {
+      origin = hit_pos + dir * BIAS;
+      continue;
+    }
+
+    // Sample metallic-roughness texture (G=roughness, B=metallic per GLTF spec)
+    var metallic = mat.metallic;
+    var roughness = mat.roughness;
+    let mr_tex_idx = i32(mat.mr_tex + 0.5);
+    if mr_tex_idx >= 0 {
+      let mr = textureSampleLevel(tex_array, tex_sampler_pt, uv, mr_tex_idx, 0.0);
+      roughness *= mr.g;
+      metallic *= mr.b;
+    }
+    roughness = max(roughness, 0.04);
+
+    // Apply normal map
+    let normal_tex_idx = i32(mat.normal_tex + 0.5);
+    normal = apply_normal_map(td, normal, uv, normal_tex_idx);
+
+    // Fix normal facing
+    if dot(normal, V) < 0.01 {
       normal = normalize(normal + V * 0.2);
     }
 
@@ -478,43 +551,23 @@ fn path_trace(primary_origin: vec3f, primary_dir: vec3f) -> PathResult {
       break;
     }
 
-    // Determine metallic from material type
-    let metallic = select(0.0, 1.0, mat_type == 1u);
-    let roughness = max(mat.roughness, 0.04);
-
     // NEE: sun direct lighting
-    let direct = sample_sun_nee(hit_pos, normal, V, mat.albedo, roughness, metallic);
+    let direct = sample_sun_nee(hit_pos, normal, V, base_color, roughness, metallic);
     radiance += throughput * direct;
 
-    // Capture direct lighting for SHaRC store in main()
     if bounce == 0u { result.direct = direct; }
 
-    // Bounce 1+: try SHaRC cache lookup for indirect GI (free multi-bounce!)
+    // Bounce 1+: SHaRC cache for indirect GI
     if bounce >= 1u && mat_type != 3u {
       let cached_gi = sharc_read_cached(hit_pos, normal);
-      radiance += throughput * cached_gi * mat.albedo;
-      break; // done — cache provides remaining bounces
+      radiance += throughput * cached_gi * base_color;
+      break;
     }
 
-    // BRDF sampling for next bounce
-    if mat_type == 0u {
-      dir = cosine_sample_hemisphere(normal);
-      if dot(normal, dir) <= 0.0 { break; }
-      throughput *= mat.albedo;
-      specular_bounce = false;
-    } else if mat_type == 1u {
-      let alpha = max(roughness * roughness, 0.001);
-      let H = sample_ggx_vndf(rand2(), V, normal, alpha);
-      dir = reflect(-V, H);
-      if dot(normal, dir) <= 0.0 { break; }
-      let VdotH = max(dot(V, H), 0.0);
-      let F = fresnel_real(VdotH, mat.albedo);
-      let G1_L = smith_g1(max(dot(normal, dir), 0.0), alpha);
-      throughput *= F * G1_L;
-      specular_bounce = roughness < 0.1;
-    } else if mat_type == 3u {
-      // Glass: dielectric
-      let ior = 1.5;
+    // BRDF sampling
+    if mat_type == 3u {
+      // Glass
+      let ior = mat.ior;
       var eta = select(ior, 1.0 / ior, front_face);
       let cos_theta = min(dot(V, normal), 1.0);
       let sin_theta = sqrt(1.0 - cos_theta * cos_theta);
@@ -526,10 +579,28 @@ fn path_trace(primary_origin: vec3f, primary_dir: vec3f) -> PathResult {
         dir = refract(-V, normal, eta);
         origin = hit_pos - normal * BIAS;
       }
-      throughput *= mat.albedo;
+      throughput *= base_color;
       specular_bounce = true;
       continue;
-    } else { break; }
+    } else if metallic > 0.5 {
+      // Metal / specular-dominant: GGX VNDF sampling
+      let alpha = max(roughness * roughness, 0.001);
+      let H = sample_ggx_vndf(rand2(), V, normal, alpha);
+      dir = reflect(-V, H);
+      if dot(normal, dir) <= 0.0 { break; }
+      let VdotH = max(dot(V, H), 0.0);
+      let F0 = mix(vec3f(0.04), base_color, metallic);
+      let F = fresnel_real(VdotH, F0);
+      let G1_L = smith_g1(max(dot(normal, dir), 0.0), alpha);
+      throughput *= F * G1_L;
+      specular_bounce = roughness < 0.1;
+    } else {
+      // Dielectric: cosine hemisphere sampling
+      dir = cosine_sample_hemisphere(normal);
+      if dot(normal, dir) <= 0.0 { break; }
+      throughput *= base_color * (1.0 - metallic);
+      specular_bounce = false;
+    }
 
     origin = hit_pos + normal * BIAS;
 

@@ -76,10 +76,10 @@ async function init() {
   const hashMode = location.hash.replace('#', '');
   let fsrMode = FSR_MODES[hashMode] ? hashMode : 'balanced';
 
-  // Display resolution — use device native (capped at 1080 long edge for perf)
-  const dispScale = Math.min(1.0, 1080 / Math.max(window.innerWidth, window.innerHeight));
-  const displayWidth = Math.ceil(Math.floor(window.innerWidth * dispScale) / 8) * 8;
-  const displayHeight = Math.ceil(Math.floor(window.innerHeight * dispScale) / 8) * 8;
+  // Display resolution — native device resolution
+  const dpr = window.devicePixelRatio || 1;
+  const displayWidth = Math.ceil(Math.floor(window.innerWidth * dpr) / 8) * 8;
+  const displayHeight = Math.ceil(Math.floor(window.innerHeight * dpr) / 8) * 8;
   canvas.width = displayWidth;
   canvas.height = displayHeight;
   context.configure({ device, format, alphaMode: 'opaque' });
@@ -167,12 +167,56 @@ async function init() {
   ]);
   device.queue.writeBuffer(fsrParamsBuf, 0, fsrParamsData);
 
+  // --- Load textures into GPU texture array ---
+  const TEX_SIZE = 1024;
+  const texInfo = scene.textureInfo;
+  const texCount = texInfo ? texInfo.count : 0;
+  let texArray;
+
+  if (texCount > 0) {
+    texArray = device.createTexture({
+      size: [TEX_SIZE, TEX_SIZE, texCount],
+      format: 'rgba8unorm',
+      usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST | GPUTextureUsage.RENDER_ATTACHMENT,
+    });
+    const BATCH = 6;
+    for (let b = 0; b < texCount; b += BATCH) {
+      const batch = [];
+      for (let i = b; i < Math.min(b + BATCH, texCount); i++) {
+        batch.push(
+          fetch(`scene/${texInfo.imageURIs[i]}`)
+            .then(r => r.blob())
+            .then(blob => createImageBitmap(blob, {
+              resizeWidth: TEX_SIZE, resizeHeight: TEX_SIZE,
+              resizeQuality: 'high',
+            }))
+            .then(bmp => {
+              device.queue.copyExternalImageToTexture(
+                { source: bmp },
+                { texture: texArray, origin: [0, 0, i] },
+                [TEX_SIZE, TEX_SIZE]
+              );
+              bmp.close();
+            })
+        );
+      }
+      await Promise.all(batch);
+      info.textContent = `Loading textures... ${Math.min(b + BATCH, texCount)}/${texCount}`;
+    }
+    rlog(`Loaded ${texCount} textures at ${TEX_SIZE}x${TEX_SIZE}`);
+  } else {
+    texArray = device.createTexture({
+      size: [1, 1, 1], format: 'rgba8unorm',
+      usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST,
+    });
+    device.queue.writeTexture({ texture: texArray }, new Uint8Array([128,128,128,255]), { bytesPerRow: 4 }, [1,1,1]);
+  }
+
   // --- Scene GPU buffers ---
   info.textContent = 'Uploading to GPU...';
   const vtxBuf = createGPUBuffer(device, scene.gpuPositions, GPUBufferUsage.STORAGE);
   const nrmBuf = createGPUBuffer(device, scene.gpuNormals, GPUBufferUsage.STORAGE);
   const triBuf = createGPUBuffer(device, scene.gpuTriData, GPUBufferUsage.STORAGE);
-  // triFlatBuf removed — freed binding slot for SHaRC
   const bvhBuf = createGPUBuffer(device, scene.gpuBVHNodes, GPUBufferUsage.STORAGE);
   const matBuf = createGPUBuffer(device, scene.gpuMaterials, GPUBufferUsage.STORAGE);
   const emsBuf = createGPUBuffer(device, scene.gpuEmissiveTris, GPUBufferUsage.STORAGE);
@@ -258,9 +302,23 @@ async function init() {
     { binding: 2, resource: { buffer: sharcResolvedBuf } },
   ]});
 
-  // --- Compute pipeline (PT + SHaRC) ---
+  // --- Bind group 3: texture array ---
+  const texSampler = device.createSampler({
+    magFilter: 'linear', minFilter: 'linear',
+    addressModeU: 'repeat', addressModeV: 'repeat',
+  });
+  const bg3Layout = device.createBindGroupLayout({ entries: [
+    { binding: 0, visibility: GPUShaderStage.COMPUTE, texture: { sampleType: 'float', viewDimension: '2d-array' } },
+    { binding: 1, visibility: GPUShaderStage.COMPUTE, sampler: { type: 'filtering' } },
+  ]});
+  const bg3 = device.createBindGroup({ layout: bg3Layout, entries: [
+    { binding: 0, resource: texArray.createView({ dimension: '2d-array' }) },
+    { binding: 1, resource: texSampler },
+  ]});
+
+  // --- Compute pipeline (PT + SHaRC + Textures) ---
   const computePipeline = device.createComputePipeline({
-    layout: device.createPipelineLayout({ bindGroupLayouts: [bg0Layout, bg1Layout, bg2Layout] }),
+    layout: device.createPipelineLayout({ bindGroupLayouts: [bg0Layout, bg1Layout, bg2Layout, bg3Layout] }),
     compute: { module: ptModule, entryPoint: 'main' },
   });
 
@@ -454,32 +512,61 @@ async function init() {
     sensitivity: 0.003,
   };
 
-  // Sun direction (coming from above through the atrium)
-  const sunDir = [0.4, 0.8, 0.3];
+  // --- Settings (menu-controlled) ---
+  const settings = {
+    sunElevation: 58,
+    sunAzimuth: 53,
+    sharpness: 0.6,
+    temporalAlpha: 0.02,
+  };
+
+  function getSunDir() {
+    const el = settings.sunElevation * Math.PI / 180;
+    const az = settings.sunAzimuth * Math.PI / 180;
+    return [Math.sin(az) * Math.cos(el), Math.sin(el), Math.cos(az) * Math.cos(el)];
+  }
 
   // --- Input handling ---
   const keys = {};
   let pointerLocked = false;
+  let menuOpen = false;
+  const menuEl = document.getElementById('options-menu');
 
-  document.addEventListener('keydown', e => { keys[e.code] = true; });
+  function toggleMenu() {
+    menuOpen = !menuOpen;
+    menuEl.classList.toggle('open', menuOpen);
+    if (menuOpen) {
+      document.exitPointerLock?.();
+      for (const k in keys) keys[k] = false;
+      hideStick(stickLeft);
+      hideStick(stickRight);
+      refreshMenu();
+    }
+  }
+
+  document.addEventListener('keydown', e => {
+    if (e.code === 'Escape') { toggleMenu(); e.preventDefault(); return; }
+    if (!menuOpen) keys[e.code] = true;
+  });
   document.addEventListener('keyup', e => { keys[e.code] = false; });
 
   const isTouchDevice = ('ontouchstart' in window) || navigator.maxTouchPoints > 0;
 
   canvas.addEventListener('click', () => {
-    if (!isTouchDevice) canvas.requestPointerLock();
+    if (!isTouchDevice && !menuOpen) canvas.requestPointerLock();
   });
   document.addEventListener('pointerlockchange', () => {
     pointerLocked = document.pointerLockElement === canvas;
   });
   canvas.addEventListener('wheel', e => {
     e.preventDefault();
+    if (menuOpen) return;
     camera.speed *= e.deltaY > 0 ? 0.85 : 1.18;
     camera.speed = Math.max(0.1, Math.min(50, camera.speed));
   }, {passive: false});
 
   document.addEventListener('mousemove', e => {
-    if (!pointerLocked) return;
+    if (!pointerLocked || menuOpen) return;
     camera.yaw += e.movementX * camera.sensitivity;
     camera.pitch -= e.movementY * camera.sensitivity;
     camera.pitch = Math.max(-Math.PI * 0.49, Math.min(Math.PI * 0.49, camera.pitch));
@@ -521,11 +608,21 @@ async function init() {
   stickLeft.el.style.display = 'none';
   stickRight.el.style.display = 'none';
 
+  let threeFingerStart = null;
+
   document.addEventListener('touchstart', e => {
+    if (e.touches.length >= 3) {
+      threeFingerStart = performance.now();
+      hideStick(stickLeft);
+      hideStick(stickRight);
+      e.preventDefault();
+      return;
+    }
+    if (menuOpen) return;
     for (const t of e.changedTouches) {
       const isLeft = t.clientX < halfW();
       const stick = isLeft ? stickLeft : stickRight;
-      if (stick.touchId !== null) continue; // already tracking a finger
+      if (stick.touchId !== null) continue;
       stick.touchId = t.identifier;
       stick.cx = t.clientX;
       stick.cy = t.clientY;
@@ -535,6 +632,10 @@ async function init() {
   }, {passive: false});
 
   document.addEventListener('touchmove', e => {
+    if (threeFingerStart !== null && e.touches.length >= 3) {
+      threeFingerStart = null; // drag, not a tap
+    }
+    if (menuOpen) return;
     for (const t of e.changedTouches) {
       if (t.identifier === stickLeft.touchId) { moveKnob(stickLeft, t.clientX, t.clientY); e.preventDefault(); }
       else if (t.identifier === stickRight.touchId) { moveKnob(stickRight, t.clientX, t.clientY); e.preventDefault(); }
@@ -542,6 +643,11 @@ async function init() {
   }, {passive: false});
 
   function onTouchEnd(e) {
+    if (threeFingerStart !== null && e.touches.length === 0) {
+      const elapsed = performance.now() - threeFingerStart;
+      threeFingerStart = null;
+      if (elapsed < 500) { toggleMenu(); return; }
+    }
     for (const t of e.changedTouches) {
       if (t.identifier === stickLeft.touchId) hideStick(stickLeft);
       if (t.identifier === stickRight.touchId) hideStick(stickRight);
@@ -550,16 +656,81 @@ async function init() {
   document.addEventListener('touchend', onTouchEnd);
   document.addEventListener('touchcancel', onTouchEnd);
 
+  // --- Menu controls ---
+  document.getElementById('menu-close').addEventListener('click', toggleMenu);
+
+  const optFsr = document.getElementById('opt-fsr');
+  optFsr.value = fsrMode;
+  optFsr.addEventListener('change', e => {
+    location.hash = e.target.value;
+    location.reload();
+  });
+
+  function bindSlider(id, valId, getter, setter, formatter) {
+    const sl = document.getElementById(id);
+    const vl = document.getElementById(valId);
+    sl.addEventListener('input', () => {
+      setter(Number(sl.value));
+      vl.textContent = formatter(Number(sl.value));
+    });
+  }
+
+  bindSlider('opt-sharp', 'val-sharp',
+    () => settings.sharpness * 100,
+    v => { settings.sharpness = v / 100; fsrParamsData[4] = settings.sharpness; device.queue.writeBuffer(fsrParamsBuf, 0, fsrParamsData); },
+    v => (v / 100).toFixed(2));
+
+  bindSlider('opt-sun-el', 'val-sun-el',
+    () => settings.sunElevation,
+    v => settings.sunElevation = v,
+    v => v + '\u00B0');
+
+  bindSlider('opt-sun-az', 'val-sun-az',
+    () => settings.sunAzimuth,
+    v => settings.sunAzimuth = v,
+    v => v + '\u00B0');
+
+  bindSlider('opt-speed', 'val-speed',
+    () => camera.speed * 10,
+    v => camera.speed = v / 10,
+    v => (v / 10).toFixed(1));
+
+  bindSlider('opt-fov', 'val-fov',
+    () => camera.fov,
+    v => camera.fov = v,
+    v => v + '\u00B0');
+
+  bindSlider('opt-temporal', 'val-temporal',
+    () => settings.temporalAlpha * 1000,
+    v => settings.temporalAlpha = v / 1000,
+    v => (v / 1000).toFixed(3));
+
+  function refreshMenu() {
+    const sets = [
+      ['opt-sharp', 'val-sharp', settings.sharpness * 100, v => (v / 100).toFixed(2)],
+      ['opt-sun-el', 'val-sun-el', settings.sunElevation, v => v + '\u00B0'],
+      ['opt-sun-az', 'val-sun-az', settings.sunAzimuth, v => v + '\u00B0'],
+      ['opt-speed', 'val-speed', camera.speed * 10, v => (v / 10).toFixed(1)],
+      ['opt-fov', 'val-fov', camera.fov, v => v + '\u00B0'],
+      ['opt-temporal', 'val-temporal', settings.temporalAlpha * 1000, v => (v / 1000).toFixed(3)],
+    ];
+    for (const [sid, vid, val, fmt] of sets) {
+      document.getElementById(sid).value = val;
+      document.getElementById(vid).textContent = fmt(val);
+    }
+    optFsr.value = fsrMode;
+  }
+
   // --- Gizmo ---
   const gizmoCanvas = document.getElementById('gizmo');
   const gctx = gizmoCanvas.getContext('2d');
   const GZ=120, GC=GZ/2, GAXIS_LEN=40;
-  const dpr = window.devicePixelRatio||1;
-  gizmoCanvas.width=GZ*dpr; gizmoCanvas.height=GZ*dpr; gctx.scale(dpr,dpr);
+  const gdpr = window.devicePixelRatio||1;
+  gizmoCanvas.width=GZ*gdpr; gizmoCanvas.height=GZ*gdpr; gctx.scale(gdpr,gdpr);
   const gizmoAxes=[{label:'X',color:'#E84545',neg:'-X',nc:'#7a2222'},{label:'Y',color:'#45E845',neg:'-Y',nc:'#227a22'},{label:'Z',color:'#4585E8',neg:'-Z',nc:'#22447a'}];
 
   function drawGizmo() {
-    gctx.save(); gctx.setTransform(dpr,0,0,dpr,0,0); gctx.clearRect(0,0,GZ,GZ);
+    gctx.save(); gctx.setTransform(gdpr,0,0,gdpr,0,0); gctx.clearRect(0,0,GZ,GZ);
     gctx.beginPath(); gctx.arc(GC,GC,GC-4,0,Math.PI*2); gctx.fillStyle='rgba(30,30,30,0.65)'; gctx.fill();
     gctx.strokeStyle='rgba(255,255,255,0.1)'; gctx.lineWidth=1; gctx.stroke();
     const cy=Math.cos(camera.yaw),sy=Math.sin(camera.yaw),cp=Math.cos(camera.pitch),sp=Math.sin(camera.pitch);
@@ -590,6 +761,7 @@ async function init() {
   }
 
   function updateCamera(dt) {
+    if (menuOpen) return;
     const {forward,right} = getCameraVectors();
     const speed = camera.speed * dt;
     let moved = false;
@@ -638,13 +810,14 @@ async function init() {
     f32[8] = forward[0]; f32[9] = forward[1]; f32[10] = forward[2]; f32[11] = 0;
     f32[12] = right[0]; f32[13] = right[1]; f32[14] = right[2]; f32[15] = 0;
     f32[16] = up[0]; f32[17] = up[1]; f32[18] = up[2]; f32[19] = fovFactor;
-    f32[20] = sunDir[0]; f32[21] = sunDir[1]; f32[22] = sunDir[2];
+    const sun = getSunDir();
+    f32[20] = sun[0]; f32[21] = sun[1]; f32[22] = sun[2];
     u32[23] = stats.emissiveTris;
     device.queue.writeBuffer(uniformBuffer, 0, ud);
 
     // Write temporal uniforms (current + previous camera)
     const td = new Float32Array(40); // 10 vec4f
-    td[0] = width; td[1] = height; td[2] = 0.01; td[3] = 0; // res, alpha=1% (very smooth temporal)
+    td[0] = width; td[1] = height; td[2] = settings.temporalAlpha; td[3] = 0;
     td[4]=right[0];td[5]=right[1];td[6]=right[2];td[7]=0;         // cam_right
     td[8]=up[0];td[9]=up[1];td[10]=up[2];td[11]=0;                // cam_up
     td[12]=forward[0];td[13]=forward[1];td[14]=forward[2];td[15]=0;// cam_fwd
@@ -676,6 +849,7 @@ async function init() {
       ptPass.setBindGroup(0, bg0);
       ptPass.setBindGroup(1, bg1);
       ptPass.setBindGroup(2, bg2);
+      ptPass.setBindGroup(3, bg3);
       ptPass.dispatchWorkgroups(Math.ceil(width/8), Math.ceil(height/8));
       ptPass.end();
 
@@ -746,30 +920,11 @@ async function init() {
     drawGizmo();
 
     info.innerHTML =
-      `<b>Sponza PT</b> | <span id="fsr-btn" style="text-decoration:underline;pointer-events:auto;cursor:pointer">${FSR_MODES[fsrMode].label}</span><br>` +
-      `${width}x${height}→${displayWidth}x${displayHeight} FPS:${fps}<br>` +
-      `<span style="font-size:11px">Speed:${camera.speed.toFixed(1)} (scroll) | Tap mode to cycle</span>`;
+      `<b>Ignis</b> | ${FSR_MODES[fsrMode].label}<br>` +
+      `${width}x${height}\u2192${displayWidth}x${displayHeight} FPS:${fps}<br>` +
+      `<span style="font-size:11px">ESC: options</span>`;
 
     requestAnimationFrame(frame);
-  }
-
-  // FSR mode cycling — tap on the mode label or press F key
-  document.addEventListener('click', e => {
-    if (e.target.id === 'fsr-btn') { cycleFSRMode(); }
-  });
-  document.addEventListener('keydown', e => {
-    if (e.code === 'KeyF') { cycleFSRMode(); }
-  });
-
-  function cycleFSRMode() {
-    const modes = Object.keys(FSR_MODES);
-    const idx = (modes.indexOf(fsrMode) + 1) % modes.length;
-    fsrMode = modes[idx];
-    rlog('FSR mode:', fsrMode, FSR_MODES[fsrMode]);
-    // Note: changing internal resolution requires recreating buffers/textures.
-    // For simplicity, reload the page with the mode as hash.
-    location.hash = fsrMode;
-    location.reload();
   }
 
   info.textContent = 'Ready. Starting render...';

@@ -2,6 +2,9 @@
 scene/scene.bin
 scene/textures/
 
+# Environment
+.env
+
 # Runtime
 client.log
 *.log

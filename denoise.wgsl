@@ -62,9 +62,10 @@ fn atrous(@builtin(global_invocation_id) gid: vec3u) {
       let dz = abs(cz - snd.w);
       let wz = exp(-dz / (gz * f32(step) + 0.001));
 
-      // Luminance: very relaxed for shadow smoothing
+      // Luminance: adaptive — more relaxed in dark/shadow regions
       let dl = abs(cl - luma(sc));
-      let wl = exp(-dl / 3.0);
+      let sigma_l = 3.0 + 1.0 / (cl + 0.08);
+      let wl = exp(-dl / sigma_l);
 
       let w = kw[ki] * wn * wz * wl;
       sum += sc * w;
