@@ -130,6 +130,8 @@ function extractMaterials(gltf) {
       type = 2; emission = [5.0, 3.0, 1.0];
     } else if (name === 'glass' || mat.extensions?.KHR_materials_transmission) {
       type = 3; ior = 1.5;
+      // GLTF baseColorFactor for glass is [0,0,0] (meant for alpha blending), override for refraction
+      albedo[0] = 0.97; albedo[1] = 0.97; albedo[2] = 0.98;
     } else if (emission[0] > 0.1 || emission[1] > 0.1 || emission[2] > 0.1) {
       type = 2;
     }
@@ -137,7 +139,9 @@ function extractMaterials(gltf) {
     let alphaMode = 0; // OPAQUE
     if (mat.alphaMode === 'MASK') alphaMode = 1;
     else if (mat.alphaMode === 'BLEND') alphaMode = 2;
-    const alphaCutoff = mat.alphaCutoff ?? 0.5;
+    let alphaCutoff = mat.alphaCutoff ?? 0.5;
+    // MASK with cutoff 0: discard fully transparent pixels (alpha=0 would pass < 0.0 check)
+    if (alphaMode === 1 && alphaCutoff < 0.001) alphaCutoff = 0.001;
 
     return { albedo, type, emission, roughness, metallic, baseTex, mrTex, normalTex, alphaMode, alphaCutoff, ior };
   });
@@ -594,6 +598,9 @@ export async function loadScene(basePath, onProgress) {
     }
   }
 
+  // Material names for debug
+  const materialNames = gltf.materials ? gltf.materials.map(m => m.name || 'unnamed') : ['default'];
+
   // Texture info for renderer (image URIs for async loading)
   let textureInfo = null;
   if (gltf.images && gltf.images.length > 0) {
@@ -623,6 +630,7 @@ export async function loadScene(basePath, onProgress) {
     gpuMaterials,
     gpuEmissiveTris,
     textureInfo,
+    materialNames,
     stats,
   };
 

@@ -544,15 +544,122 @@ async function init() {
     }
   }
 
+  let debugMode = false;
+  const debugPanel = document.getElementById('debug-panel');
+  const debugContent = document.getElementById('debug-content');
+  const debugCrosshair = document.getElementById('debug-crosshair');
+
+  function toggleDebug() {
+    debugMode = !debugMode;
+    debugPanel.classList.toggle('open', debugMode);
+    debugCrosshair.style.display = debugMode ? 'block' : 'none';
+    if (debugMode) {
+      if (menuOpen) toggleMenu();
+      document.exitPointerLock?.();
+      for (const k in keys) keys[k] = false;
+      debugContent.textContent = 'Click to inspect...';
+    }
+  }
+
+  // --- CPU ray-BVH picker for debug ---
+  function debugPick(cssX, cssY) {
+    const rect = canvas.getBoundingClientRect();
+    const px = (cssX - rect.left) / rect.width * width;
+    const py = (cssY - rect.top) / rect.height * height;
+    const {forward: fw, right: rt, up: u} = getCameraVectors();
+    const ff = Math.tan((camera.fov * Math.PI / 180) * 0.5);
+    const asp = width / height;
+    const nx = ((px + 0.5) / width) * 2 - 1;
+    const ny = ((py + 0.5) / height) * 2 - 1;
+    const dx = fw[0]+nx*asp*ff*rt[0]+ny*ff*u[0], dy = fw[1]+nx*asp*ff*rt[1]+ny*ff*u[1], dz = fw[2]+nx*asp*ff*rt[2]+ny*ff*u[2];
+    const dl = Math.sqrt(dx*dx+dy*dy+dz*dz);
+    const dir = [dx/dl, dy/dl, dz/dl];
+    const orig = camera.pos;
+    const invD = [1/dir[0], 1/dir[1], 1/dir[2]];
+    const bF = scene.gpuBVHNodes, bU = new Uint32Array(bF.buffer, bF.byteOffset, bF.length);
+    const pos = scene.gpuPositions, nrm = scene.gpuNormals, td = scene.gpuTriData;
+    let bestT = 1e30, bestTri = -1, bestBary = [0,0];
+
+    function aabb(o) {
+      const t1x=(bF[o]-orig[0])*invD[0], t2x=(bF[o+4]-orig[0])*invD[0];
+      const t1y=(bF[o+1]-orig[1])*invD[1], t2y=(bF[o+5]-orig[1])*invD[1];
+      const t1z=(bF[o+2]-orig[2])*invD[2], t2z=(bF[o+6]-orig[2])*invD[2];
+      const tmn=Math.max(Math.min(t1x,t2x),Math.min(t1y,t2y),Math.min(t1z,t2z));
+      const tmx=Math.min(Math.max(t1x,t2x),Math.max(t1y,t2y),Math.max(t1z,t2z));
+      return (tmx>=Math.max(tmn,0)&&tmn<bestT)?Math.max(tmn,0):1e30;
+    }
+    function tri(ti) {
+      const i0=td[ti*4]*4, i1=td[ti*4+1]*4, i2=td[ti*4+2]*4;
+      const e1=[pos[i1]-pos[i0],pos[i1+1]-pos[i0+1],pos[i1+2]-pos[i0+2]];
+      const e2=[pos[i2]-pos[i0],pos[i2+1]-pos[i0+1],pos[i2+2]-pos[i0+2]];
+      const h=[dir[1]*e2[2]-dir[2]*e2[1],dir[2]*e2[0]-dir[0]*e2[2],dir[0]*e2[1]-dir[1]*e2[0]];
+      const a=e1[0]*h[0]+e1[1]*h[1]+e1[2]*h[2];
+      if(Math.abs(a)<1e-8)return;
+      const f=1/a, s=[orig[0]-pos[i0],orig[1]-pos[i0+1],orig[2]-pos[i0+2]];
+      const bu=f*(s[0]*h[0]+s[1]*h[1]+s[2]*h[2]);
+      if(bu<0||bu>1)return;
+      const q=[s[1]*e1[2]-s[2]*e1[1],s[2]*e1[0]-s[0]*e1[2],s[0]*e1[1]-s[1]*e1[0]];
+      const bv=f*(dir[0]*q[0]+dir[1]*q[1]+dir[2]*q[2]);
+      if(bv<0||bu+bv>1)return;
+      const t=f*(e2[0]*q[0]+e2[1]*q[1]+e2[2]*q[2]);
+      if(t>1e-5&&t<bestT){bestT=t;bestTri=ti;bestBary=[bu,bv];}
+    }
+
+    const stk = [0];
+    while (stk.length > 0) {
+      const ni = stk.pop(), o = ni * 8;
+      const cnt = bU[o+7], lf = bU[o+3];
+      if (cnt > 0) { for (let i = 0; i < cnt; i++) tri(lf+i); }
+      else {
+        const tl = aabb(lf*8), tr = aabb((lf+1)*8);
+        if(tl<tr){if(tr<bestT)stk.push(lf+1);if(tl<bestT)stk.push(lf);}
+        else{if(tl<bestT)stk.push(lf);if(tr<bestT)stk.push(lf+1);}
+      }
+    }
+    if (bestTri < 0) return null;
+
+    const mi = td[bestTri*4+3];
+    const v0=td[bestTri*4]*4, v1=td[bestTri*4+1]*4, v2=td[bestTri*4+2]*4;
+    const bw=1-bestBary[0]-bestBary[1];
+    const huv = [
+      bw*pos[v0+3]+bestBary[0]*pos[v1+3]+bestBary[1]*pos[v2+3],
+      bw*nrm[v0+3]+bestBary[0]*nrm[v1+3]+bestBary[1]*nrm[v2+3],
+    ];
+    return { triIdx:bestTri, matIdx:mi, uv:huv, t:bestT };
+  }
+
+  function showPickInfo(pick) {
+    if (!pick) { debugContent.textContent = 'No hit (sky)'; return; }
+    const m = scene.gpuMaterials, o = pick.matIdx * 16;
+    const names = scene.materialNames || [];
+    const types = ['PBR','','Emissive','Glass'];
+    debugContent.textContent = [
+      `Mat #${pick.matIdx}: "${names[pick.matIdx] || '?'}"`,
+      `Type: ${types[Math.round(m[o+3])] || 'Unknown'}`,
+      `Albedo: [${m[o].toFixed(3)}, ${m[o+1].toFixed(3)}, ${m[o+2].toFixed(3)}]`,
+      `Metallic: ${m[o+8].toFixed(2)}  Rough: ${m[o+7].toFixed(2)}`,
+      `Tex: base=${m[o+9]}  mr=${m[o+10]}  nrm=${m[o+11]}`,
+      `Alpha: mode=${m[o+12]}  cutoff=${m[o+13].toFixed(2)}`,
+      `IoR: ${m[o+14].toFixed(2)}`,
+      `UV: [${pick.uv[0].toFixed(4)}, ${pick.uv[1].toFixed(4)}]`,
+      `Tri: #${pick.triIdx}  Dist: ${pick.t.toFixed(3)}`,
+    ].join('\n');
+  }
+
   document.addEventListener('keydown', e => {
     if (e.code === 'Escape') { toggleMenu(); e.preventDefault(); return; }
-    if (!menuOpen) keys[e.code] = true;
+    if (e.code === 'Tab') { toggleDebug(); e.preventDefault(); return; }
+    if (!menuOpen && !debugMode) keys[e.code] = true;
   });
   document.addEventListener('keyup', e => { keys[e.code] = false; });
 
   const isTouchDevice = ('ontouchstart' in window) || navigator.maxTouchPoints > 0;
 
-  canvas.addEventListener('click', () => {
+  canvas.addEventListener('click', (e) => {
+    if (debugMode) {
+      showPickInfo(debugPick(e.clientX, e.clientY));
+      return;
+    }
     if (!isTouchDevice && !menuOpen) canvas.requestPointerLock();
   });
   document.addEventListener('pointerlockchange', () => {
@@ -560,13 +667,13 @@ async function init() {
   });
   canvas.addEventListener('wheel', e => {
     e.preventDefault();
-    if (menuOpen) return;
+    if (menuOpen || debugMode) return;
     camera.speed *= e.deltaY > 0 ? 0.85 : 1.18;
     camera.speed = Math.max(0.1, Math.min(50, camera.speed));
   }, {passive: false});
 
   document.addEventListener('mousemove', e => {
-    if (!pointerLocked || menuOpen) return;
+    if (!pointerLocked || menuOpen || debugMode) return;
     camera.yaw += e.movementX * camera.sensitivity;
     camera.pitch -= e.movementY * camera.sensitivity;
     camera.pitch = Math.max(-Math.PI * 0.49, Math.min(Math.PI * 0.49, camera.pitch));
@@ -761,7 +868,7 @@ async function init() {
   }
 
   function updateCamera(dt) {
-    if (menuOpen) return;
+    if (menuOpen || debugMode) return;
     const {forward,right} = getCameraVectors();
     const speed = camera.speed * dt;
     let moved = false;
@@ -922,7 +1029,7 @@ async function init() {
     info.innerHTML =
       `<b>Ignis</b> | ${FSR_MODES[fsrMode].label}<br>` +
       `${width}x${height}\u2192${displayWidth}x${displayHeight} FPS:${fps}<br>` +
-      `<span style="font-size:11px">ESC: options</span>`;
+      `<span style="font-size:11px">ESC: options | TAB: debug</span>`;
 
     requestAnimationFrame(frame);
   }

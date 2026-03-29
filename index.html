@@ -94,6 +94,26 @@
     .menu-row select:focus { outline: 1px solid #0c0; }
     .menu-val { flex: 0 0 42px; text-align: right; font-size: 11px; color: #666; }
     .menu-hint { text-align: center; font-size: 10px; color: #444; margin-top: 12px; }
+    #debug-panel {
+      position: fixed; bottom: 12px; left: 12px;
+      background: rgba(0,0,0,0.88); color: #0f0; font-size: 12px;
+      padding: 10px 14px; border-radius: 6px;
+      border: 1px solid rgba(0,255,0,0.2);
+      z-index: 15; display: none;
+      max-width: 380px; pointer-events: none;
+    }
+    #debug-panel.open { display: block; }
+    .dbg-title { font-size: 10px; text-transform: uppercase; letter-spacing: 1px; color: #0a0; margin-bottom: 6px; }
+    #debug-content { line-height: 1.7; white-space: pre-wrap; }
+    #debug-crosshair {
+      position: fixed; top: 50%; left: 50%; transform: translate(-50%,-50%);
+      width: 20px; height: 20px; z-index: 15; display: none; pointer-events: none;
+    }
+    #debug-crosshair::before, #debug-crosshair::after {
+      content: ''; position: absolute; background: rgba(0,255,0,0.6);
+    }
+    #debug-crosshair::before { top: 0; left: 50%; width: 1px; height: 100%; transform: translateX(-50%); }
+    #debug-crosshair::after { left: 0; top: 50%; height: 1px; width: 100%; transform: translateY(-50%); }
   </style>
 </head>
 <body>
@@ -101,6 +121,11 @@
   <canvas id="gizmo" width="120" height="120"></canvas>
   <div id="info">Initializing WebGPU...</div>
   <div id="error"></div>
+  <div id="debug-crosshair"></div>
+  <div id="debug-panel">
+    <div class="dbg-title">Debug Pick</div>
+    <div id="debug-content">Click to inspect...</div>
+  </div>
   <div id="options-menu">
     <div class="menu-panel">
       <div class="menu-hdr">
