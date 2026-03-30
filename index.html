@@ -314,6 +314,36 @@
         </div>
       </div>
       <div class="menu-sec">
+        <div class="menu-title">Color</div>
+        <div class="menu-row">
+          <label>Tonemap</label>
+          <select id="opt-tonemap">
+            <option value="0">AgX Punchy</option>
+            <option value="1">ACES</option>
+            <option value="2">Reinhard</option>
+            <option value="3">Uncharted 2</option>
+            <option value="4">PBR Neutral</option>
+            <option value="5">Standard</option>
+            <option value="6">None</option>
+          </select>
+        </div>
+        <div class="menu-row">
+          <label>Exposure</label>
+          <input type="range" id="opt-exposure" min="10" max="500" value="100">
+          <span class="menu-val" id="val-exposure">1.00</span>
+        </div>
+        <div class="menu-row">
+          <label>Saturation</label>
+          <input type="range" id="opt-saturation" min="0" max="200" value="100">
+          <span class="menu-val" id="val-saturation">1.00</span>
+        </div>
+        <div class="menu-row">
+          <label>Contrast</label>
+          <input type="range" id="opt-contrast" min="0" max="100" value="0">
+          <span class="menu-val" id="val-contrast">0.00</span>
+        </div>
+      </div>
+      <div class="menu-sec">
         <div class="menu-title">Post-Processing</div>
         <div class="menu-row">
           <label>Temporal Blend</label>

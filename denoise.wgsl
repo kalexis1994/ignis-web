@@ -7,6 +7,11 @@ struct Params {
   resolution: vec2f,
   step_size: f32,
   frames_still: f32,
+  // Color controls (used by composite only)
+  tonemap_mode: u32,  // 0=AgX, 1=ACES, 2=Reinhard, 3=Uncharted2, 4=PBR Neutral, 5=Standard, 6=None
+  exposure: f32,       // pre-tonemap multiplier (default 1.0)
+  saturation: f32,     // post-tonemap (0=gray, 1=normal, 2=vivid)
+  contrast: f32,       // post-gamma Hermite smoothstep (0=off, 1=max)
 };
 
 @group(0) @binding(0) var<uniform> params: Params;
@@ -232,13 +237,19 @@ fn preblur(@builtin(global_invocation_id) gid: vec3u) {
   textureStore(out_spec, px, vec4f(s_sum / s_wsum, center_hit_dist));
 }
 
-// === COMPOSITE: albedo * diffuse + specular, then AgX tonemap ===
+// ============================================================
+// COMPOSITE: remodulate + tonemap + color controls
+// Pipeline: HDR → Exposure → Tonemap → Saturation → Gamma → Contrast → Dither
+// ============================================================
 @group(0) @binding(7) var composite_out: texture_storage_2d<rgba8unorm, write>;
 
-fn agx(color_in: vec3f) -> vec3f {
+// --- Tonemap 0: AgX Punchy (Blender 4 / Troy Sobotka) ---
+fn tonemap_agx(color_in: vec3f) -> vec3f {
+  // sRGB → Rec.2020
   var c = mat3x3f(
     vec3f(0.6274, 0.0691, 0.0164), vec3f(0.3293, 0.9195, 0.0880), vec3f(0.0433, 0.0113, 0.8956)
   ) * color_in;
+  // AgX inset
   c = mat3x3f(
     vec3f(0.856627, 0.137319, 0.111898), vec3f(0.095121, 0.761242, 0.076799), vec3f(0.048252, 0.101439, 0.811302)
   ) * c;
@@ -247,17 +258,66 @@ fn agx(color_in: vec3f) -> vec3f {
   c = (c + 12.47393) / (4.026069 + 12.47393);
   let x2 = c * c; let x4 = x2 * x2;
   c = 15.5*x4*x2 - 40.14*x4*c + 31.96*x4 - 6.868*x2*c + 0.4298*x2 + 0.1191*c - 0.00232;
+  // Punchy: contrast + saturation boost
   c = pow(max(vec3f(0.0), c), vec3f(1.35));
   let l = dot(c, vec3f(0.2126, 0.7152, 0.0722));
   c = l + 1.4 * (c - l);
+  // AgX outset + linearize
   c = mat3x3f(
     vec3f(1.1271, -0.1413, -0.1413), vec3f(-0.1106, 1.1578, -0.1106), vec3f(-0.0165, -0.0165, 1.2519)
   ) * c;
   c = pow(max(vec3f(0.0), c), vec3f(2.2));
+  // Rec.2020 → sRGB
   c = mat3x3f(
     vec3f(1.6605, -0.1246, -0.0182), vec3f(-0.5876, 1.1329, -0.1006), vec3f(-0.0728, -0.0083, 1.1187)
   ) * c;
-  return clamp(c, vec3f(0.0), vec3f(1.0));
+  return c; // returns linear
+}
+
+// --- Tonemap 1: ACES Narkowicz 2015 fit ---
+fn tonemap_aces(v: vec3f) -> vec3f {
+  let x = v * 0.6; // exposure bias
+  return clamp((x * (2.51 * x + 0.03)) / (x * (2.43 * x + 0.59) + 0.14), vec3f(0.0), vec3f(1.0));
+}
+
+// --- Tonemap 2: Reinhard (luminance-preserving) ---
+fn tonemap_reinhard(v: vec3f) -> vec3f {
+  let l = dot(v, vec3f(0.2126, 0.7152, 0.0722));
+  if l < 1e-6 { return v; }
+  let l_new = l / (1.0 + l);
+  return v * (l_new / l);
+}
+
+// --- Tonemap 3: Uncharted 2 / Hable filmic ---
+fn uc2_partial(x: vec3f) -> vec3f {
+  let A = 0.15; let B = 0.50; let C = 0.10; let D = 0.20; let E = 0.02; let F = 0.30;
+  return ((x*(A*x+C*B)+D*E)/(x*(A*x+B)+D*F))-E/F;
+}
+fn tonemap_uncharted2(v: vec3f) -> vec3f {
+  let curr = uc2_partial(v * 2.0); // exposure bias = 2.0
+  let white_scale = vec3f(1.0) / uc2_partial(vec3f(11.2));
+  return curr * white_scale;
+}
+
+// --- Tonemap 4: Khronos PBR Neutral (May 2024, true-to-life color) ---
+fn tonemap_pbr_neutral(color_in: vec3f) -> vec3f {
+  let startCompression = 0.8 - 0.04;
+  let desaturation = 0.15;
+  let x = min(color_in.r, min(color_in.g, color_in.b));
+  let offset = select(0.04, x - 6.25 * x * x, x < 0.08);
+  var color = color_in - offset;
+  let peak = max(color.r, max(color.g, color.b));
+  if peak < startCompression { return color; }
+  let d = 1.0 - startCompression;
+  let newPeak = 1.0 - d * d / (peak + d - startCompression);
+  color *= newPeak / peak;
+  let g = 1.0 - 1.0 / (desaturation * (peak - newPeak) + 1.0);
+  return mix(color, vec3f(newPeak), g);
+}
+
+// --- Tonemap 5: Standard (clamp) ---
+fn tonemap_standard(v: vec3f) -> vec3f {
+  return clamp(v, vec3f(0.0), vec3f(1.0));
 }
 
 @compute @workgroup_size(8, 8)
@@ -270,9 +330,41 @@ fn composite(@builtin(global_invocation_id) gid: vec3u) {
   let denoised_spec = textureLoad(in_spec, px, 0).rgb;
   let albedo = textureLoad(albedo_tex, px, 0).rgb;
 
-  // Remodulate: albedo * diffuse_irradiance + specular_radiance
+  // Remodulate: albedo × diffuse_irradiance + specular_radiance
   var hdr = max(albedo, vec3f(0.02)) * denoised_diff + denoised_spec;
-  var c = agx(hdr);
-  c = pow(max(c, vec3f(0.0)), vec3f(1.0 / 2.2));
+
+  // 1. Exposure (pre-tonemap)
+  hdr *= params.exposure;
+
+  // 2. Tonemap curve
+  var ldr: vec3f;
+  switch params.tonemap_mode {
+    case 0u: { ldr = tonemap_agx(hdr); }       // AgX Punchy
+    case 1u: { ldr = tonemap_aces(hdr); }       // ACES (Narkowicz)
+    case 2u: { ldr = tonemap_reinhard(hdr); }   // Reinhard
+    case 3u: { ldr = tonemap_uncharted2(hdr); } // Uncharted 2
+    case 4u: { ldr = tonemap_pbr_neutral(hdr); } // Khronos PBR Neutral
+    case 5u: { ldr = tonemap_standard(hdr); }   // Standard (clamp)
+    default: { ldr = hdr; }                     // None (linear, debug)
+  }
+  ldr = clamp(ldr, vec3f(0.0), vec3f(1.0));
+
+  // 3. Saturation (post-tonemap)
+  let sat_luma = dot(ldr, vec3f(0.2126, 0.7152, 0.0722));
+  ldr = clamp(mix(vec3f(sat_luma), ldr, params.saturation), vec3f(0.0), vec3f(1.0));
+
+  // 4. Gamma encode (sRGB 2.2)
+  var c = pow(max(ldr, vec3f(0.0)), vec3f(1.0 / 2.2));
+
+  // 5. Contrast (post-gamma Hermite smoothstep, ignis-rt)
+  if params.contrast > 0.01 {
+    let curved = c * c * (3.0 - 2.0 * c);
+    c = mix(c, curved, params.contrast);
+  }
+
+  // 6. Dither (triangular ±0.5/255, prevents banding)
+  let dither_hash = fract(sin(dot(vec2f(f32(px.x), f32(px.y)), vec2f(12.9898, 78.233))) * 43758.5453);
+  c += (dither_hash - 0.5) / 255.0;
+
   textureStore(composite_out, px, vec4f(c, 1.0));
 }

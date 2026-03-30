@@ -570,12 +570,11 @@ async function init() {
   const denoisePasses = gpuProfile.denoisePasses || 5;
   const dnSteps = [1, 2, 4, 8, 16]; // up to 5 passes
   const dnParamBufs = dnSteps.map((s, i) => {
-    const buf = device.createBuffer({ size: 16, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
-    device.queue.writeBuffer(buf, 0, new Float32Array([width, height, s, i]));
+    const buf = device.createBuffer({ size: 32, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
+    device.queue.writeBuffer(buf, 0, new Float32Array([width, height, s, 0, 0, 1.0, 1.0, 0]));
     return buf;
   });
-  const dnCompParamBuf = device.createBuffer({ size: 16, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
-  device.queue.writeBuffer(dnCompParamBuf, 0, new Float32Array([width, height, 0, 0]));
+  const dnCompParamBuf = device.createBuffer({ size: 32, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
 
   // À-trous layout: dual-signal (diffuse + specular) + normals + albedo(roughness)
   const dnAtrousLayout = device.createBindGroupLayout({
@@ -723,11 +722,16 @@ async function init() {
   };
 
   // --- Settings (menu-controlled) ---
+  const TONEMAP_NAMES = ['AgX Punchy', 'ACES', 'Reinhard', 'Uncharted 2', 'PBR Neutral', 'Standard', 'None'];
   const settings = {
     sunElevation: 58,
     sunAzimuth: 53,
     sharpness: 0.6,
     temporalAlpha: 0.02,
+    tonemapMode: 0,
+    exposure: 1.0,
+    saturation: 1.0,
+    contrast: 0.0,
   };
 
   function getSunDir() {
@@ -1138,6 +1142,28 @@ async function init() {
     v => settings.temporalAlpha = v / 1000,
     v => (v / 1000).toFixed(3));
 
+  // Color controls
+  bindSlider('opt-exposure', 'val-exposure',
+    () => settings.exposure * 100,
+    v => settings.exposure = v / 100,
+    v => (v / 100).toFixed(2));
+
+  bindSlider('opt-saturation', 'val-saturation',
+    () => settings.saturation * 100,
+    v => settings.saturation = v / 100,
+    v => (v / 100).toFixed(2));
+
+  bindSlider('opt-contrast', 'val-contrast',
+    () => settings.contrast * 100,
+    v => settings.contrast = v / 100,
+    v => (v / 100).toFixed(2));
+
+  const optTonemap = document.getElementById('opt-tonemap');
+  if (optTonemap) {
+    optTonemap.value = settings.tonemapMode;
+    optTonemap.addEventListener('change', e => settings.tonemapMode = Number(e.target.value));
+  }
+
   function refreshMenu() {
     const sets = [
       ['opt-sharp', 'val-sharp', settings.sharpness * 100, v => (v / 100).toFixed(2)],
@@ -1146,12 +1172,16 @@ async function init() {
       ['opt-speed', 'val-speed', camera.speed * 10, v => (v / 10).toFixed(1)],
       ['opt-fov', 'val-fov', camera.fov, v => v + '\u00B0'],
       ['opt-temporal', 'val-temporal', settings.temporalAlpha * 1000, v => (v / 1000).toFixed(3)],
+      ['opt-exposure', 'val-exposure', settings.exposure * 100, v => (v / 100).toFixed(2)],
+      ['opt-saturation', 'val-saturation', settings.saturation * 100, v => (v / 100).toFixed(2)],
+      ['opt-contrast', 'val-contrast', settings.contrast * 100, v => (v / 100).toFixed(2)],
     ];
     for (const [sid, vid, val, fmt] of sets) {
-      document.getElementById(sid).value = val;
-      document.getElementById(vid).textContent = fmt(val);
+      const el = document.getElementById(sid);
+      if (el) { el.value = val; document.getElementById(vid).textContent = fmt(val); }
     }
     optFsr.value = fsrMode;
+    if (optTonemap) optTonemap.value = settings.tonemapMode;
   }
 
   // --- Gizmo ---
@@ -1406,6 +1436,15 @@ async function init() {
       }
 
       // Composite (tonemap → LDR)
+      // Write composite params: resolution + color controls
+      const cp = new ArrayBuffer(32);
+      const cpf = new Float32Array(cp);
+      const cpu = new Uint32Array(cp);
+      cpf[0] = width; cpf[1] = height; cpf[2] = 0; cpf[3] = 0;
+      cpu[4] = settings.tonemapMode; cpf[5] = settings.exposure;
+      cpf[6] = settings.saturation; cpf[7] = settings.contrast;
+      device.queue.writeBuffer(dnCompParamBuf, 0, cp);
+
       const compPass = encoder.beginComputePass();
       compPass.setPipeline(dnCompPipeline);
       compPass.setBindGroup(0, denoiseMode !== 'off' ? dnBG_comp : dnBG_comp_noisy);
