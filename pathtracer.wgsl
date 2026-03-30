@@ -41,7 +41,7 @@ struct Material {
   albedo: vec3f, mat_type: f32,
   emission: vec3f, roughness: f32,
   metallic: f32, base_tex: f32, mr_tex: f32, normal_tex: f32,
-  alpha_mode: f32, alpha_cutoff: f32, ior: f32, _pad: f32,
+  alpha_mode: f32, alpha_cutoff: f32, ior: f32, emission_strength: f32,
 };
 struct HitInfo { t: f32, u: f32, v: f32, tri_idx: u32, hit: bool, };
 
@@ -486,7 +486,44 @@ fn sample_sun_nee_split(pos: vec3f, normal: vec3f, V: vec3f, baseColor: vec3f, r
   if cos_theta <= 0.0 { return BRDFSplit(vec3f(0.0), vec3f(0.0)); }
   let brdf = eval_ct_split(normal, V, L, baseColor, roughness, metallic);
   let light = SUN_COLOR * SUN_MULT * SUN_SOLID_ANGLE * shadow_val;
-  return BRDFSplit(brdf.diffuse * light, brdf.specular * light);
+  var result_split = BRDFSplit(brdf.diffuse * light, brdf.specular * light);
+
+  // NEE to emissive triangles (split diffuse/specular)
+  if uniforms.emissive_tri_count > 0u {
+    let eidx = emissive_tris[u32(rand() * f32(uniforms.emissive_tri_count)) % uniforms.emissive_tri_count];
+    let etd = tri_data[eidx];
+    let emat = material_buf[etd.w];
+    let ev0 = vertices[etd.x].xyz;
+    let ev1 = vertices[etd.y].xyz;
+    let ev2 = vertices[etd.z].xyz;
+    var eu = rand(); var ev = rand();
+    if eu + ev > 1.0 { eu = 1.0 - eu; ev = 1.0 - ev; }
+    let epos = ev0 * (1.0 - eu - ev) + ev1 * eu + ev2 * ev;
+    let eedge1 = ev1 - ev0; let eedge2 = ev2 - ev0;
+    let ecross = cross(eedge1, eedge2);
+    let earea = length(ecross) * 0.5;
+    let enormal = ecross / max(length(ecross), 1e-8);
+    let eto = epos - pos;
+    let edist = length(eto);
+    let edir = eto / max(edist, 1e-6);
+    let endotl = dot(normal, edir);
+    let ecos_theta = dot(-edir, enormal);
+    if endotl > 0.0 && ecos_theta > 0.0 && edist > 0.01 && earea > 1e-6 {
+      if !trace_shadow_skip_mat(origin, edir, edist - 0.01, etd.w) {
+        let ebrdf = eval_ct_split(normal, V, edir, baseColor, roughness, metallic);
+        let eradiance = emat.emission * emat.emission_strength * ecos_theta / (edist * edist);
+        let light_pdf = (1.0 / f32(uniforms.emissive_tri_count)) / earea;
+        let sa_pdf = light_pdf * edist * edist / ecos_theta;
+        let bsdf_pdf = endotl * INV_PI;
+        let mis_w = (sa_pdf * sa_pdf) / (sa_pdf * sa_pdf + bsdf_pdf * bsdf_pdf + 1e-8);
+        let escale = eradiance * mis_w / max(light_pdf, 1e-6);
+        result_split.diffuse += ebrdf.diffuse * escale;
+        result_split.specular += ebrdf.specular * escale;
+      }
+    }
+  }
+
+  return result_split;
 }
 
 // ============================================================
@@ -568,6 +605,52 @@ fn trace_bvh_hint(origin: vec3f, dir: vec3f, t_hint: f32) -> HitInfo {
   return hit;
 }
 
+// Shadow with material skip (for emissive NEE — skip the emissive's own geometry)
+fn trace_shadow_skip_mat(origin: vec3f, dir: vec3f, max_t: f32, skip_mat: u32) -> bool {
+  let inv_dir = 1.0 / dir;
+  var stk: array<u32, 6>; var sp = 0u; var cur = 0u;
+  let root = bvh_nodes[0u];
+  if intersect_aabb(origin, inv_dir, root.aabb_min, root.aabb_max, max_t) >= max_t { return false; }
+  loop {
+    let nd = bvh_nodes[cur];
+    if nd.tri_count > 0u {
+      for (var i = 0u; i < nd.tri_count; i++) {
+        let ti = nd.left_first+i; let td = tri_data[ti];
+        if td.w == skip_mat { continue; } // skip target emissive material
+        let r = intersect_tri(origin, dir, vertices[td.x].xyz, vertices[td.y].xyz, vertices[td.z].xyz, max_t);
+        if r.x < max_t {
+          let mat = material_buf[td.w];
+          let am = u32(mat.alpha_mode + 0.5);
+          if am >= 1u {
+            let bw = 1.0 - r.y - r.z;
+            let uv = get_uv(td, bw, r.y, r.z);
+            let btx = i32(mat.base_tex + 0.5);
+            var ta = 1.0;
+            if btx >= 0 { ta = textureSampleLevel(tex_array, tex_sampler_pt, uv, btx, 0.0).a; }
+            if am == 1u && ta < mat.alpha_cutoff { continue; }
+            if am == 2u && ta < g_alpha_dither { continue; }
+          }
+          let shadow_mat_type = u32(mat.mat_type + 0.5);
+          if shadow_mat_type == 3u { continue; }
+          return true;
+        }
+      }
+      if sp==0u{break;} sp--; cur=stk[sp]; continue;
+    }
+    let l=nd.left_first; let r=l+1u;
+    let tl=intersect_aabb(origin,inv_dir,bvh_nodes[l].aabb_min,bvh_nodes[l].aabb_max,max_t);
+    let tr=intersect_aabb(origin,inv_dir,bvh_nodes[r].aabb_min,bvh_nodes[r].aabb_max,max_t);
+    if tl<tr {
+      if tr<max_t && sp<6u { stk[sp]=r; sp++; }
+      if tl<max_t { cur=l; } else { if sp==0u{break;} sp--; cur=stk[sp]; }
+    } else {
+      if tl<max_t && sp<6u { stk[sp]=l; sp++; }
+      if tr<max_t { cur=r; } else { if sp==0u{break;} sp--; cur=stk[sp]; }
+    }
+  }
+  return false;
+}
+
 // Shadow (any hit, stack of 6)
 fn trace_shadow(origin: vec3f, dir: vec3f, max_t: f32) -> bool {
   let inv_dir = 1.0 / dir;
@@ -591,8 +674,11 @@ fn trace_shadow(origin: vec3f, dir: vec3f, max_t: f32) -> bool {
             var ta = 1.0;
             if btx >= 0 { ta = textureSampleLevel(tex_array, tex_sampler_pt, uv, btx, 0.0).a; }
             if am == 1u && ta < mat.alpha_cutoff { continue; }
-            if am == 2u && ta < g_alpha_dither { continue; } // BLEND: same dither as primary
+            if am == 2u && ta < g_alpha_dither { continue; }
           }
+          // Glass is transparent to shadow rays
+          let shadow_mat_type = u32(mat.mat_type + 0.5);
+          if shadow_mat_type == 3u { continue; }
           return true;
         }
       }
@@ -632,10 +718,56 @@ fn sample_sun_nee(pos: vec3f, normal: vec3f, V: vec3f, baseColor: vec3f, roughne
   if !trace_shadow(origin, L2, 50.0) { shadow_val += 0.5; }
   if shadow_val <= 0.0 { return vec3f(0.0); }
 
-  let L = normalize(L1 + L2); // average direction for BRDF eval
+  let L = normalize(L1 + L2);
   let cos_theta = dot(normal, L);
   if cos_theta <= 0.0 { return vec3f(0.0); }
-  return SUN_COLOR * SUN_MULT * eval_cook_torrance(normal, V, L, baseColor, roughness, metallic) * SUN_SOLID_ANGLE * shadow_val;
+  var result = SUN_COLOR * SUN_MULT * eval_cook_torrance(normal, V, L, baseColor, roughness, metallic) * SUN_SOLID_ANGLE * shadow_val;
+
+  // NEE to emissive triangles (MIS, ported from ignis-rt)
+  if uniforms.emissive_tri_count > 0u {
+    // Select random emissive triangle (uniform probability)
+    let eidx = emissive_tris[u32(rand() * f32(uniforms.emissive_tri_count)) % uniforms.emissive_tri_count];
+    let etd = tri_data[eidx];
+    let emat = material_buf[etd.w];
+    let ev0 = vertices[etd.x].xyz;
+    let ev1 = vertices[etd.y].xyz;
+    let ev2 = vertices[etd.z].xyz;
+
+    // Random point on emissive triangle (uniform barycentric)
+    var eu = rand(); var ev = rand();
+    if eu + ev > 1.0 { eu = 1.0 - eu; ev = 1.0 - ev; }
+    let epos = ev0 * (1.0 - eu - ev) + ev1 * eu + ev2 * ev;
+
+    // Triangle area and normal
+    let eedge1 = ev1 - ev0;
+    let eedge2 = ev2 - ev0;
+    let ecross = cross(eedge1, eedge2);
+    let earea = length(ecross) * 0.5;
+    let enormal = ecross / max(length(ecross), 1e-8);
+
+    // Direction and distance to emissive point
+    let eto = epos - pos;
+    let edist = length(eto);
+    let edir = eto / max(edist, 1e-6);
+
+    // Geometric checks: facing, distance
+    let endotl = dot(normal, edir);
+    let ecos_theta = dot(-edir, enormal);
+
+    if endotl > 0.0 && ecos_theta > 0.0 && edist > 0.01 && earea > 1e-6 {
+      if !trace_shadow_skip_mat(origin, edir, edist - 0.01, etd.w) {
+        let ebrdf = eval_cook_torrance(normal, V, edir, baseColor, roughness, metallic);
+        let eradiance = emat.emission * emat.emission_strength * ecos_theta / (edist * edist);
+        let light_pdf = (1.0 / f32(uniforms.emissive_tri_count)) / earea;
+        let solid_angle_pdf = light_pdf * edist * edist / ecos_theta;
+        let bsdf_pdf = endotl * INV_PI;
+        let mis_w = (solid_angle_pdf * solid_angle_pdf) / (solid_angle_pdf * solid_angle_pdf + bsdf_pdf * bsdf_pdf + 1e-8);
+        result += ebrdf * eradiance * mis_w / max(light_pdf, 1e-6);
+      }
+    }
+  }
+
+  return result;
 }
 
 // ============================================================
@@ -826,7 +958,7 @@ fn path_trace(primary_origin: vec3f, primary_dir: vec3f) -> PathResult {
     // Emission
     if mat_type == 2u {
       if specular_bounce {
-        let e = throughput * mat.emission;
+        let e = throughput * mat.emission * mat.emission_strength;
         if bounce == 0u { spec_rad += e; }
         else if is_diffuse_path { diff_rad += e; }
         else { spec_rad += e; }
@@ -875,25 +1007,50 @@ fn path_trace(primary_origin: vec3f, primary_dir: vec3f) -> PathResult {
 
     // BRDF sampling — at bounce 0, classify path and demodulate diffuse throughput
     if mat_type == 3u {
-      // Glass: separate bounce budget (doesn't consume main bounces)
+      // Glass: solid refraction/reflection (ported from ignis-rt Vulkan)
+      // Separate bounce budget — glass doesn't consume main bounces
       glass_bounces += 1u;
-      if glass_bounces > 16u { break; } // max 16 glass bounces
-      let ior = mat.ior;
-      var eta = select(ior, 1.0 / ior, front_face);
-      let cos_theta = min(dot(V, normal), 1.0);
-      let sin_theta = sqrt(1.0 - cos_theta * cos_theta);
-      let F = fresnel_dielectric(cos_theta, select(1.0/ior, ior, front_face));
-      if eta * sin_theta > 1.0 || F > rand() {
-        dir = reflect(-V, normal);
-        origin = hit_pos + normal * BIAS;
+      if glass_bounces > 16u { break; }
+
+      let glass_ior = max(mat.ior, 1.01);
+      let entering = front_face; // dot(dir, original_normal) < 0 = entering glass
+      let refract_n = select(-normal, normal, entering);
+      let eta = select(glass_ior, 1.0 / glass_ior, entering);
+
+      // GGX roughness for microfacet refraction
+      var alpha_glass = roughness * roughness;
+      alpha_glass = max(alpha_glass, 0.001);
+
+      // Microfacet half-vector: smooth glass (< 0.0005) uses flat normal
+      var H_glass: vec3f;
+      if alpha_glass >= 0.0005 {
+        H_glass = sample_ggx_vndf(rand2(), V, refract_n, alpha_glass);
       } else {
-        dir = refract(-V, normal, eta);
-        origin = hit_pos - normal * BIAS;
+        H_glass = refract_n;
       }
-      throughput *= base_color;
-      specular_bounce = true;
+
+      let cos_i = abs(dot(V, H_glass));
+      let fresnel = fresnel_dielectric(cos_i, eta);
+      let refracted = refract(-V, H_glass, eta);
+      let can_refract = dot(refracted, refracted) > 0.0001;
+
+      if !can_refract || rand() < fresnel {
+        // Reflection (TIR or Fresnel)
+        dir = reflect(-dir, H_glass);
+        origin = hit_pos + refract_n * BIAS;
+      } else {
+        // Refraction
+        dir = refracted;
+        origin = hit_pos - refract_n * BIAS;
+      }
+
+      // Cycles Principled transmission tint: sqrt(baseColor)
+      // Simpler than Beer's law, matches Blender exactly
+      throughput *= sqrt(clamp(base_color, vec3f(0.0), vec3f(1.0)));
+
+      specular_bounce = roughness < 0.1;
       if bounce == 0u { is_diffuse_path = false; }
-      bounce -= 1u; // glass doesn't consume a main bounce
+      bounce -= 1u;
       continue;
     } else if metallic > 0.5 {
       // Metal / specular-dominant: GGX VNDF sampling → specular path

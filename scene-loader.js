@@ -124,15 +124,14 @@ function extractMaterials(gltf) {
       emission = [mat.emissiveFactor[0], mat.emissiveFactor[1], mat.emissiveFactor[2]];
     }
 
-    if (name === 'light_bulb') {
-      type = 2; emission = [8.0, 7.5, 6.0];
-    } else if (name === 'lamp_glass_01') {
-      type = 2; emission = [5.0, 3.0, 1.0];
-    } else if (name === 'glass' || mat.extensions?.KHR_materials_transmission) {
-      type = 3; ior = 1.5;
-      // GLTF baseColorFactor for glass is [0,0,0] (meant for alpha blending), override for refraction
-      albedo[0] = 0.97; albedo[1] = 0.97; albedo[2] = 0.98;
-    } else if (emission[0] > 0.1 || emission[1] > 0.1 || emission[2] > 0.1) {
+    if (mat.extensions?.KHR_materials_transmission) {
+      type = 3;
+      ior = mat.extensions?.KHR_materials_ior?.ior || 1.5;
+      // Glass with [0,0,0] baseColor: use near-white for refraction
+      if (albedo[0] < 0.01 && albedo[1] < 0.01 && albedo[2] < 0.01) {
+        albedo[0] = 0.97; albedo[1] = 0.97; albedo[2] = 0.98;
+      }
+    } else if (emission[0] > 0.01 || emission[1] > 0.01 || emission[2] > 0.01) {
       type = 2;
     }
 
@@ -145,7 +144,19 @@ function extractMaterials(gltf) {
     // A true MASK material would have cutoff ~0.5
     if (alphaMode === 1 && alphaCutoff < 0.1) { alphaMode = 2; }
 
-    return { albedo, type, emission, roughness, metallic, baseTex, mrTex, normalTex, alphaMode, alphaCutoff, ior };
+    // Emission strength: KHR_materials_emissive_strength or extract from magnitude
+    let emissionStrength = mat.extensions?.KHR_materials_emissive_strength?.emissiveStrength || 0;
+    const emLum = Math.max(emission[0], emission[1], emission[2]);
+    if (emissionStrength <= 0 && emLum > 1.0) {
+      // Hardcoded override with values > 1: extract magnitude as strength
+      emissionStrength = emLum;
+    }
+    if (emissionStrength <= 0) emissionStrength = 1.0;
+    // Normalize emission color to 0-1 range
+    if (emLum > 1.0) {
+      emission[0] /= emLum; emission[1] /= emLum; emission[2] /= emLum;
+    }
+    return { albedo, type, emission, roughness, metallic, baseTex, mrTex, normalTex, alphaMode, alphaCutoff, ior, emissionStrength };
   });
 }
 
@@ -578,7 +589,7 @@ export async function loadScene(basePath, onProgress) {
     gpuMaterials[o+12] = m.alphaMode;
     gpuMaterials[o+13] = m.alphaCutoff;
     gpuMaterials[o+14] = m.ior;
-    gpuMaterials[o+15] = 0;
+    gpuMaterials[o+15] = m.emissionStrength || 1.0;
   }
 
   // Collect emissive triangle indices for NEE

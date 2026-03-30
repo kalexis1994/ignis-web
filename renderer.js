@@ -322,7 +322,7 @@ async function init() {
   }
 
   // Create G-buffer bind group (now that texArray exists)
-  const matBufForGbuf = createGPUBuffer(device, scene.gpuMaterials, GPUBufferUsage.STORAGE);
+  const matBufForGbuf = createGPUBuffer(device, scene.gpuMaterials, GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST);
   const gbufSampler = device.createSampler({ magFilter: 'linear', minFilter: 'linear' });
   const gbufBG = device.createBindGroup({ layout: gbufBGL, entries: [
     { binding: 0, resource: { buffer: gbufUniformBuf } },
@@ -337,7 +337,7 @@ async function init() {
   const nrmBuf = createGPUBuffer(device, scene.gpuNormals, GPUBufferUsage.STORAGE);
   const triBuf = createGPUBuffer(device, scene.gpuTriData, GPUBufferUsage.STORAGE);
   const bvhBuf = createGPUBuffer(device, scene.gpuBVHNodes, GPUBufferUsage.STORAGE);
-  const matBuf = createGPUBuffer(device, scene.gpuMaterials, GPUBufferUsage.STORAGE);
+  const matBuf = createGPUBuffer(device, scene.gpuMaterials, GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST);
   const emsBuf = createGPUBuffer(device, scene.gpuEmissiveTris, GPUBufferUsage.STORAGE);
 
   // --- Bind group 0: uniforms + accumulation + output ---
@@ -779,13 +779,13 @@ async function init() {
   // --- CPU ray-BVH picker for debug ---
   function debugPick(cssX, cssY) {
     const rect = canvas.getBoundingClientRect();
-    const px = (cssX - rect.left) / rect.width * width;
-    const py = (cssY - rect.top) / rect.height * height;
+    // Map CSS click to NDC [-1,+1]
+    // Y inverted: display pipeline flips Y (clip -1=bottom → UV 0=texture top)
+    const nx = ((cssX - rect.left) / rect.width) * 2 - 1;
+    const ny = -(((cssY - rect.top) / rect.height) * 2 - 1);
     const {forward: fw, right: rt, up: u} = getCameraVectors();
     const ff = Math.tan((camera.fov * Math.PI / 180) * 0.5);
-    const asp = width / height;
-    const nx = ((px + 0.5) / width) * 2 - 1;
-    const ny = ((py + 0.5) / height) * 2 - 1;
+    const asp = rect.width / rect.height;
     const dx = fw[0]+nx*asp*ff*rt[0]+ny*ff*u[0], dy = fw[1]+nx*asp*ff*rt[1]+ny*ff*u[1], dz = fw[2]+nx*asp*ff*rt[2]+ny*ff*u[2];
     const dl = Math.sqrt(dx*dx+dy*dy+dz*dz);
     const dir = [dx/dl, dy/dl, dz/dl];
@@ -857,6 +857,14 @@ async function init() {
   document.getElementById('pick-close').addEventListener('click', () => { pickModal.style.display = 'none'; });
   pickModal.addEventListener('click', (e) => { if (e.target === pickModal) pickModal.style.display = 'none'; });
 
+  // Upload material changes to GPU (both buffers)
+  function uploadMaterial(matIdx) {
+    const byteOffset = matIdx * 16 * 4; // 16 floats × 4 bytes
+    const slice = new Float32Array(scene.gpuMaterials.buffer, byteOffset, 16);
+    device.queue.writeBuffer(matBuf, byteOffset, slice);
+    device.queue.writeBuffer(matBufForGbuf, byteOffset, slice);
+  }
+
   function showPickInfo(pick) {
     if (!pick) { debugContent.textContent = 'No hit (sky)'; return; }
     const m = scene.gpuMaterials, o = pick.matIdx * 16;
@@ -864,71 +872,125 @@ async function init() {
     const types = ['PBR','Metal','Emissive','Glass'];
     const alphaModes = ['Opaque','Mask','Blend'];
     const name = names[pick.matIdx] || 'unknown';
+    const mi = pick.matIdx;
 
-    // Short info in debug panel
     debugContent.textContent = `${name} | Tri #${pick.triIdx} | d=${pick.t.toFixed(2)}`;
+    pickTitle.textContent = `#${mi} "${name}"`;
 
-    // Full info in modal
-    pickTitle.textContent = `#${pick.matIdx} "${name}"`;
+    const albHex = '#' + [m[o],m[o+1],m[o+2]].map(v => Math.round(Math.min(v,1)*255).toString(16).padStart(2,'0')).join('');
+    const isEmissive = Math.round(m[o+3]) === 2;
 
-    const albR = m[o], albG = m[o+1], albB = m[o+2];
-    const albHex = '#' + [albR,albG,albB].map(v => Math.round(v*255).toString(16).padStart(2,'0')).join('');
+    // Helper: create editable slider row
+    function sliderRow(label, value, min, max, step, onChange) {
+      const id = `mat-${label.replace(/\s/g,'-').toLowerCase()}-${mi}`;
+      return `<div style="margin-bottom:6px; display:flex; align-items:center; gap:8px;">
+        <span style="color:#888; flex:0 0 80px; font-size:11px;">${label}</span>
+        <input type="range" id="${id}" min="${min}" max="${max}" step="${step}" value="${value}"
+          style="flex:1; accent-color:#0c0; height:4px;">
+        <span id="${id}-v" style="color:#fff; flex:0 0 40px; text-align:right; font-size:11px;">${Number(value).toFixed(2)}</span>
+      </div>`;
+    }
 
-    pickProps.innerHTML = `
+    // Build editable properties
+    let html = `
       <div style="margin-bottom:10px;">
-        <span style="color:#888;">Type:</span> <span style="color:#fff;">${types[Math.round(m[o+3])] || '?'}</span>
-        &nbsp;&nbsp;<span style="color:#888;">Alpha:</span> ${alphaModes[Math.round(m[o+12])] || '?'} (cutoff ${m[o+13].toFixed(2)})
+        <span style="color:#888;">Type:</span>
+        <select id="mat-type-${mi}" style="background:#222; color:#fff; border:1px solid #444; padding:2px 6px; border-radius:3px; font-size:11px;">
+          ${types.map((t,i) => `<option value="${i}" ${Math.round(m[o+3])===i?'selected':''}>${t}</option>`).join('')}
+        </select>
+        &nbsp;&nbsp;<span style="color:#555;">Tri #${pick.triIdx} | Dist: ${pick.t.toFixed(2)}</span>
       </div>
-      <div style="margin-bottom:8px;">
-        <span style="color:#888;">Albedo:</span>
-        <span style="display:inline-block;width:14px;height:14px;border-radius:3px;vertical-align:middle;border:1px solid #444;background:${albHex};"></span>
-        <span style="color:#fff;">${albHex}</span>
-        <span style="color:#555;">[${albR.toFixed(2)}, ${albG.toFixed(2)}, ${albB.toFixed(2)}]</span>
+      <div style="margin-bottom:10px;">
+        <span style="color:#888; font-size:11px;">Albedo</span>
+        <input type="color" id="mat-albedo-${mi}" value="${albHex}"
+          style="vertical-align:middle; width:28px; height:20px; border:1px solid #444; border-radius:3px; cursor:pointer;">
       </div>
-      <div style="margin-bottom:8px;">
-        <span style="color:#888;">Metallic:</span> <span style="color:#fff;">${m[o+8].toFixed(2)}</span>
-        &nbsp;&nbsp;<span style="color:#888;">Roughness:</span> <span style="color:#fff;">${m[o+7].toFixed(2)}</span>
-        &nbsp;&nbsp;<span style="color:#888;">IoR:</span> <span style="color:#fff;">${m[o+14].toFixed(2)}</span>
-      </div>
-      <div style="margin-bottom:8px;">
-        <span style="color:#888;">UV:</span> [${pick.uv[0].toFixed(4)}, ${pick.uv[1].toFixed(4)}]
-        &nbsp;&nbsp;<span style="color:#888;">Tri:</span> #${pick.triIdx}
-        &nbsp;&nbsp;<span style="color:#888;">Dist:</span> ${pick.t.toFixed(3)}
-      </div>
-      <div style="margin-bottom:4px;">
-        <span style="color:#888;">Normal:</span> [${pick.normal[0].toFixed(3)}, ${pick.normal[1].toFixed(3)}, ${pick.normal[2].toFixed(3)}]
+      ${sliderRow('Roughness', m[o+7], 0.01, 1, 0.01)}
+      ${sliderRow('Metallic', m[o+8], 0, 1, 0.01)}
+      ${sliderRow('IoR', m[o+14], 1, 3, 0.01)}
+    `;
+
+    if (isEmissive) {
+      html += `
+        <div style="margin-top:8px; padding-top:8px; border-top:1px solid rgba(255,255,255,0.05);">
+          ${sliderRow('Strength', m[o+15], 0.1, 5000, 1)}
+          ${sliderRow('Emission R', m[o+4], 0, 1, 0.01)}
+          ${sliderRow('Emission G', m[o+5], 0, 1, 0.01)}
+          ${sliderRow('Emission B', m[o+6], 0, 1, 0.01)}
+        </div>
+      `;
+    }
+
+    html += `
+      <div style="margin-top:6px; color:#444; font-size:10px;">
+        Normal: [${pick.normal.map(v=>v.toFixed(3)).join(', ')}] | UV: [${pick.uv.map(v=>v.toFixed(3)).join(', ')}]
       </div>
     `;
+
+    pickProps.innerHTML = html;
+
+    // Bind change events
+    function bindSliderProp(label, offset) {
+      const id = `mat-${label.replace(/\s/g,'-').toLowerCase()}-${mi}`;
+      const sl = document.getElementById(id);
+      const vl = document.getElementById(id + '-v');
+      if (!sl) return;
+      sl.addEventListener('input', () => {
+        const v = Number(sl.value);
+        vl.textContent = v.toFixed(2);
+        m[o + offset] = v;
+        uploadMaterial(mi);
+      });
+    }
+
+    bindSliderProp('Roughness', 7);
+    bindSliderProp('Metallic', 8);
+    bindSliderProp('IoR', 14);
+    bindSliderProp('Strength', 15);
+    bindSliderProp('Emission R', 4);
+    bindSliderProp('Emission G', 5);
+    bindSliderProp('Emission B', 6);
+
+    // Albedo color picker
+    const albPicker = document.getElementById(`mat-albedo-${mi}`);
+    if (albPicker) {
+      albPicker.addEventListener('input', () => {
+        const hex = albPicker.value;
+        m[o]   = parseInt(hex.slice(1,3), 16) / 255;
+        m[o+1] = parseInt(hex.slice(3,5), 16) / 255;
+        m[o+2] = parseInt(hex.slice(5,7), 16) / 255;
+        uploadMaterial(mi);
+      });
+    }
+
+    // Type selector
+    const typeSel = document.getElementById(`mat-type-${mi}`);
+    if (typeSel) {
+      typeSel.addEventListener('change', () => {
+        m[o+3] = Number(typeSel.value);
+        uploadMaterial(mi);
+        showPickInfo(pick); // rebuild UI (show/hide emission)
+      });
+    }
 
     // Texture previews
     const texInfo = scene.textureInfo;
     const texIds = { base: m[o+9], mr: m[o+10], normal: m[o+11] };
     const texLabels = { base: 'Base Color', mr: 'Metal/Rough', normal: 'Normal' };
     let texHTML = '';
-
     if (texInfo) {
       for (const [key, idx] of Object.entries(texIds)) {
         const ti = Math.round(idx);
         if (ti >= 0 && ti < texInfo.count) {
-          const uri = texInfo.imageURIs[ti];
-          texHTML += `
-            <div style="margin-bottom:12px;">
-              <div style="font-size:10px; text-transform:uppercase; letter-spacing:1px; color:#0a0; margin-bottom:4px;">${texLabels[key]} <span style="color:#444;">(#${ti})</span></div>
-              <img src="scene/${uri}" style="width:100%; max-height:180px; object-fit:contain; border-radius:4px; border:1px solid rgba(255,255,255,0.08); background:#111;">
-            </div>
-          `;
+          texHTML += `<div style="margin-bottom:8px;">
+            <div style="font-size:10px; text-transform:uppercase; letter-spacing:1px; color:#0a0; margin-bottom:4px;">${texLabels[key]} <span style="color:#444;">(#${ti})</span></div>
+            <img src="scene/${texInfo.imageURIs[ti]}" style="width:100%; max-height:140px; object-fit:contain; border-radius:4px; border:1px solid rgba(255,255,255,0.08); background:#111;">
+          </div>`;
         } else {
-          texHTML += `
-            <div style="margin-bottom:8px;">
-              <span style="font-size:10px; text-transform:uppercase; letter-spacing:1px; color:#333;">${texLabels[key]}: none</span>
-            </div>
-          `;
+          texHTML += `<div style="margin-bottom:4px;"><span style="font-size:10px; text-transform:uppercase; color:#333;">${texLabels[key]}: none</span></div>`;
         }
       }
-    } else {
-      texHTML = '<div style="color:#444;">No textures loaded</div>';
     }
-
     pickTextures.innerHTML = texHTML;
     pickModal.style.display = 'flex';
   }
