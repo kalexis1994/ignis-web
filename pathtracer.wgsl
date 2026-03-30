@@ -487,7 +487,11 @@ fn trace_bvh_hint(origin: vec3f, dir: vec3f, t_hint: f32) -> HitInfo {
             var ta = 1.0;
             if btx >= 0 { ta = textureSampleLevel(tex_array, tex_sampler_pt, uv, btx, 0.0).a; }
             if am == 1u && ta < max(mat.alpha_cutoff, 0.5) { continue; }
-            if am == 2u { continue; } // skip BLEND entirely in BVH — raster handles it
+            if am == 2u {
+              // Stochastic alpha: rand() threshold converges to correct coverage via temporal
+              let blend_rand = fract(f32((ti * 73856093u) ^ (u32(r.x * 1000.0) * 19349663u)) / 4294967295.0 + f32(pcg(&rng_state)) / 4294967295.0);
+              if ta < blend_rand { continue; }
+            }
           }
           hit.t=r.x; hit.u=r.y; hit.v=r.z; hit.tri_idx=ti; hit.hit=true;
         }
@@ -531,7 +535,7 @@ fn trace_shadow(origin: vec3f, dir: vec3f, max_t: f32) -> bool {
             var ta = 1.0;
             if btx >= 0 { ta = textureSampleLevel(tex_array, tex_sampler_pt, uv, btx, 0.0).a; }
             if am == 1u && ta < mat.alpha_cutoff { continue; }
-            if am == 2u { continue; } // skip BLEND entirely in BVH — raster handles it
+            if am == 2u && ta < 0.5 { continue; } // shadow rays: fixed 0.5 threshold (no RNG in shadow)
           }
           return true;
         }
@@ -722,10 +726,16 @@ fn path_trace(primary_origin: vec3f, primary_dir: vec3f) -> PathResult {
     var base_color = mat.albedo;
     var tex_alpha = 1.0;
     let base_tex_idx = i32(mat.base_tex + 0.5);
+    let alpha_mode = u32(mat.alpha_mode + 0.5);
     if base_tex_idx >= 0 {
       let tc = textureSampleLevel(tex_array, tex_sampler_pt, uv, base_tex_idx, 0.0);
-      base_color *= srgb_to_linear(tc.rgb);
+      var tex_rgb = srgb_to_linear(tc.rgb);
       tex_alpha = tc.a;
+      // BLEND decals: unpremultiply RGB (many decal textures have pre-multiplied alpha)
+      if alpha_mode == 2u && tex_alpha > 0.01 {
+        tex_rgb /= tex_alpha;
+      }
+      base_color *= tex_rgb;
     }
 
     // Sample metallic-roughness texture (G=roughness, B=metallic per GLTF spec)
