@@ -172,7 +172,7 @@ fn sharc_jenkins(a_in: u32) -> u32 {
 
 fn sharc_make_key(wp: vec3f, n: vec3f) -> u32 {
   let dist = length(wp - sharc_params.camera_pos);
-  let level = u32(max(log2(max(dist * sharc_params.scene_scale, 1.0)) / log2(2.0), 0.0));
+  let level = u32(max(log2(max(dist * sharc_params.scene_scale, 1.0)), 0.0));
   let vs = pow(2.0, f32(level)) / max(sharc_params.scene_scale, 1e-6);
   let gp = vec3i(floor(wp / vs));
   let an = abs(n);
@@ -669,7 +669,9 @@ fn path_trace(primary_origin: vec3f, primary_dir: vec3f) -> PathResult {
       let cached_gi = sharc_read_cached(hit_pos, normal);
       let has_cache = dot(cached_gi, vec3f(1.0)) > 0.001;
       if has_cache {
-        let gi = throughput * cached_gi * base_color;
+        // cached_gi already includes surface albedo (stored as pt.direct with BRDF)
+        // Don't multiply by base_color again — that would square the albedo
+        let gi = throughput * cached_gi;
         if is_diffuse_path { diff_rad += gi; } else { spec_rad += gi; }
         break;
       }

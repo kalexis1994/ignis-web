@@ -548,7 +548,7 @@ async function init() {
 
   // --- Denoiser pipelines ---
   // 3 separate param buffers for the 3 à-trous steps (avoid writeBuffer during encoding)
-  const denoisePasses = gpuProfile.denoisePasses || 3;
+  const denoisePasses = gpuProfile.denoisePasses || 5;
   const dnSteps = [1, 2, 4, 8, 16]; // up to 5 passes
   const dnParamBufs = dnSteps.map((s, i) => {
     const buf = device.createBuffer({ size: 16, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });

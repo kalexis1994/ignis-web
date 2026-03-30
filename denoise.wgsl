@@ -51,10 +51,10 @@ fn atrous(@builtin(global_invocation_id) gid: vec3u) {
   // Hit distance modulates blur: contact shadows stay sharp, far GI gets smoothed
   let hit_factor = mix(0.5, 1.0, hit_dist);
 
-  // Depth gradient
+  // Depth gradient with distance-relative floor (prevents filter rejection at far distances)
   let zr = textureLoad(gbuf_nd, min(px + vec2i(1,0), sz-1), 0).w;
   let zu = textureLoad(gbuf_nd, min(px + vec2i(0,1), sz-1), 0).w;
-  let gz = max(abs(zr - cz), abs(zu - cz));
+  let gz = max(max(abs(zr - cz), abs(zu - cz)), cz * 0.002);
 
   let step = i32(params.step_size);
 
@@ -116,8 +116,7 @@ fn atrous(@builtin(global_invocation_id) gid: vec3u) {
       let sd = s_diff.rgb;
       let ss = textureLoad(in_spec, sp, 0).rgb;
 
-      // Shared edge-stopping (SVGF, Schied 2017):
-      // Normal: eq.4, σ_n=128 (exponent). Depth: eq.3, σ_z=1.0.
+      // Normal edge-stopping (SVGF, Schied 2017, eq.4, σ_n=128)
       let wn = pow(max(dot(cn, snd.xyz), 0.0), 128.0);
       let dz = abs(cz - snd.w);
       let wz = exp(-dz / (gz * f32(step) + 1e-3));
