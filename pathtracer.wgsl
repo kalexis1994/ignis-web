@@ -657,7 +657,14 @@ fn apply_normal_map(td: vec4u, N: vec3f, uv: vec2f, tex_idx: i32) -> vec3f {
 // Path tracing with PBR BRDF + texture sampling
 // Returns radiance; writes first-hit normal+depth to out params
 // ============================================================
-struct PathResult { diffuse: vec3f, specular: vec3f, normal: vec3f, depth: f32, hit_pos: vec3f, direct: vec3f, tri_idx: u32, bary: vec2f, albedo: vec3f, roughness: f32, hit_dist: f32, };
+struct PathResult {
+  diffuse: vec3f, specular: vec3f, normal: vec3f, depth: f32,
+  hit_pos: vec3f, direct: vec3f, tri_idx: u32, bary: vec2f,
+  albedo: vec3f, roughness: f32, hit_dist: f32,
+  // SHaRC backpropagation data
+  sharc_pos: array<vec3f, 4>, sharc_nrm: array<vec3f, 4>,
+  sharc_rad: array<vec3f, 4>, sharc_count: u32,
+};
 
 var<private> g_depth_hint: f32; // G-buffer depth hint for first bounce acceleration
 
@@ -677,7 +684,13 @@ fn path_trace(primary_origin: vec3f, primary_dir: vec3f) -> PathResult {
   var origin = primary_origin;
   var dir = primary_dir;
   var specular_bounce = true;
-  var is_diffuse_path = true;  // set at bounce 0 based on BRDF sampling
+  var is_diffuse_path = true;
+  var glass_bounces = 0u;
+  // SHaRC backpropagation: store up to 4 bounce points for cache update
+  var sharc_pos: array<vec3f, 4>;
+  var sharc_nrm: array<vec3f, 4>;
+  var sharc_rad: array<vec3f, 4>;
+  var sharc_count = 0u;
 
   for (var bounce = 0u; bounce < uniforms.max_bounces; bounce++) {
     let hit = trace_bvh(origin, dir);
@@ -763,6 +776,13 @@ fn path_trace(primary_origin: vec3f, primary_dir: vec3f) -> PathResult {
       let direct = sample_sun_nee(hit_pos, normal, V, base_color, roughness, metallic);
       if is_diffuse_path { diff_rad += throughput * direct; }
       else { spec_rad += throughput * direct; }
+      // SHaRC backpropagation: record bounce point for cache update (up to 4)
+      if sharc_count < 4u {
+        sharc_pos[sharc_count] = hit_pos;
+        sharc_nrm[sharc_count] = normal;
+        sharc_rad[sharc_count] = direct;
+        sharc_count += 1u;
+      }
     }
 
     // Bounce 1+: try SHaRC cache for indirect GI
@@ -792,7 +812,9 @@ fn path_trace(primary_origin: vec3f, primary_dir: vec3f) -> PathResult {
 
     // BRDF sampling — at bounce 0, classify path and demodulate diffuse throughput
     if mat_type == 3u {
-      // Glass → specular path
+      // Glass: separate bounce budget (doesn't consume main bounces)
+      glass_bounces += 1u;
+      if glass_bounces > 16u { break; } // max 16 glass bounces
       let ior = mat.ior;
       var eta = select(ior, 1.0 / ior, front_face);
       let cos_theta = min(dot(V, normal), 1.0);
@@ -808,6 +830,7 @@ fn path_trace(primary_origin: vec3f, primary_dir: vec3f) -> PathResult {
       throughput *= base_color;
       specular_bounce = true;
       if bounce == 0u { is_diffuse_path = false; }
+      bounce -= 1u; // glass doesn't consume a main bounce
       continue;
     } else if metallic > 0.5 {
       // Metal / specular-dominant: GGX VNDF sampling → specular path
@@ -837,15 +860,21 @@ fn path_trace(primary_origin: vec3f, primary_dir: vec3f) -> PathResult {
 
     origin = hit_pos + normal * BIAS;
 
-    // Russian roulette
+    // Perceptual √ Russian roulette (ignis-rt / NRD guideline)
+    // sqrt prevents dim paths from surviving with huge weight → fewer fireflies
+    // Min 0.05 = max 20× boost (NRD recommendation)
     if bounce > 0u {
-      let p = min(max(throughput.x, max(throughput.y, throughput.z)), 0.9);
-      if p < 0.05 || rand() > p { break; }
+      let p = clamp(sqrt(max(throughput.x, max(throughput.y, throughput.z))), 0.05, 0.9);
+      if rand() > p { break; }
       throughput /= p;
     }
   }
   result.diffuse = diff_rad;
   result.specular = spec_rad;
+  result.sharc_pos = sharc_pos;
+  result.sharc_nrm = sharc_nrm;
+  result.sharc_rad = sharc_rad;
+  result.sharc_count = sharc_count;
   return result;
 }
 
@@ -975,13 +1004,20 @@ fn main(@builtin(global_invocation_id) gid: vec3u) {
   let sl = dot(spec_color, vec3f(0.2126, 0.7152, 0.0722));
   if sl > MAX_FIREFLY_LUM { spec_color *= MAX_FIREFLY_LUM / sl; }
 
-  // SHaRC sparse update: 4% of pixels write direct lighting to cache
+  // SHaRC sparse update with backpropagation (ignis-rt style):
+  // Store direct lighting at up to 4 bounce points per path (not just first hit).
+  // Cache fills 4× faster and covers more of the scene.
   if pt.depth < 1e5 {
     let bx = pixel.x / 5u; let by = pixel.y / 5u;
     let bh = ((bx * 73856093u) ^ (by * 19349663u) ^ (uniforms.frame_seed * 83492791u));
     let sx = bx * 5u + (bh % 5u); let sy = by * 5u + ((bh / 5u) % 5u);
     if pixel.x == sx && pixel.y == sy {
+      // First hit
       sharc_store_radiance(pt.hit_pos, pt.normal, pt.direct);
+      // Backpropagate: indirect bounce points
+      for (var si = 0u; si < pt.sharc_count; si++) {
+        sharc_store_radiance(pt.sharc_pos[si], pt.sharc_nrm[si], pt.sharc_rad[si]);
+      }
     }
   }
 
