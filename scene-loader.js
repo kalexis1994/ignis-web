@@ -1,6 +1,9 @@
 // GLTF Scene Loader + BVH Builder for WebGPU Path Tracer
 
 const MAX_LEAF_SIZE = 8;
+const MAT_FLAG_THIN_TRANSMISSION = 1;
+const MAT_FLAG_DOUBLE_SIDED = 2;
+const MAT_FLAG_UNLIT = 4;
 
 // ============================================================
 // Matrix utilities (column-major, GLTF convention)
@@ -86,63 +89,111 @@ function readAccessor(gltf, bin, accIdx) {
   throw new Error(`Unsupported component type: ${acc.componentType}`);
 }
 
+function textureBinding(gltf, texInfo) {
+  if (!texInfo) return { index: -1, texCoord: 0 };
+  const tex = gltf.textures?.[texInfo.index];
+  return {
+    index: tex?.source ?? -1,
+    texCoord: texInfo.texCoord ?? 0,
+  };
+}
+
 // ============================================================
 // Material extraction (PBR metallic-roughness from GLTF)
 // ============================================================
 function extractMaterials(gltf) {
   const defaultMat = {
-    albedo:[0.7,0.7,0.7], type:0, emission:[0,0,0], roughness:1,
-    metallic:0, baseTex:-1, mrTex:-1, normalTex:-1,
+    albedo:[1,1,1], type:0, emission:[0,0,0], roughness:1,
+    metallic:1, baseTex:-1, mrTex:-1, normalTex:-1,
     alphaMode:0, alphaCutoff:0.5, ior:1.5,
+    transmission:0, transmissionTex:-1, thickness:0, flags:0,
+    baseAlpha:1.0, baseTexCoord:0, mrTexCoord:0, normalTexCoord:0,
+    normalScale:1.0, emissiveTex:-1, emissiveTexCoord:0,
+    occlusionTex:-1, occlusionTexCoord:0, occlusionStrength:1.0,
+    thicknessTex:-1, thicknessTexCoord:0, transmissionTexCoord:0,
+    attenuationColor:[1,1,1], attenuationDistance:1e30,
   };
   if (!gltf.materials) return [defaultMat];
 
   return gltf.materials.map(mat => {
     const pbr = mat.pbrMetallicRoughness || {};
-    const name = mat.name || '';
 
     // Base color factor (multiplied with texture in shader)
     const bcf = pbr.baseColorFactor || [1, 1, 1, 1];
     const albedo = [bcf[0], bcf[1], bcf[2]];
+    const baseAlpha = bcf[3] ?? 1.0;
 
-    const metallic = pbr.metallicFactor ?? 1.0;
+    let metallic = pbr.metallicFactor ?? 1.0;
     const roughness = pbr.roughnessFactor ?? 1.0;
 
-    // Texture indices: material → gltf.textures[].source → image index
-    const baseTex = pbr.baseColorTexture != null
-      ? gltf.textures[pbr.baseColorTexture.index].source : -1;
-    const mrTex = pbr.metallicRoughnessTexture != null
-      ? gltf.textures[pbr.metallicRoughnessTexture.index].source : -1;
-    const normalTex = mat.normalTexture != null
-      ? gltf.textures[mat.normalTexture.index].source : -1;
+    const baseBinding = textureBinding(gltf, pbr.baseColorTexture);
+    const mrBinding = textureBinding(gltf, pbr.metallicRoughnessTexture);
+    const normalBinding = textureBinding(gltf, mat.normalTexture);
+    const emissiveBinding = textureBinding(gltf, mat.emissiveTexture);
+    const occlusionBinding = textureBinding(gltf, mat.occlusionTexture);
 
-    let type = 0; // 0=PBR, 2=emissive, 3=glass
+    const baseTex = baseBinding.index;
+    const mrTex = mrBinding.index;
+    const normalTex = normalBinding.index;
+    const emissiveTex = emissiveBinding.index;
+    const occlusionTex = occlusionBinding.index;
+    const baseTexCoord = baseBinding.texCoord;
+    const mrTexCoord = mrBinding.texCoord;
+    const normalTexCoord = normalBinding.texCoord;
+    const emissiveTexCoord = emissiveBinding.texCoord;
+    const occlusionTexCoord = occlusionBinding.texCoord;
+    const normalScale = mat.normalTexture?.scale ?? 1.0;
+    const occlusionStrength = mat.occlusionTexture?.strength ?? 1.0;
+
+    let type = 0; // 0=PBR, 1=unlit, 3=transmission
     let emission = [0, 0, 0];
     let ior = 1.5;
+    let transmission = 0.0;
+    let transmissionTex = -1;
+    let transmissionTexCoord = 0;
+    let thickness = 0.0;
+    let thicknessTex = -1;
+    let thicknessTexCoord = 0;
+    let flags = 0;
+    let attenuationColor = [1, 1, 1];
+    let attenuationDistance = 1e30;
 
     if (mat.emissiveFactor) {
       emission = [mat.emissiveFactor[0], mat.emissiveFactor[1], mat.emissiveFactor[2]];
     }
+    if (mat.doubleSided) flags |= MAT_FLAG_DOUBLE_SIDED;
+    if (mat.extensions?.KHR_materials_unlit) {
+      flags |= MAT_FLAG_UNLIT;
+      type = 1;
+    }
 
-    if (mat.extensions?.KHR_materials_transmission) {
-      type = 3;
-      ior = mat.extensions?.KHR_materials_ior?.ior || 1.5;
-      metallic = 0.0;
-      if (albedo[0] < 0.05 && albedo[1] < 0.05 && albedo[2] < 0.05) {
-        albedo[0] = 0.97; albedo[1] = 0.97; albedo[2] = 0.98;
+    const transmissionExt = mat.extensions?.KHR_materials_transmission;
+    const volumeExt = mat.extensions?.KHR_materials_volume;
+    if (transmissionExt) {
+      transmission = transmissionExt.transmissionFactor ?? 0.0;
+      const txBinding = textureBinding(gltf, transmissionExt.transmissionTexture);
+      transmissionTex = txBinding.index;
+      transmissionTexCoord = txBinding.texCoord;
+      thickness = volumeExt?.thicknessFactor ?? 0.0;
+      const thBinding = textureBinding(gltf, volumeExt?.thicknessTexture);
+      thicknessTex = thBinding.index;
+      thicknessTexCoord = thBinding.texCoord;
+      attenuationColor = volumeExt?.attenuationColor || attenuationColor;
+      attenuationDistance = Number.isFinite(volumeExt?.attenuationDistance)
+        ? volumeExt.attenuationDistance : attenuationDistance;
+
+      if (transmission > 0.001 || transmissionTex >= 0) {
+        type = 3;
+        ior = mat.extensions?.KHR_materials_ior?.ior || 1.5;
+        // glTF volume becomes active only when thicknessFactor > 0.
+        if (thickness <= 0.0) flags |= MAT_FLAG_THIN_TRANSMISSION;
       }
-    } else if (emission[0] > 0.01 || emission[1] > 0.01 || emission[2] > 0.01) {
-      type = 2;
     }
 
     let alphaMode = 0; // OPAQUE
     if (mat.alphaMode === 'MASK') alphaMode = 1;
     else if (mat.alphaMode === 'BLEND') alphaMode = 2;
     let alphaCutoff = mat.alphaCutoff ?? 0.5;
-    // MASK with cutoff 0 or near-zero: treat as BLEND (stochastic)
-    // Authors often set cutoff=0 for decals/foliage that should be alpha-blended
-    // A true MASK material would have cutoff ~0.5
-    if (alphaMode === 1 && alphaCutoff < 0.1) { alphaMode = 2; }
 
     // Emission strength: KHR_materials_emissive_strength or extract from magnitude
     let emissionStrength = mat.extensions?.KHR_materials_emissive_strength?.emissiveStrength || 0;
@@ -156,7 +207,15 @@ function extractMaterials(gltf) {
     if (emLum > 1.0) {
       emission[0] /= emLum; emission[1] /= emLum; emission[2] /= emLum;
     }
-    return { albedo, type, emission, roughness, metallic, baseTex, mrTex, normalTex, alphaMode, alphaCutoff, ior, emissionStrength };
+    return {
+      albedo, type, emission, roughness, metallic, baseTex, mrTex, normalTex,
+      alphaMode, alphaCutoff, ior, emissionStrength,
+      transmission, transmissionTex, thickness, flags,
+      baseAlpha, baseTexCoord, mrTexCoord, normalTexCoord, normalScale,
+      emissiveTex, emissiveTexCoord, occlusionTex, occlusionTexCoord, occlusionStrength,
+      thicknessTex, thicknessTexCoord, transmissionTexCoord,
+      attenuationColor, attenuationDistance,
+    };
   });
 }
 
@@ -426,7 +485,7 @@ export async function loadScene(basePath, onProgress) {
     db = await openDB();
     // Hash based on gltf file size + accessor count (changes if scene changes)
     const gltfSig = `${JSON.stringify(gltf.accessors?.length)}-${gltf.buffers?.[0]?.byteLength}`;
-    cacheKey = 'scene-v3-' + gltfSig;
+    cacheKey = 'scene-v4-' + gltfSig;
     cached = await dbGet(db, cacheKey);
   } catch(e) { /* IndexedDB not available, proceed without cache */ }
 
@@ -473,7 +532,8 @@ export async function loadScene(basePath, onProgress) {
   // Allocate flat arrays
   const allPos = new Float32Array(totalVerts * 3);
   const allNrm = new Float32Array(totalVerts * 3);
-  const allUV  = new Float32Array(totalVerts * 2);
+  const allUV0 = new Float32Array(totalVerts * 2);
+  const allUV1 = new Float32Array(totalVerts * 2);
   const allTriData = new Uint32Array(totalTris * 4);
   let vOff = 0, tOff = 0;
 
@@ -489,7 +549,8 @@ export async function loadScene(basePath, onProgress) {
 
       const positions = readAccessor(gltf, bin, prim.attributes.POSITION);
       const normals = prim.attributes.NORMAL != null ? readAccessor(gltf, bin, prim.attributes.NORMAL) : null;
-      const uvs = prim.attributes.TEXCOORD_0 != null ? readAccessor(gltf, bin, prim.attributes.TEXCOORD_0) : null;
+      const uv0s = prim.attributes.TEXCOORD_0 != null ? readAccessor(gltf, bin, prim.attributes.TEXCOORD_0) : null;
+      const uv1s = prim.attributes.TEXCOORD_1 != null ? readAccessor(gltf, bin, prim.attributes.TEXCOORD_1) : null;
       const indices = readAccessor(gltf, bin, prim.indices);
       const matIdx = prim.material ?? 0;
       const vertCount = gltf.accessors[prim.attributes.POSITION].count;
@@ -514,9 +575,13 @@ export async function loadScene(basePath, onProgress) {
           allNrm[(vOff+v)*3+1] = 1;
         }
         // UV coordinates
-        if (uvs) {
-          allUV[(vOff+v)*2]   = uvs[v*2];
-          allUV[(vOff+v)*2+1] = uvs[v*2+1];
+        if (uv0s) {
+          allUV0[(vOff+v)*2]   = uv0s[v*2];
+          allUV0[(vOff+v)*2+1] = uv0s[v*2+1];
+        }
+        if (uv1s) {
+          allUV1[(vOff+v)*2]   = uv1s[v*2];
+          allUV1[(vOff+v)*2+1] = uv1s[v*2+1];
         }
       }
 
@@ -555,25 +620,28 @@ export async function loadScene(basePath, onProgress) {
     gpuTriFlat[base+11] = 0;
   }
 
-  // Pack vertex data: position.xyz + UV.x, normal.xyz + UV.y
+  // Pack vertex data: position.xyz + UV0.x, normal.xyz + UV0.y, UV1 in separate buffer
   const gpuPositions = new Float32Array(totalVerts * 4);
   const gpuNormals = new Float32Array(totalVerts * 4);
+  const gpuUV1 = new Float32Array(totalVerts * 2);
   for (let v = 0; v < totalVerts; v++) {
     gpuPositions[v*4]   = allPos[v*3];
     gpuPositions[v*4+1] = allPos[v*3+1];
     gpuPositions[v*4+2] = allPos[v*3+2];
-    gpuPositions[v*4+3] = allUV[v*2];     // UV.x packed in position.w
+    gpuPositions[v*4+3] = allUV0[v*2];    // UV0.x packed in position.w
     gpuNormals[v*4]   = allNrm[v*3];
     gpuNormals[v*4+1] = allNrm[v*3+1];
     gpuNormals[v*4+2] = allNrm[v*3+2];
-    gpuNormals[v*4+3] = allUV[v*2+1];    // UV.y packed in normal.w
+    gpuNormals[v*4+3] = allUV0[v*2+1];   // UV0.y packed in normal.w
+    gpuUV1[v*2] = allUV1[v*2];
+    gpuUV1[v*2+1] = allUV1[v*2+1];
   }
 
-  // Materials -> GPU format (64 bytes / 16 floats per material)
+  // Materials -> GPU format (160 bytes / 40 floats per material)
   const materials = extractMaterials(gltf);
-  const gpuMaterials = new Float32Array(materials.length * 16);
+  const gpuMaterials = new Float32Array(materials.length * 40);
   for (let i = 0; i < materials.length; i++) {
-    const m = materials[i], o = i * 16;
+    const m = materials[i], o = i * 40;
     gpuMaterials[o]    = m.albedo[0];
     gpuMaterials[o+1]  = m.albedo[1];
     gpuMaterials[o+2]  = m.albedo[2];
@@ -590,18 +658,43 @@ export async function loadScene(basePath, onProgress) {
     gpuMaterials[o+13] = m.alphaCutoff;
     gpuMaterials[o+14] = m.ior;
     gpuMaterials[o+15] = m.emissionStrength || 1.0;
+    gpuMaterials[o+16] = m.transmission || 0.0;
+    gpuMaterials[o+17] = m.transmissionTex ?? -1;
+    gpuMaterials[o+18] = m.thickness || 0.0;
+    gpuMaterials[o+19] = m.flags || 0;
+    gpuMaterials[o+20] = m.baseAlpha ?? 1.0;
+    gpuMaterials[o+21] = m.baseTexCoord ?? 0;
+    gpuMaterials[o+22] = m.mrTexCoord ?? 0;
+    gpuMaterials[o+23] = m.normalTexCoord ?? 0;
+    gpuMaterials[o+24] = m.normalScale ?? 1.0;
+    gpuMaterials[o+25] = m.emissiveTex ?? -1;
+    gpuMaterials[o+26] = m.occlusionTex ?? -1;
+    gpuMaterials[o+27] = m.thicknessTex ?? -1;
+    gpuMaterials[o+28] = m.transmissionTexCoord ?? 0;
+    gpuMaterials[o+29] = m.emissiveTexCoord ?? 0;
+    gpuMaterials[o+30] = m.occlusionTexCoord ?? 0;
+    gpuMaterials[o+31] = m.thicknessTexCoord ?? 0;
+    gpuMaterials[o+32] = m.occlusionStrength ?? 1.0;
+    gpuMaterials[o+33] = m.attenuationDistance ?? 1e30;
+    gpuMaterials[o+34] = m.attenuationColor?.[0] ?? 1.0;
+    gpuMaterials[o+35] = m.attenuationColor?.[1] ?? 1.0;
+    gpuMaterials[o+36] = m.attenuationColor?.[2] ?? 1.0;
+    gpuMaterials[o+37] = 0.0;
+    gpuMaterials[o+38] = 0.0;
+    gpuMaterials[o+39] = 0.0;
   }
 
   // Collect emissive triangle indices for NEE
-  // Build emissive triangle buffer (ignis-rt format):
-  // 4 vec4 per tri: [v0.xyz,area] [v1.xyz,CDF] [v2.xyz,totalPower] [emission.rgb,0]
+  // Build emissive triangle buffer:
+  // 1 vec4 per tri: [tri_idx(bitcast u32), area, CDF, 0]
   // Sorted by power, CDF for importance sampling, max 256 triangles
   const MAX_EMISSIVE = 256;
   const emissiveCandidates = [];
   for (let i = 0; i < totalTris; i++) {
     const matIdx = bvh.sortedTriData[i * 4 + 3];
-    if (matIdx >= materials.length || materials[matIdx].type !== 2) continue;
+    if (matIdx >= materials.length) continue;
     const m = materials[matIdx];
+    if ((m.emission[0] <= 0.0 && m.emission[1] <= 0.0 && m.emission[2] <= 0.0) || (m.emissionStrength || 0) <= 0.0) continue;
     const vi0 = bvh.sortedTriData[i * 4], vi1 = bvh.sortedTriData[i * 4 + 1], vi2 = bvh.sortedTriData[i * 4 + 2];
     const v0 = [allPos[vi0*3], allPos[vi0*3+1], allPos[vi0*3+2]];
     const v1 = [allPos[vi1*3], allPos[vi1*3+1], allPos[vi1*3+2]];
@@ -617,23 +710,24 @@ export async function loadScene(basePath, onProgress) {
     const lum = 0.2126*em[0]*str + 0.7152*em[1]*str + 0.0722*em[2]*str;
     const power = area * lum;
     if (power < 1e-6) continue;
-    emissiveCandidates.push({ power, v0, v1, v2, area, em, matIdx });
+    emissiveCandidates.push({ power, triIdx: i, area });
   }
   // Sort by power descending, keep top MAX_EMISSIVE
   emissiveCandidates.sort((a, b) => b.power - a.power);
   const emissiveCount = Math.min(emissiveCandidates.length, MAX_EMISSIVE);
   const totalPower = emissiveCandidates.slice(0, emissiveCount).reduce((s, t) => s + t.power, 0);
 
-  // Build GPU buffer: 16 floats per triangle
-  const gpuEmissiveTris = new Float32Array(Math.max(emissiveCount * 16, 16));
+  // Build GPU buffer: 4 floats per triangle
+  const gpuEmissiveTris = new Float32Array(Math.max(emissiveCount * 4, 4));
+  const gpuEmissiveTrisU32 = new Uint32Array(gpuEmissiveTris.buffer);
   let cumulative = 0;
   for (let i = 0; i < emissiveCount; i++) {
-    const t = emissiveCandidates[i], o = i * 16;
+    const t = emissiveCandidates[i], o = i * 4;
     cumulative += t.power / totalPower;
-    gpuEmissiveTris[o+0] = t.v0[0]; gpuEmissiveTris[o+1] = t.v0[1]; gpuEmissiveTris[o+2] = t.v0[2]; gpuEmissiveTris[o+3] = t.area;
-    gpuEmissiveTris[o+4] = t.v1[0]; gpuEmissiveTris[o+5] = t.v1[1]; gpuEmissiveTris[o+6] = t.v1[2]; gpuEmissiveTris[o+7] = cumulative;
-    gpuEmissiveTris[o+8] = t.v2[0]; gpuEmissiveTris[o+9] = t.v2[1]; gpuEmissiveTris[o+10]= t.v2[2]; gpuEmissiveTris[o+11]= totalPower;
-    gpuEmissiveTris[o+12]= t.em[0]; gpuEmissiveTris[o+13]= t.em[1]; gpuEmissiveTris[o+14]= t.em[2]; gpuEmissiveTris[o+15]= t.matIdx;
+    gpuEmissiveTrisU32[o+0] = t.triIdx;
+    gpuEmissiveTris[o+1] = t.area;
+    gpuEmissiveTris[o+2] = cumulative;
+    gpuEmissiveTris[o+3] = 0.0;
   }
 
   // Scene bounding box for camera
@@ -699,10 +793,12 @@ export async function loadScene(basePath, onProgress) {
   const result = {
     gpuPositions,
     gpuNormals,
+    gpuUV1,
     gpuTriData: bvh.sortedTriData,
     gpuTriFlat,
     gpuBVHNodes: bvh.nodesF32,
     gpuMaterials,
+    materialStride: 40,
     gpuEmissiveTris,
     rasterIndices,
     vertMatIds,

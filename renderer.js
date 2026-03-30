@@ -35,11 +35,20 @@ async function init() {
   const adapter = await navigator.gpu.requestAdapter({ powerPreference: 'high-performance' });
   if (!adapter) { showError('Failed to get GPU adapter.'); return; }
 
+  const requiredStorageBuffersPerStage = 11;
+  if (adapter.limits.maxStorageBuffersPerShaderStage < requiredStorageBuffersPerStage) {
+    showError(
+      `This GPU/browser exposes maxStorageBuffersPerShaderStage=${adapter.limits.maxStorageBuffersPerShaderStage}, `
+      + `but the current glTF renderer needs at least ${requiredStorageBuffersPerStage}.`
+    );
+    return;
+  }
+
   const device = await adapter.requestDevice({
     requiredLimits: {
       maxStorageBufferBindingSize: adapter.limits.maxStorageBufferBindingSize,
       maxBufferSize: adapter.limits.maxBufferSize,
-      maxStorageBuffersPerShaderStage: Math.min(10, adapter.limits.maxStorageBuffersPerShaderStage),
+      maxStorageBuffersPerShaderStage: requiredStorageBuffersPerStage,
     }
   });
   device.onuncapturederror = (e) => rlog('GPU_ERROR: ' + e.error.message);
@@ -201,6 +210,7 @@ async function init() {
   const gbufUniformBuf = device.createBuffer({ size: 80, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST }); // mat4x4 + vec3 + pad = 80
   const posVB = createGPUBuffer(device, scene.gpuPositions, GPUBufferUsage.VERTEX);
   const nrmVB = createGPUBuffer(device, scene.gpuNormals, GPUBufferUsage.VERTEX);
+  const uv1VB = createGPUBuffer(device, scene.gpuUV1, GPUBufferUsage.VERTEX);
   const matIdVB = createGPUBuffer(device, scene.vertMatIds, GPUBufferUsage.VERTEX);
   const indexBuf = createGPUBuffer(device, scene.rasterIndices, GPUBufferUsage.INDEX);
   const triCount = stats.triangles;
@@ -221,6 +231,7 @@ async function init() {
         { arrayStride: 16, attributes: [{ shaderLocation: 0, offset: 0, format: 'float32x4' }] }, // pos.xyz + uv.x
         { arrayStride: 16, attributes: [{ shaderLocation: 1, offset: 0, format: 'float32x4' }] }, // normal.xyz + uv.y
         { arrayStride: 4,  attributes: [{ shaderLocation: 2, offset: 0, format: 'float32' }] },    // matId
+        { arrayStride: 8,  attributes: [{ shaderLocation: 3, offset: 0, format: 'float32x2' }] },   // UV1.xy
       ],
     },
     fragment: {
@@ -249,7 +260,12 @@ async function init() {
   const specHistoryB = device.createTexture({ size:[width,height], format:'rgba16float', usage:F16C });
   const ptOutputTex = device.createTexture({
     size:[width,height], format:'rgba8unorm',
-    usage: GPUTextureUsage.STORAGE_BINDING | GPUTextureUsage.TEXTURE_BINDING,
+    usage: GPUTextureUsage.STORAGE_BINDING | GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_SRC,
+  });
+  // Legacy composite input kept bound for layout stability.
+  const prevFrameTex = device.createTexture({
+    size:[width,height], format:'rgba8unorm',
+    usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST,
   });
 
   // --- FSR textures (display resolution) ---
@@ -339,6 +355,7 @@ async function init() {
   const bvhBuf = createGPUBuffer(device, scene.gpuBVHNodes, GPUBufferUsage.STORAGE);
   const matBuf = createGPUBuffer(device, scene.gpuMaterials, GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST);
   const emsBuf = createGPUBuffer(device, scene.gpuEmissiveTris, GPUBufferUsage.STORAGE);
+  const uv1Buf = createGPUBuffer(device, scene.gpuUV1, GPUBufferUsage.STORAGE);
 
   // --- Bind group 0: uniforms + accumulation + output ---
   const bg0Layout = device.createBindGroupLayout({
@@ -374,6 +391,7 @@ async function init() {
       { binding: 3, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } },
       { binding: 4, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } },
       { binding: 5, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } },
+      { binding: 6, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } },
     ],
   });
   const bg1 = device.createBindGroup({
@@ -385,11 +403,12 @@ async function init() {
       { binding: 3, resource: { buffer: bvhBuf } },
       { binding: 4, resource: { buffer: matBuf } },
       { binding: 5, resource: { buffer: emsBuf } },
+      { binding: 6, resource: { buffer: uv1Buf } },
     ],
   });
 
   // --- ReSTIR GI buffers (created before SHaRC so bg2 can reference them) ---
-  const restirEnabled = device.limits.maxStorageBuffersPerShaderStage >= 10;
+  const restirEnabled = device.limits.maxStorageBuffersPerShaderStage >= requiredStorageBuffersPerStage;
   const restirPixels = width * height;
   const restirBufSize = restirEnabled ? restirPixels * 3 * 16 : 48;
   const restirBufA = device.createBuffer({ size: restirBufSize, usage: GPUBufferUsage.STORAGE });
@@ -571,11 +590,11 @@ async function init() {
   const denoisePasses = gpuProfile.denoisePasses || 5;
   const dnSteps = [1, 2, 4, 8, 16]; // up to 5 passes
   const dnParamBufs = dnSteps.map((s, i) => {
-    const buf = device.createBuffer({ size: 32, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
+    const buf = device.createBuffer({ size: 96, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
     device.queue.writeBuffer(buf, 0, new Float32Array([width, height, s, 0, 0, 1.0, 1.0, 0]));
     return buf;
   });
-  const dnCompParamBuf = device.createBuffer({ size: 32, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
+  const dnCompParamBuf = device.createBuffer({ size: 96, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST }); // 8+16 camera floats
 
   // À-trous layout: dual-signal (diffuse + specular) + normals + albedo(roughness)
   const dnAtrousLayout = device.createBindGroupLayout({
@@ -609,14 +628,19 @@ async function init() {
     { binding: 6, resource: albedoTex.createView() },
   ]});
 
-  // Composite layout: reads denoised diffuse + specular + albedo → LDR
+  // Composite layout: denoised signals + legacy extra inputs kept for layout stability
   const dnCompLayout = device.createBindGroupLayout({
     entries: [
       { binding: 0, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'uniform' } },
       { binding: 1, visibility: GPUShaderStage.COMPUTE, texture: { sampleType: 'float' } },          // denoised diffuse
       { binding: 4, visibility: GPUShaderStage.COMPUTE, texture: { sampleType: 'float' } },          // denoised specular
       { binding: 6, visibility: GPUShaderStage.COMPUTE, texture: { sampleType: 'float' } },          // albedo
-      { binding: 7, visibility: GPUShaderStage.COMPUTE, storageTexture: { access: 'write-only', format: 'rgba8unorm' } }, // LDR out
+      { binding: 7, visibility: GPUShaderStage.COMPUTE, storageTexture: { access: 'write-only', format: 'rgba8unorm' } },
+      { binding: 8, visibility: GPUShaderStage.COMPUTE, texture: { sampleType: 'float' } },          // matId (glass detect)
+      { binding: 9, visibility: GPUShaderStage.COMPUTE, texture: { sampleType: 'float' } },          // G-buffer normals
+      { binding: 10, visibility: GPUShaderStage.COMPUTE, texture: { sampleType: 'float' } },         // prev frame (reflection)
+      { binding: 11, visibility: GPUShaderStage.COMPUTE, sampler: { type: 'filtering' } },
+      { binding: 12, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } }, // materials
     ],
   });
   const dnCompPipeline = device.createComputePipeline({
@@ -657,21 +681,31 @@ async function init() {
     { binding: 6, resource: albedoTex.createView() },
   ]});
   const dnFinalInPing = (denoisePasses % 2 === 1); // 3 passes → ping, 4 → pong, 5 → ping
-  // Composite: reads final denoised diffuse + specular + albedo
+  // Composite: denoised signals + glass composition
+  const compSampler = device.createSampler({ magFilter: 'linear', minFilter: 'linear' });
   const dnBG_comp = device.createBindGroup({ layout: dnCompLayout, entries: [
     { binding: 0, resource: { buffer: dnCompParamBuf } },
     { binding: 1, resource: (dnFinalInPing ? pingTex : pongTex).createView() },
     { binding: 4, resource: (dnFinalInPing ? specPingTex : specPongTex).createView() },
     { binding: 6, resource: albedoTex.createView() },
     { binding: 7, resource: ptOutputTex.createView() },
+    { binding: 8, resource: matIdTex.createView() },
+    { binding: 9, resource: ndTex.createView() },
+    { binding: 10, resource: prevFrameTex.createView() },
+    { binding: 11, resource: compSampler },
+    { binding: 12, resource: { buffer: matBuf } },
   ]});
-  // Raw mode: composite reads noisy directly (no denoise)
   const dnBG_comp_noisy = device.createBindGroup({ layout: dnCompLayout, entries: [
     { binding: 0, resource: { buffer: dnCompParamBuf } },
     { binding: 1, resource: noisyTex.createView() },
     { binding: 4, resource: specNoisyTex.createView() },
     { binding: 6, resource: albedoTex.createView() },
     { binding: 7, resource: ptOutputTex.createView() },
+    { binding: 8, resource: matIdTex.createView() },
+    { binding: 9, resource: ndTex.createView() },
+    { binding: 10, resource: prevFrameTex.createView() },
+    { binding: 11, resource: compSampler },
+    { binding: 12, resource: { buffer: matBuf } },
   ]});
 
   // --- Display pipeline (reads FSR final output) ---
@@ -859,17 +893,19 @@ async function init() {
 
   // Upload material changes to GPU (both buffers)
   function uploadMaterial(matIdx) {
-    const byteOffset = matIdx * 16 * 4; // 16 floats × 4 bytes
-    const slice = new Float32Array(scene.gpuMaterials.buffer, byteOffset, 16);
+    const stride = scene.materialStride || 40;
+    const byteOffset = matIdx * stride * 4;
+    const slice = new Float32Array(scene.gpuMaterials.buffer, byteOffset, stride);
     device.queue.writeBuffer(matBuf, byteOffset, slice);
     device.queue.writeBuffer(matBufForGbuf, byteOffset, slice);
   }
 
   function showPickInfo(pick) {
     if (!pick) { debugContent.textContent = 'No hit (sky)'; return; }
-    const m = scene.gpuMaterials, o = pick.matIdx * 16;
+    const stride = scene.materialStride || 40;
+    const m = scene.gpuMaterials, o = pick.matIdx * stride;
     const names = scene.materialNames || [];
-    const types = ['PBR','Metal','Emissive','Glass'];
+    const types = ['PBR','Unlit','Reserved','Transmission'];
     const alphaModes = ['Opaque','Mask','Blend'];
     const name = names[pick.matIdx] || 'unknown';
     const mi = pick.matIdx;
@@ -878,7 +914,7 @@ async function init() {
     pickTitle.textContent = `#${mi} "${name}"`;
 
     const albHex = '#' + [m[o],m[o+1],m[o+2]].map(v => Math.round(Math.min(v,1)*255).toString(16).padStart(2,'0')).join('');
-    const isEmissive = Math.round(m[o+3]) === 2;
+    const isEmissive = (m[o+4] + m[o+5] + m[o+6]) > 0.001 || m[o+25] >= 0;
 
     // Helper: create editable slider row
     function sliderRow(label, value, min, max, step, onChange) {
@@ -1380,6 +1416,7 @@ async function init() {
       rp.setVertexBuffer(0, posVB);
       rp.setVertexBuffer(1, nrmVB);
       rp.setVertexBuffer(2, matIdVB);
+      rp.setVertexBuffer(3, uv1VB);
       rp.setIndexBuffer(indexBuf, 'uint32');
       rp.drawIndexed(triCount * 3);
       rp.end();
@@ -1499,13 +1536,18 @@ async function init() {
       }
 
       // Composite (tonemap → LDR)
-      // Write composite params: resolution + color controls
-      const cp = new ArrayBuffer(32);
+      // Write composite params: resolution + color controls.
+      const cp = new ArrayBuffer(96);
       const cpf = new Float32Array(cp);
       const cpu = new Uint32Array(cp);
       cpf[0] = width; cpf[1] = height; cpf[2] = 0; cpf[3] = 0;
       cpu[4] = settings.tonemapMode; cpf[5] = settings.exposure;
       cpf[6] = settings.saturation; cpf[7] = settings.contrast;
+      // Legacy camera fields remain populated to preserve uniform layout.
+      cpf[8] = camera.pos[0]; cpf[9] = camera.pos[1]; cpf[10] = camera.pos[2]; cpf[11] = 0;
+      cpf[12] = forward[0]; cpf[13] = forward[1]; cpf[14] = forward[2]; cpf[15] = fovFactor;
+      cpf[16] = right[0]; cpf[17] = right[1]; cpf[18] = right[2]; cpf[19] = aspect;
+      cpf[20] = up[0]; cpf[21] = up[1]; cpf[22] = up[2]; cpf[23] = 0;
       device.queue.writeBuffer(dnCompParamBuf, 0, cp);
 
       const compPass = encoder.beginComputePass();

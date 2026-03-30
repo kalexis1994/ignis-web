@@ -14,11 +14,19 @@ struct Params {
   resolution: vec2f,
   step_size: f32,
   frames_still: f32,
-  // Color controls (used by composite only)
-  tonemap_mode: u32,  // 0=AgX, 1=ACES, 2=Reinhard, 3=Uncharted2, 4=PBR Neutral, 5=Standard, 6=None
-  exposure: f32,       // pre-tonemap multiplier (default 1.0)
-  saturation: f32,     // post-tonemap (0=gray, 1=normal, 2=vivid)
-  contrast: f32,       // post-gamma Hermite smoothstep (0=off, 1=max)
+  tonemap_mode: u32,
+  exposure: f32,
+  saturation: f32,
+  contrast: f32,
+  // Legacy camera data kept to preserve the composite uniform layout.
+  cam_pos: vec3f,
+  _pad_cam0: f32,
+  cam_forward: vec3f,
+  fov_factor: f32,
+  cam_right: vec3f,
+  aspect: f32,
+  cam_up: vec3f,
+  _pad_cam1: f32,
 };
 
 @group(0) @binding(0) var<uniform> params: Params;
@@ -28,6 +36,20 @@ struct Params {
 @group(0) @binding(4) var in_spec: texture_2d<f32>;        // specular input
 @group(0) @binding(5) var out_spec: texture_storage_2d<rgba16float, write>; // specular output
 @group(0) @binding(6) var albedo_tex: texture_2d<f32>;     // albedo.rgb + roughness.a
+
+// Material struct (same layout as pathtracer.wgsl)
+struct Material {
+  d0: vec4f,
+  d1: vec4f,
+  d2: vec4f,
+  d3: vec4f,
+  d4: vec4f,
+  d5: vec4f,
+  d6: vec4f,
+  d7: vec4f,
+  d8: vec4f,
+  d9: vec4f,
+};
 
 fn luma(c: vec3f) -> f32 { return dot(c, vec3f(0.2126, 0.7152, 0.0722)); }
 
@@ -249,6 +271,12 @@ fn preblur(@builtin(global_invocation_id) gid: vec3u) {
 // Pipeline: HDR → Exposure → Tonemap → Saturation → Gamma → Contrast → Dither
 // ============================================================
 @group(0) @binding(7) var composite_out: texture_storage_2d<rgba8unorm, write>;
+// Legacy extra bindings kept for layout stability after moving glass into the path tracer.
+@group(0) @binding(8) var gbuf_mat_uv: texture_2d<f32>;
+@group(0) @binding(9) var gbuf_nd_comp: texture_2d<f32>;
+@group(0) @binding(10) var prev_frame: texture_2d<f32>;
+@group(0) @binding(11) var prev_sampler: sampler;
+@group(0) @binding(12) var<storage, read> material_buf_comp: array<Material>;
 
 // --- Tonemap 0: AgX Punchy (Blender 4 / Troy Sobotka) ---
 fn tonemap_agx(color_in: vec3f) -> vec3f {
