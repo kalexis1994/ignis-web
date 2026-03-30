@@ -120,7 +120,7 @@ async function init() {
   const displayCap = cfg.displayCap || gpuProfile.displayCap || 1080;
   const texSize = cfg.texSize ?? gpuProfile.texSize ?? 512;
   const denoiseMode = cfg.denoise || gpuProfile.denoise || 'full';
-  const maxBounces = cfg.bounces || gpuProfile.maxBounces || 2;
+  const maxBounces = cfg.bounces || gpuProfile.maxBounces || 3;
   const sppPerFrame = cfg.spp || gpuProfile.spp || 1;
   const sharcEnabled = cfg.sharc !== undefined ? cfg.sharc : (gpuProfile.sharc !== false);
   rlog(`Config: fsr=${fsrMode} display=${displayCap}p tex=${texSize} denoise=${denoiseMode} bounces=${maxBounces} spp=${sppPerFrame} sharc=${sharcEnabled}`);

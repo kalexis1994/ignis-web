@@ -776,7 +776,7 @@ fn path_trace(primary_origin: vec3f, primary_dir: vec3f) -> PathResult {
       let direct = sample_sun_nee(hit_pos, normal, V, base_color, roughness, metallic);
       if is_diffuse_path { diff_rad += throughput * direct; }
       else { spec_rad += throughput * direct; }
-      // SHaRC backpropagation: record bounce point for cache update (up to 4)
+      // SHaRC backpropagation: store direct lighting only (sky needs occlusion check)
       if sharc_count < 4u {
         sharc_pos[sharc_count] = hit_pos;
         sharc_nrm[sharc_count] = normal;
@@ -800,14 +800,8 @@ fn path_trace(primary_origin: vec3f, primary_dir: vec3f) -> PathResult {
       let ind = throughput * indirect_direct;
       if is_diffuse_path { diff_rad += ind; } else { spec_rad += ind; }
 
-      if bounce >= uniforms.max_bounces - 1u {
-        let sky_up = sky_color(normal);
-        let sky_side = sky_color(vec3f(normal.x, 0.0, normal.z));
-        let sky_irr = mix(sky_side, sky_up, max(normal.y, 0.0)) * INV_PI;
-        let s = throughput * sky_irr * base_color * (1.0 - metallic);
-        if is_diffuse_path { diff_rad += s; } else { spec_rad += s; }
-        break;
-      }
+      // Last bounce: energy terminates. No fake sky — SHaRC + extra bounces provide real GI.
+      if bounce >= uniforms.max_bounces - 1u { break; }
     }
 
     // BRDF sampling — at bounce 0, classify path and demodulate diffuse throughput
@@ -1012,9 +1006,7 @@ fn main(@builtin(global_invocation_id) gid: vec3u) {
     let bh = ((bx * 73856093u) ^ (by * 19349663u) ^ (uniforms.frame_seed * 83492791u));
     let sx = bx * 5u + (bh % 5u); let sy = by * 5u + ((bh / 5u) % 5u);
     if pixel.x == sx && pixel.y == sy {
-      // First hit
       sharc_store_radiance(pt.hit_pos, pt.normal, pt.direct);
-      // Backpropagate: indirect bounce points
       for (var si = 0u; si < pt.sharc_count; si++) {
         sharc_store_radiance(pt.sharc_pos[si], pt.sharc_nrm[si], pt.sharc_rad[si]);
       }
