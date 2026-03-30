@@ -55,8 +55,7 @@ fn atrous(@builtin(global_invocation_id) gid: vec3u) {
   let roughness = textureLoad(albedo_tex, px, 0).a;
 
   // Hit distance modulates blur: contact shadows stay sharp, far GI gets smoothed
-  // 0.3 = tight blur for contact, 1.0 = full blur for far bounces
-  let hit_factor = mix(0.3, 1.0, hit_dist);
+  let hit_factor = mix(0.5, 1.0, hit_dist);
 
   // Depth gradient
   let zr = textureLoad(gbuf_nd, min(px + vec2i(1,0), sz-1), 0).w;
@@ -82,16 +81,13 @@ fn atrous(@builtin(global_invocation_id) gid: vec3u) {
   let d_std = sqrt(max(d_m2 - d_m1 * d_m1, 0.0));
   let s_std = sqrt(max(s_m2 - s_m1 * s_m1, 0.0));
 
-  // Sigma scales: NRD-style complementary temporal/spatial (Zhdan, ReBLUR 2021).
-  // σ_l = 4.0 in original SVGF (Schied 2017, eq.5). We modulate by history:
-  // New pixels (motion≈0): σ=4.0 (aggressive spatial, compensates no temporal)
-  // Converged (motion≈1): σ=1.5 (light spatial, temporal already cleaned)
-  let diff_sigma_scale = mix(4.0, 1.5, motion);
+  // σ_l = 4.0 per SVGF (Schied 2017, eq.5). Kept constant — variance adapts the blur.
+  // With 1SPP, temporal alone doesn't fully converge, so spatial must stay strong.
+  let diff_sigma_scale = 4.0;
   // Specular: roughness modulates filter width (ReLAX, NRD).
   // Glossy (roughness~0): σ×0.3 → preserve sharp reflections
   // Rough (roughness~1): σ×1.0 → wider blur, approaches diffuse
-  let spec_base_scale = mix(3.5, 1.0, motion);
-  let spec_sigma_scale = mix(spec_base_scale * 0.3, spec_base_scale, roughness);
+  let spec_sigma_scale = mix(4.0 * 0.3, 4.0, roughness);
 
   // === FILTER (both signals in one pass) ===
   var d_sum = vec3f(0.0); var d_wsum = 0.0;
@@ -135,8 +131,6 @@ fn atrous(@builtin(global_invocation_id) gid: vec3u) {
 }
 
 // === PRE-BLUR: anti-firefly percentile clamp + lightweight 3x3 bilateral ===
-// 1. Neighborhood luminance statistics → clamp outliers beyond 4σ
-// 2. Bilateral filter with clamped center pixel
 // Stabilizes temporal AABB and eliminates bright speckles adaptively.
 @compute @workgroup_size(8, 8)
 fn preblur(@builtin(global_invocation_id) gid: vec3u) {
@@ -150,10 +144,7 @@ fn preblur(@builtin(global_invocation_id) gid: vec3u) {
   let cc_raw = textureLoad(in_color, px, 0).rgb;
   let cs_raw = textureLoad(in_spec, px, 0).rgb;
 
-  // === Pass 1: neighborhood luminance stats for anti-firefly ===
-  // Percentile-inspired outlier rejection (HPG 2025, Lalber).
-  // Monte Carlo noise has heavy tails → 3σ is standard for MC outlier rejection.
-  // ε floor (0.1) prevents clamping in very dark regions where mean≈0.
+  // === Anti-firefly: 3σ percentile clamp (HPG 2025, Lalber) ===
   var d_m1 = 0.0; var d_m2 = 0.0;
   var s_m1 = 0.0; var s_m2 = 0.0;
   for (var fy = -1; fy <= 1; fy++) {
@@ -167,13 +158,12 @@ fn preblur(@builtin(global_invocation_id) gid: vec3u) {
   }
   let d_mean = d_m1 / 9.0;
   let d_std = sqrt(max(d_m2 / 9.0 - d_mean * d_mean, 0.0));
-  let d_max_lum = d_mean + 3.0 * d_std + 0.1; // 3σ for heavy-tail MC distributions
+  let d_max_lum = d_mean + 3.0 * d_std + 0.1;
 
   let s_mean = s_m1 / 9.0;
   let s_std = sqrt(max(s_m2 / 9.0 - s_mean * s_mean, 0.0));
   let s_max_lum = s_mean + 3.0 * s_std + 0.1;
 
-  // Clamp outliers (fireflies)
   let cl_raw = luma(cc_raw);
   var cc = cc_raw;
   if cl_raw > d_max_lum && cl_raw > 0.01 { cc = cc_raw * (d_max_lum / cl_raw); }
@@ -184,7 +174,7 @@ fn preblur(@builtin(global_invocation_id) gid: vec3u) {
   let cl = luma(cc);
   let csl = luma(cs);
 
-  // === Pass 2: bilateral filter with clamped center ===
+  // === 3x3 bilateral filter ===
   var d_sum = cc;  var d_wsum = 1.0;
   var s_sum = cs;  var s_wsum = 1.0;
 
@@ -196,7 +186,6 @@ fn preblur(@builtin(global_invocation_id) gid: vec3u) {
       let sd = textureLoad(in_color, sp, 0).rgb;
       let ss = textureLoad(in_spec, sp, 0).rgb;
 
-      // Also clamp neighbor fireflies before accumulating
       let sd_l = luma(sd);
       var sd_c = sd;
       if sd_l > d_max_lum && sd_l > 0.01 { sd_c = sd * (d_max_lum / sd_l); }
@@ -204,25 +193,19 @@ fn preblur(@builtin(global_invocation_id) gid: vec3u) {
       var ss_c = ss;
       if ss_l > s_max_lum && ss_l > 0.01 { ss_c = ss * (s_max_lum / ss_l); }
 
-      // Normal edge-stopping: σ_n=32 (gentler than à-trous σ_n=128, per Q2RTX preblur)
       let wn = pow(max(dot(cn, snd.xyz), 0.0), 32.0);
-
-      // Depth edge-stopping: 5% relative threshold (matched to typical scene depth range)
       let wz = exp(-abs(cz - snd.w) / max(cz * 0.05, 1e-2));
 
-      // Diffuse luminance edge-stopping (uses clamped center)
       let d_wl = exp(-abs(cl - luma(sd_c)) / max(cl * 0.5 + 0.1, 0.01));
       d_sum += sd_c * (wn * wz * d_wl);
       d_wsum += wn * wz * d_wl;
 
-      // Specular luminance edge-stopping
       let s_wl = exp(-abs(csl - luma(ss_c)) / max(csl * 0.5 + 0.1, 0.01));
       s_sum += ss_c * (wn * wz * s_wl);
       s_wsum += wn * wz * s_wl;
     }
   }
 
-  // Preserve hit distance from specular alpha (center pixel pass-through)
   let center_hit_dist = textureLoad(in_spec, px, 0).a;
   textureStore(out_color, px, vec4f(d_sum / d_wsum, 1.0));
   textureStore(out_spec, px, vec4f(s_sum / s_wsum, center_hit_dist));

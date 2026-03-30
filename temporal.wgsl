@@ -40,6 +40,39 @@ struct TemporalParams {
 
 fn luma(c: vec3f) -> f32 { return dot(c, vec3f(0.2126, 0.7152, 0.0722)); }
 
+// Catmull-Rom (bicubic) sampling using 5 bilinear taps (Jimenez 2014).
+// Sharper than bilinear — reduces accumulated blur from temporal reprojection.
+fn sample_catmull_rom(tex: texture_2d<f32>, samp: sampler, uv: vec2f, tex_size: vec2f) -> vec4f {
+  let pixel = uv * tex_size - 0.5;
+  let tc = floor(pixel) + 0.5;
+  let f = pixel - tc;
+  let f2 = f * f;
+  let f3 = f2 * f;
+
+  // Catmull-Rom weights
+  let w0 = f2 - 0.5 * (f3 + f);
+  let w1 = 1.5 * f3 - 2.5 * f2 + vec2f(1.0);
+  let w3 = 0.5 * (f3 - f2);
+  let w2 = vec2f(1.0) - w0 - w1 - w3;
+
+  // Collapse to 5 bilinear taps
+  let w12 = w1 + w2;
+  let tc0 = (tc - 1.0) / tex_size;
+  let tc12 = (tc + w2 / w12) / tex_size;
+  let tc3 = (tc + 2.0) / tex_size;
+
+  var color = vec4f(0.0);
+  // Center cross (5 taps)
+  color += textureSampleLevel(tex, samp, vec2f(tc12.x, tc0.y), 0.0) * (w12.x * w0.y);
+  color += textureSampleLevel(tex, samp, vec2f(tc0.x, tc12.y), 0.0) * (w0.x * w12.y);
+  color += textureSampleLevel(tex, samp, vec2f(tc12.x, tc12.y), 0.0) * (w12.x * w12.y);
+  color += textureSampleLevel(tex, samp, vec2f(tc3.x, tc12.y), 0.0) * (w3.x * w12.y);
+  color += textureSampleLevel(tex, samp, vec2f(tc12.x, tc3.y), 0.0) * (w12.x * w3.y);
+
+  // Clamp to prevent ringing (negative lobes can cause undershoot)
+  return max(color, vec4f(0.0));
+}
+
 // Reconstruct world position from pixel + depth + camera
 fn reconstruct_world(px: vec2f, depth: f32, right: vec3f, up: vec3f, fwd: vec3f, pos: vec3f, fov: f32, aspect: f32, res: vec2f) -> vec3f {
   let uv = (px + 0.5) / res;
@@ -103,7 +136,9 @@ fn accumulate_signal(
 
   let clipped = clip_aabb(mn, mx, history);
 
-  // Adaptive alpha: favor current frame for new pixels, favor history for converged
+  // Adaptive alpha: favor current frame for new pixels, favor history for converged.
+  // SVGF paper uses 1/N but that's too aggressive for 1SPP (injects too much noise).
+  // This heuristic keeps α low even for new pixels, letting pre-blur + spatial handle noise.
   let var_lum = dot(stddev, vec3f(0.2126, 0.7152, 0.0722));
   let motion_alpha = mix(0.08, base_alpha, motion);
   let alpha = max(motion_alpha * 0.1, motion_alpha / (1.0 + var_lum * 10.0));
@@ -156,7 +191,7 @@ fn temporal(@builtin(global_invocation_id) gid: vec3u) {
 
   // Valid reprojection? (UV in bounds)
   if prev_uv_z.x >= 0.0 && prev_uv_z.x <= 1.0 && prev_uv_z.y >= 0.0 && prev_uv_z.y <= 1.0 {
-    // Sample previous frames with bilinear (color + metadata in alpha)
+    // Sample previous frames with bilinear
     let diff_hist_sample = textureSampleLevel(prev_denoised, tex_sampler, prev_uv_z.xy, 0.0);
     let spec_hist_sample = textureSampleLevel(prev_spec, tex_sampler, prev_uv_z.xy, 0.0);
     let diff_hist = diff_hist_sample.rgb;
