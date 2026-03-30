@@ -240,6 +240,21 @@
           <input type="checkbox" id="splash-sharc" checked>
         </div>
       </div>
+      <div class="splash-sec">
+        <div class="menu-title">Color</div>
+        <div class="splash-row">
+          <label>Tonemapping</label>
+          <select id="splash-tonemap">
+            <option value="0">AgX Punchy</option>
+            <option value="1">ACES</option>
+            <option value="2">Reinhard</option>
+            <option value="3">Uncharted 2</option>
+            <option value="4">PBR Neutral</option>
+            <option value="5" selected>Standard</option>
+            <option value="6">None</option>
+          </select>
+        </div>
+      </div>
       <button id="splash-start">START RENDERING</button>
       <button id="splash-clear-cache" style="display:block;width:100%;margin-top:8px;padding:8px;font-size:11px;font-family:'Courier New',monospace;background:rgba(255,60,60,0.15);color:#f66;border:1px solid rgba(255,60,60,0.3);border-radius:6px;cursor:pointer;">Clear Scene Cache</button>
       <div class="splash-footer">Sponza &bull; 3.7M triangles &bull; Adreno / Desktop GPU</div>
@@ -432,6 +447,7 @@
         bounces:    parseInt(document.getElementById('splash-bounces').value),
         spp:        parseInt(document.getElementById('splash-spp').value),
         sharc:      document.getElementById('splash-sharc').checked,
+        tonemap:    parseInt(document.getElementById('splash-tonemap').value),
       };
       _log('Config: ' + JSON.stringify(window.IGNIS_CONFIG));
       // Fade out splash
