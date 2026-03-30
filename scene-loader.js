@@ -687,8 +687,12 @@ export async function loadScene(basePath, onProgress) {
   // Collect emissive triangle indices for NEE
   // Build emissive triangle buffer:
   // 1 vec4 per tri: [tri_idx(bitcast u32), area, CDF, 0]
-  // Sorted by power, CDF for importance sampling, max 256 triangles
-  const MAX_EMISSIVE = 256;
+  // Sorted by power, CDF for importance sampling.
+  // Keep a generous fixed budget (~2 MB) so large area lights are represented
+  // without exploding memory on pathological fully-emissive scenes.
+  const EMISSIVE_TRI_STRIDE_BYTES = 16;
+  const MAX_EMISSIVE_BUFFER_BYTES = 2 * 1024 * 1024;
+  const MAX_EMISSIVE = Math.max(256, Math.floor(MAX_EMISSIVE_BUFFER_BYTES / EMISSIVE_TRI_STRIDE_BYTES));
   const emissiveCandidates = [];
   for (let i = 0; i < totalTris; i++) {
     const matIdx = bvh.sortedTriData[i * 4 + 3];
@@ -712,9 +716,11 @@ export async function loadScene(basePath, onProgress) {
     if (power < 1e-6) continue;
     emissiveCandidates.push({ power, triIdx: i, area });
   }
-  // Sort by power descending, keep top MAX_EMISSIVE
+  // Sort by power descending, keep top MAX_EMISSIVE if needed.
   emissiveCandidates.sort((a, b) => b.power - a.power);
-  const emissiveCount = Math.min(emissiveCandidates.length, MAX_EMISSIVE);
+  const emissiveSourceCount = emissiveCandidates.length;
+  const emissiveCount = Math.min(emissiveSourceCount, MAX_EMISSIVE);
+  const emissiveTruncated = emissiveSourceCount > emissiveCount;
   const totalPower = emissiveCandidates.slice(0, emissiveCount).reduce((s, t) => s + t.power, 0);
 
   // Build GPU buffer: 4 floats per triangle
@@ -757,6 +763,8 @@ export async function loadScene(basePath, onProgress) {
     bvhNodes: bvh.nodeCount,
     materials: materials.length,
     emissiveTris: emissiveCount,
+    emissiveSourceTris: emissiveSourceCount,
+    emissiveTruncated,
     sceneMin, sceneMax,
   };
 

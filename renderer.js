@@ -107,6 +107,10 @@ async function init() {
   }
   const stats = scene.stats;
   rlog('Scene loaded:', stats);
+  if (stats.emissiveSourceTris !== undefined) {
+    const trunc = stats.emissiveTruncated ? ' (truncated)' : '';
+    rlog(`Emissive sampling: ${stats.emissiveTris}/${stats.emissiveSourceTris} tris${trunc}`);
+  }
 
   // --- Resolution setup (FSR modes) ---
   const canvas = document.getElementById('canvas');
