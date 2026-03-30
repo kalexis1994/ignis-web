@@ -989,7 +989,7 @@ fn path_trace(primary_origin: vec3f, primary_dir: vec3f) -> PathResult {
       let fresnel_refl = f0 + (1.0 - f0) * pow(1.0 - cos_theta, 5.0);
 
       if rand() < fresnel_refl {
-        // Fresnel reflection (GGX microfacet for rough glass)
+        // Fresnel reflection
         if roughness > 0.02 {
           let alpha = max(roughness * roughness, 0.001);
           let H = sample_ggx_vndf(rand2(), V, normal, alpha);
@@ -999,9 +999,13 @@ fn path_trace(primary_origin: vec3f, primary_dir: vec3f) -> PathResult {
         }
         origin = hit_pos + normal * 0.001;
       } else {
-        // Pass through — no direction change (ignis-rt: rayOrigin += rayDir * 0.002)
+        // Pass through — no direction change, no tint for clear glass
+        // Tint only for colored glass (baseColor significantly non-white)
         origin = hit_pos + dir * 0.002;
-        throughput *= sqrt(clamp(base_color, vec3f(0.0), vec3f(1.0)));
+        let min_c = min(base_color.x, min(base_color.y, base_color.z));
+        if min_c < 0.9 {
+          throughput *= sqrt(clamp(base_color, vec3f(0.0), vec3f(1.0)));
+        }
       }
       specular_bounce = true;
       if bounce == 0u { is_diffuse_path = false; }
