@@ -1197,7 +1197,7 @@ async function init() {
     gctx.beginPath(); gctx.arc(GC,GC,GC-4,0,Math.PI*2); gctx.fillStyle='rgba(30,30,30,0.65)'; gctx.fill();
     gctx.strokeStyle='rgba(255,255,255,0.1)'; gctx.lineWidth=1; gctx.stroke();
     const cy=Math.cos(camera.yaw),sy=Math.sin(camera.yaw),cp=Math.cos(camera.pitch),sp=Math.sin(camera.pitch);
-    function proj(wx,wy,wz){return{x:cy*wx-sy*wz,y:-((-sp*sy)*wx+cp*wy+(-sp*cy)*wz),z:cp*sy*wx+sp*wy+cp*cy*wz};}
+    function proj(wx,wy,wz){return{x:cy*wx-sy*wz,y:-(sp*sy*wx+cp*wy+sp*cy*wz),z:-(cp*sy*wx+sp*wy+cp*cy*wz)};}
     const eps=[];
     [[1,0,0],[0,1,0],[0,0,1],[-1,0,0],[0,-1,0],[0,0,-1]].forEach(([wx,wy,wz],i)=>{
       const p=proj(wx,wy,wz);const pos=i<3;const ai=i%3;
