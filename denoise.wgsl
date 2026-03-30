@@ -1,7 +1,14 @@
-// SVGF-inspired Denoiser — Dual-Signal Variance-Guided À-Trous Wavelet Filter
-// Processes diffuse irradiance and specular radiance in a single dispatch.
-// Diffuse: standard variance-guided sigma
-// Specular: roughness-dependent sigma (tight for glossy, wide for rough)
+// Ignis SVGF — Dual-Signal Variance-Guided Denoiser
+//
+// Hybrid denoiser combining SVGF (Schied 2017) with NRD/ReBLUR/ReLAX techniques:
+// - À-trous wavelet filter (5×5 B3-spline, σ_n=128, σ_l=4.0×√var)
+// - Variance filtering propagated through passes (SVGF §4.2)
+// - Separated diffuse irradiance + specular radiance (ReLAX, NRD)
+// - Roughness-dependent specular sigma (tight for glossy, wide for rough)
+// - Per-pixel history length for adaptive temporal/spatial balance (ReBLUR)
+// - Hit distance-modulated blur radius (ReBLUR hitT)
+// - Pre-blur pass with anti-firefly 3σ percentile clamp (HPG 2025)
+// - Depth-relative gradient floor for distance-invariant filtering
 
 struct Params {
   resolution: vec2f,

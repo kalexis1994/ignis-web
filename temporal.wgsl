@@ -1,8 +1,11 @@
-// Temporal reprojection — dual-signal (diffuse + specular)
-// Per-pixel history length tracking (NRD-style):
-// - diffuse history alpha = accumulated frame count
-// - specular history alpha = previous camera-space Z (for disocclusion detection)
-// Disoccluded pixels reset to 0 → aggressive denoising only where needed
+// Ignis SVGF — Temporal Reprojection (dual-signal diffuse + specular)
+//
+// Per-pixel history length tracking (NRD/ReBLUR-style):
+// - Diffuse history alpha = accumulated frame count
+// - Specular history alpha = previous camera-space Z (depth disocclusion)
+// - AABB clip (Salvi) with adaptive expansion
+// - Catmull-Rom sampling function available (Jimenez 2014)
+// - ReSTIR GI temporal radiance reuse (Talbot et al.)
 
 struct TemporalParams {
   resolution: vec2f,
