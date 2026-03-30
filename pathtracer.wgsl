@@ -967,11 +967,46 @@ fn path_trace(primary_origin: vec3f, primary_dir: vec3f) -> PathResult {
       normal = normalize(normal + V * 0.2);
     }
 
-    // Capture first-hit G-buffer data
-    if bounce == 0u {
+    // Capture G-buffer data at first NON-SPECULAR surface (PSR: Primary Surface Replacement)
+    // Glass/mirror at bounce 0: skip capture, use the diffuse surface behind instead.
+    // This lets the denoiser operate on the visible surface, not the transparent glass.
+    if result.depth > 1e5 && mat_type != 3u {
       result.normal = normal; result.depth = hit.t; result.hit_pos = hit_pos;
       result.tri_idx = hit.tri_idx; result.bary = vec2f(hit.u, hit.v);
       result.albedo = base_color; result.roughness = roughness;
+    }
+
+    // Glass: Cycles-style transparent passthrough (ported from ignis-rt)
+    // Ray passes through without refraction (like Transparent BSDF).
+    // Fresnel determines reflect vs pass-through probability.
+    // Origin advances along ray direction to avoid self-intersection.
+    if mat_type == 3u {
+      glass_bounces += 1u;
+      if glass_bounces > 16u { break; }
+      let glass_ior = max(mat.ior, 1.01);
+      let cos_theta = abs(dot(normal, V));
+      let f0 = pow((glass_ior - 1.0) / (glass_ior + 1.0), 2.0);
+      let fresnel_refl = f0 + (1.0 - f0) * pow(1.0 - cos_theta, 5.0);
+
+      if rand() < fresnel_refl {
+        // Fresnel reflection (GGX microfacet for rough glass)
+        if roughness > 0.02 {
+          let alpha = max(roughness * roughness, 0.001);
+          let H = sample_ggx_vndf(rand2(), V, normal, alpha);
+          dir = reflect(-V, H);
+        } else {
+          dir = reflect(-V, normal);
+        }
+        origin = hit_pos + normal * 0.001;
+      } else {
+        // Pass through — no direction change (ignis-rt: rayOrigin += rayDir * 0.002)
+        origin = hit_pos + dir * 0.002;
+        throughput *= sqrt(clamp(base_color, vec3f(0.0), vec3f(1.0)));
+      }
+      specular_bounce = true;
+      if bounce == 0u { is_diffuse_path = false; }
+      if bounce > 0u { bounce -= 1u; }
+      continue;
     }
 
     // Emission
@@ -1025,53 +1060,7 @@ fn path_trace(primary_origin: vec3f, primary_dir: vec3f) -> PathResult {
     }
 
     // BRDF sampling — at bounce 0, classify path and demodulate diffuse throughput
-    if mat_type == 3u {
-      // Glass: solid refraction/reflection (ported from ignis-rt Vulkan)
-      // Separate bounce budget — glass doesn't consume main bounces
-      glass_bounces += 1u;
-      if glass_bounces > 16u { break; }
-
-      let glass_ior = max(mat.ior, 1.01);
-      let entering = front_face; // dot(dir, original_normal) < 0 = entering glass
-      let refract_n = select(-normal, normal, entering);
-      let eta = select(glass_ior, 1.0 / glass_ior, entering);
-
-      // GGX roughness for microfacet refraction
-      var alpha_glass = roughness * roughness;
-      alpha_glass = max(alpha_glass, 0.001);
-
-      // Microfacet half-vector: smooth glass (< 0.0005) uses flat normal
-      var H_glass: vec3f;
-      if alpha_glass >= 0.0005 {
-        H_glass = sample_ggx_vndf(rand2(), V, refract_n, alpha_glass);
-      } else {
-        H_glass = refract_n;
-      }
-
-      let cos_i = abs(dot(V, H_glass));
-      let fresnel = fresnel_dielectric(cos_i, eta);
-      let refracted = refract(-V, H_glass, eta);
-      let can_refract = dot(refracted, refracted) > 0.0001;
-
-      if !can_refract || rand() < fresnel {
-        // Reflection (TIR or Fresnel)
-        dir = reflect(-dir, H_glass);
-        origin = hit_pos + refract_n * BIAS;
-      } else {
-        // Refraction
-        dir = refracted;
-        origin = hit_pos - refract_n * BIAS;
-      }
-
-      // Cycles Principled transmission tint: sqrt(baseColor)
-      // Simpler than Beer's law, matches Blender exactly
-      throughput *= sqrt(clamp(base_color, vec3f(0.0), vec3f(1.0)));
-
-      specular_bounce = roughness < 0.1;
-      if bounce == 0u { is_diffuse_path = false; }
-      bounce -= 1u;
-      continue;
-    } else if metallic > 0.5 {
+    if metallic > 0.5 {
       // Metal / specular-dominant: GGX VNDF sampling → specular path
       let alpha = max(roughness * roughness, 0.001);
       let H = sample_ggx_vndf(rand2(), V, normal, alpha);

@@ -127,8 +127,8 @@ function extractMaterials(gltf) {
     if (mat.extensions?.KHR_materials_transmission) {
       type = 3;
       ior = mat.extensions?.KHR_materials_ior?.ior || 1.5;
-      // Glass with [0,0,0] baseColor: use near-white for refraction
-      if (albedo[0] < 0.01 && albedo[1] < 0.01 && albedo[2] < 0.01) {
+      metallic = 0.0;
+      if (albedo[0] < 0.05 && albedo[1] < 0.05 && albedo[2] < 0.05) {
         albedo[0] = 0.97; albedo[1] = 0.97; albedo[2] = 0.98;
       }
     } else if (emission[0] > 0.01 || emission[1] > 0.01 || emission[2] > 0.01) {
