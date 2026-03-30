@@ -39,7 +39,7 @@ async function init() {
     requiredLimits: {
       maxStorageBufferBindingSize: adapter.limits.maxStorageBufferBindingSize,
       maxBufferSize: adapter.limits.maxBufferSize,
-      maxStorageBuffersPerShaderStage: Math.min(8, adapter.limits.maxStorageBuffersPerShaderStage),
+      maxStorageBuffersPerShaderStage: Math.min(10, adapter.limits.maxStorageBuffersPerShaderStage),
     }
   });
   device.onuncapturederror = (e) => rlog('GPU_ERROR: ' + e.error.message);
@@ -175,7 +175,7 @@ async function init() {
 
   // --- Uniform buffer ---
   // Added: sun_dir (vec3f) + emissive_tri_count (u32) = 16 more bytes
-  const uniformBufferSize = 128;
+  const uniformBufferSize = 256; // expanded for prev camera (ReSTIR reprojection)
   const uniformBuffer = device.createBuffer({
     size: uniformBufferSize,
     usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
@@ -388,25 +388,42 @@ async function init() {
     ],
   });
 
-  // --- SHaRC radiance cache ---
-  // SHaRC radiance cache — keys+accum packed in 1 buffer, resolved in another
-  // keys_accum: [0..cap) = keys, [cap..cap+cap*4) = accum RGBS = total cap*5 u32s
-  // resolved: [0..cap*4) = resolved RGBS = total cap*4 u32s
+  // --- ReSTIR GI buffers (created before SHaRC so bg2 can reference them) ---
+  const restirEnabled = device.limits.maxStorageBuffersPerShaderStage >= 10;
+  const restirPixels = width * height;
+  const restirBufSize = restirEnabled ? restirPixels * 3 * 16 : 48;
+  const restirBufA = device.createBuffer({ size: restirBufSize, usage: GPUBufferUsage.STORAGE });
+  const restirBufB = device.createBuffer({ size: restirBufSize, usage: GPUBufferUsage.STORAGE });
+  let restirFrame = 0;
+
+  // --- SHaRC radiance cache + ReSTIR bind group ---
   const SHARC_CAPACITY = 131072;
   const sharcParamBuf = device.createBuffer({ size: 32, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
   const sharcKeysAccumBuf = device.createBuffer({ size: SHARC_CAPACITY * 5 * 4, usage: GPUBufferUsage.STORAGE });
   const sharcResolvedBuf = device.createBuffer({ size: SHARC_CAPACITY * 4 * 4, usage: GPUBufferUsage.STORAGE });
 
-  // PT reads resolved as read-only, writes keys_accum as read_write
+  // PT reads resolved as read-only, writes keys_accum as read_write + ReSTIR buffers
   const bg2Layout = device.createBindGroupLayout({ entries: [
     { binding: 0, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'uniform' } },
-    { binding: 1, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } },        // keys_accum rw
+    { binding: 1, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } },           // keys_accum rw
     { binding: 2, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } }, // resolved ro
+    { binding: 3, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } },           // restir curr rw
+    { binding: 4, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } }, // restir prev ro
   ]});
-  const bg2 = device.createBindGroup({ layout: bg2Layout, entries: [
+  // Double-buffered: bg2_A writes restirA reads restirB, bg2_B swaps
+  const bg2_A = device.createBindGroup({ layout: bg2Layout, entries: [
     { binding: 0, resource: { buffer: sharcParamBuf } },
     { binding: 1, resource: { buffer: sharcKeysAccumBuf } },
     { binding: 2, resource: { buffer: sharcResolvedBuf } },
+    { binding: 3, resource: { buffer: restirBufA } },
+    { binding: 4, resource: { buffer: restirBufB } },
+  ]});
+  const bg2_B = device.createBindGroup({ layout: bg2Layout, entries: [
+    { binding: 0, resource: { buffer: sharcParamBuf } },
+    { binding: 1, resource: { buffer: sharcKeysAccumBuf } },
+    { binding: 2, resource: { buffer: sharcResolvedBuf } },
+    { binding: 3, resource: { buffer: restirBufB } },
+    { binding: 4, resource: { buffer: restirBufA } },
   ]});
 
   // Resolve needs rw on both
@@ -443,7 +460,9 @@ async function init() {
     { binding: 1, resource: texSampler },
   ]});
 
-  // --- Compute pipeline (PT + SHaRC + Textures) ---
+  rlog(`ReSTIR GI ${restirEnabled ? 'enabled' : 'disabled (limit<10)'} (${(restirBufSize * 2 / 1048576).toFixed(1)} MB)`);
+
+  // --- Compute pipeline (PT + SHaRC/ReSTIR + Textures) ---
   const computePipeline = device.createComputePipeline({
     layout: device.createPipelineLayout({ bindGroupLayouts: [bg0Layout, bg1Layout, bg2Layout, bg3Layout] }),
     compute: { module: ptModule, entryPoint: 'main' },
@@ -1243,6 +1262,7 @@ async function init() {
     const aspect = width / height;
 
     frameIndex++;
+    restirFrame = 1 - restirFrame;
 
     // --- G-buffer rasterization (replaces primary ray BVH traversal) ---
     const viewProj = buildViewProj(camera, forward, right, up, width, height);
@@ -1288,6 +1308,13 @@ async function init() {
     u32[23] = stats.emissiveTris;
     u32[24] = maxBounces;
     u32[25] = framesStill;
+    f32[26] = aspect;
+    u32[27] = restirEnabled ? 1 : 0;
+    // Previous camera for ReSTIR reprojection
+    f32[28] = prevCam.pos[0]; f32[29] = prevCam.pos[1]; f32[30] = prevCam.pos[2]; f32[31] = 0;
+    f32[32] = prevCam.fwd[0]; f32[33] = prevCam.fwd[1]; f32[34] = prevCam.fwd[2]; f32[35] = 0;
+    f32[36] = prevCam.right[0]; f32[37] = prevCam.right[1]; f32[38] = prevCam.right[2]; f32[39] = 0;
+    f32[40] = prevCam.up[0]; f32[41] = prevCam.up[1]; f32[42] = prevCam.up[2]; f32[43] = 0;
     device.queue.writeBuffer(uniformBuffer, 0, ud);
 
     // Write temporal uniforms (current + previous camera)
@@ -1329,7 +1356,7 @@ async function init() {
         ptPass.setPipeline(computePipeline);
         ptPass.setBindGroup(0, bg0);
         ptPass.setBindGroup(1, bg1);
-        ptPass.setBindGroup(2, bg2);
+        ptPass.setBindGroup(2, restirFrame === 0 ? bg2_A : bg2_B);
         ptPass.setBindGroup(3, bg3);
         ptPass.dispatchWorkgroups(Math.ceil(width/8), Math.ceil(height/8));
         ptPass.end();

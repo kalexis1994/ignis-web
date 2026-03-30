@@ -22,9 +22,18 @@ struct Uniforms {
   sun_dir: vec3f,
   emissive_tri_count: u32,
   max_bounces: u32,
-  frames_still: u32, // frames since last camera move
-  _pad4: u32,
-  _pad5: u32,
+  frames_still: u32,
+  aspect: f32,
+  restir_enabled: u32,
+  // Previous camera for ReSTIR reprojection
+  prev_pos: vec3f,
+  _pad6: f32,
+  prev_forward: vec3f,
+  _pad7: f32,
+  prev_right: vec3f,
+  _pad8: f32,
+  prev_up: vec3f,
+  _pad9: f32,
 };
 
 struct BVHNode { aabb_min: vec3f, left_first: u32, aabb_max: vec3f, tri_count: u32, };
@@ -61,6 +70,12 @@ struct SharcParams { capacity: u32, frame_index: u32, scene_scale: f32, stale_ma
 
 @group(3) @binding(0) var tex_array: texture_2d_array<f32>;
 @group(3) @binding(1) var tex_sampler_pt: sampler;
+
+// ReSTIR GI — Weighted Reservoir Sampling for indirect lighting
+// Packed as 3 vec4f per pixel: [pos+wSum, rad+M, octNorm+hitDist+age]
+// Merged into SHaRC bind group (group 2) to stay within 4 bind group limit
+@group(2) @binding(3) var<storage, read_write> restir_curr: array<vec4f>;
+@group(2) @binding(4) var<storage, read> restir_prev: array<vec4f>;
 
 const PI: f32 = 3.14159265359;
 const TWO_PI: f32 = 6.28318530718;
@@ -236,6 +251,92 @@ fn sharc_store_radiance(wp: vec3f, n: vec3f, rad: vec3f) {
   if u32(s.y) > 0u { atomicAdd(&sharc_keys_accum[aBase + 1u], u32(s.y)); }
   if u32(s.z) > 0u { atomicAdd(&sharc_keys_accum[aBase + 2u], u32(s.z)); }
   atomicAdd(&sharc_keys_accum[aBase + 3u], 1u);
+}
+
+// ============================================================
+// ReSTIR GI — Temporal Radiance Reuse (Talbot et al.)
+// ============================================================
+struct GIReservoir {
+  position: vec3f, normal: vec3f, radiance: vec3f,
+  weight_sum: f32, M: f32, hit_dist: f32, age: f32,
+};
+
+fn empty_reservoir() -> GIReservoir {
+  return GIReservoir(vec3f(0.0), vec3f(0.0), vec3f(0.0), 0.0, 0.0, 0.0, 0.0);
+}
+
+// Octahedral normal encoding (3D → 2 floats)
+fn oct_encode(n: vec3f) -> vec2f {
+  let s = abs(n.x) + abs(n.y) + abs(n.z);
+  var o = n.xy / s;
+  if n.z < 0.0 { o = (1.0 - abs(o.yx)) * select(vec2f(-1.0), vec2f(1.0), o >= vec2f(0.0)); }
+  return o * 0.5 + 0.5;
+}
+
+fn oct_decode(e: vec2f) -> vec3f {
+  let f = e * 2.0 - 1.0;
+  var n = vec3f(f.x, f.y, 1.0 - abs(f.x) - abs(f.y));
+  if n.z < 0.0 { n = vec3f((1.0 - abs(n.yx)) * select(vec2f(-1.0), vec2f(1.0), n.xy >= vec2f(0.0)), n.z); }
+  return normalize(n);
+}
+
+fn write_reservoir(idx: u32, r: GIReservoir) {
+  let base = idx * 3u;
+  restir_curr[base]     = vec4f(r.position, r.weight_sum);
+  restir_curr[base + 1u] = vec4f(r.radiance, r.M);
+  let on = oct_encode(r.normal);
+  restir_curr[base + 2u] = vec4f(on.x, on.y, r.hit_dist, r.age);
+}
+
+fn read_reservoir_prev(idx: u32) -> GIReservoir {
+  let base = idx * 3u;
+  let d0 = restir_prev[base];
+  let d1 = restir_prev[base + 1u];
+  let d2 = restir_prev[base + 2u];
+  return GIReservoir(d0.xyz, oct_decode(d2.xy), d1.xyz, d0.w, d1.w, d2.z, d2.w);
+}
+
+// Target PDF: luminance × cosine-weighted importance
+fn gi_target_pdf(primary_normal: vec3f, primary_pos: vec3f, s: GIReservoir) -> f32 {
+  let dir = s.position - primary_pos;
+  let dist = length(dir);
+  if dist < 0.001 { return 0.0; }
+  let cos_theta = max(dot(primary_normal, dir / dist), 0.0);
+  let lum = dot(s.radiance, vec3f(0.2126, 0.7152, 0.0722));
+  return lum * cos_theta;
+}
+
+// WRS update: accept sample with probability weight/weightSum
+fn reservoir_update(r: ptr<function, GIReservoir>, s: GIReservoir, weight: f32) {
+  (*r).weight_sum += weight;
+  (*r).M += 1.0;
+  if rand() * (*r).weight_sum < weight {
+    (*r).position = s.position;
+    (*r).normal = s.normal;
+    (*r).radiance = s.radiance;
+    (*r).hit_dist = s.hit_dist;
+    (*r).age = s.age;
+  }
+}
+
+// Merge source reservoir into destination
+fn reservoir_merge(dest: ptr<function, GIReservoir>, src: GIReservoir, target_pdf: f32) {
+  let weight = target_pdf * src.M;
+  let old_M = (*dest).M;
+  reservoir_update(dest, src, weight);
+  (*dest).M = old_M + src.M;
+}
+
+// Reproject current pixel to previous frame UV
+fn restir_reproject(world_pos: vec3f) -> vec2f {
+  let local = world_pos - uniforms.prev_pos;
+  let z = dot(local, uniforms.prev_forward);
+  if z <= 0.0 { return vec2f(-1.0); }
+  let x = dot(local, uniforms.prev_right);
+  let y = dot(local, uniforms.prev_up);
+  let ndcx = x / (z * uniforms.aspect * uniforms.fov_factor);
+  let ndcy = y / (z * uniforms.fov_factor);
+  return vec2f(ndcx * 0.5 + 0.5, ndcy * 0.5 + 0.5);
 }
 
 // ============================================================
@@ -884,12 +985,60 @@ fn main(@builtin(global_invocation_id) gid: vec3u) {
     }
   }
 
+  // === ReSTIR GI: temporal radiance reuse ===
+  if uniforms.restir_enabled > 0u && pt.depth < 1e5 {
+    // Build current reservoir from bounce-1 sample
+    var reservoir = empty_reservoir();
+    if pt.hit_dist < 1e3 {
+      var gi_sample = empty_reservoir();
+      gi_sample.radiance = diff_color;
+      gi_sample.position = pt.hit_pos;
+      gi_sample.normal = pt.normal;
+      gi_sample.hit_dist = pt.hit_dist;
+      gi_sample.age = 0.0;
+      let p_hat = gi_target_pdf(pt.normal, pt.hit_pos, gi_sample);
+      if p_hat > 0.0 { reservoir_update(&reservoir, gi_sample, p_hat); }
+    }
+
+    // Temporal reuse: reproject to previous frame, merge reservoir
+    if uniforms.frame_seed > 0u {
+      let prev_uv = restir_reproject(pt.hit_pos);
+      if prev_uv.x >= 0.0 && prev_uv.x < 1.0 && prev_uv.y >= 0.0 && prev_uv.y < 1.0 {
+        let prev_px = vec2i(vec2f(prev_uv.x * uniforms.resolution.x, prev_uv.y * uniforms.resolution.y));
+        let prev_idx = u32(prev_px.y) * res.x + u32(prev_px.x);
+        var prev = read_reservoir_prev(prev_idx);
+
+        // Validate: age < 20, normal similarity > 0.5
+        if prev.age < 20.0 && prev.M >= 1.0 && dot(pt.normal, prev.normal) > 0.5 {
+          prev.age += 1.0;
+          prev.M = min(prev.M, 20.0); // clamp M to prevent weight explosion
+          let prev_pdf = gi_target_pdf(pt.normal, pt.hit_pos, prev);
+          reservoir_merge(&reservoir, prev, prev_pdf);
+        }
+      }
+    }
+
+    // Apply reused GI to diffuse radiance
+    if reservoir.weight_sum > 0.0 && reservoir.M > 0.0 {
+      let final_pdf = gi_target_pdf(pt.normal, pt.hit_pos, reservoir);
+      if final_pdf > 0.0 {
+        let W = reservoir.weight_sum / (reservoir.M * final_pdf);
+        let reused_gi = reservoir.radiance * final_pdf * W;
+        let blend = clamp(reservoir.M / 10.0, 0.0, 0.5);
+        diff_color = mix(diff_color, diff_color + reused_gi * 0.3, blend);
+      }
+    }
+
+    write_reservoir(idx, reservoir);
+  } else if uniforms.restir_enabled > 0u {
+    // Sky pixel: write empty reservoir
+    write_reservoir(idx, empty_reservoir());
+  }
+
   // Adreno: clamp to fp16 range (values >65504 produce artifacts)
   diff_color = min(diff_color, vec3f(65000.0));
   spec_color = min(spec_color, vec3f(65000.0));
 
-  // Diffuse irradiance (demodulated: no first-hit albedo) + specular radiance
-  // Normalize hit distance logarithmically: 0 = contact shadow, 1 = far/sky
   let norm_hit_dist = clamp(log2(pt.hit_dist + 1.0) / 8.0, 0.0, 1.0);
 
   textureStore(noisy_out, vec2i(pixel), vec4f(diff_color, 1.0));
