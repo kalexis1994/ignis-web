@@ -94,11 +94,21 @@ const SUN_MULT: f32 = 100.0;
 const MAX_FIREFLY_LUM: f32 = 8.0;
 
 // ============================================================
-// RNG (PCG) + R2 quasi-random sequence (ignis-rt)
+// RNG: PCG + spatio-temporal R2 blue noise stratification
+// R2 quasi-random sequence provides low-discrepancy sampling that:
+// - Spatially: nearby pixels get maximally different offsets (blue-noise-like)
+// - Temporally: each frame shifts the pattern (Cranley-Patterson rotation)
+// Result: noise is spatially uniform → denoiser works much better
 // ============================================================
 var<private> rng_state: u32;
 var<private> g_sun_dir: vec3f;
-var<private> g_r2_offset: vec2f; // R2 jitter per pixel per frame
+var<private> g_r2_offset: vec2f;
+var<private> g_sample_idx: u32;
+var<private> g_alpha_dither: f32; // spatiotemporal R2 dither for alpha testing
+
+// R2 quasi-random constants (plastic constant)
+const R2_A1: f32 = 0.7548776662466927;
+const R2_A2: f32 = 0.5698402909980532;
 
 fn pcg(state: ptr<private, u32>) -> u32 {
   let s = *state;
@@ -107,11 +117,14 @@ fn pcg(state: ptr<private, u32>) -> u32 {
   return (word >> 22u) ^ word;
 }
 fn rand() -> f32 { return f32(pcg(&rng_state)) / 4294967295.0; }
-fn rand2() -> vec2f { return fract(vec2f(rand(), rand()) + g_r2_offset); }
 
-// R2 quasi-random: much better convergence than pure random (ignis-rt)
-const R2_A1: f32 = 0.7548776662466927; // 1/plastic constant
-const R2_A2: f32 = 0.5698402909980532; // 1/plastic constant^2
+// Blue-noise-like 2D sample: R2 spatial stratification + temporal rotation
+// Each call returns a different R2 point (indexed by g_sample_idx)
+fn rand2() -> vec2f {
+  let idx = f32(g_sample_idx);
+  g_sample_idx += 1u;
+  return fract(vec2f(R2_A1 * idx, R2_A2 * idx) + g_r2_offset);
+}
 
 // ============================================================
 // Sampling utilities
@@ -200,7 +213,8 @@ fn sharc_make_key(wp: vec3f, n: vec3f) -> u32 {
   return select(key, 1u, key == 0u);
 }
 
-// keys_accum layout: [0..cap) = keys, [cap..cap + cap*4) = accum R,G,B,count per slot
+// keys_accum layout: [0..cap) = keys, [cap..cap*7) = accum R,G,B,count,Dx,Dy,Dz per slot
+// resolved layout: [0..cap*7) = resolved R,G,B,samples|stale,Dx,Dy,Dz per slot
 
 fn sharc_find_slot(key: u32) -> u32 {
   let base = sharc_jenkins(key) % sharc_params.capacity;
@@ -208,7 +222,7 @@ fn sharc_find_slot(key: u32) -> u32 {
   for (var i = 0u; i < 4u; i++) {
     let slot = (base + i) % sharc_params.capacity;
     // Read from resolved (non-atomic, fast) to check if slot has data
-    let rSamples = sharc_resolved[slot * 4u + 3u] & 0xFFFFu;
+    let rSamples = sharc_resolved[slot * 7u + 3u] & 0xFFFFu;
     if rSamples == 0u { return 0xFFFFFFFFu; } // empty chain, stop
     // Verify key match via atomic (only if slot has data)
     let stored = atomicLoad(&sharc_keys_accum[slot]);
@@ -231,7 +245,7 @@ fn sharc_read_cached(wp: vec3f, n: vec3f) -> vec3f {
   let key = sharc_make_key(wp, n);
   let slot = sharc_find_slot(key);
   if slot == 0xFFFFFFFFu { return vec3f(0.0); }
-  let rBase = slot * 4u;
+  let rBase = slot * 7u;
   let samples = f32(sharc_resolved[rBase + 3u] & 0xFFFFu);
   if samples < 1.0 { return vec3f(0.0); }
   return vec3f(
@@ -241,16 +255,62 @@ fn sharc_read_cached(wp: vec3f, n: vec3f) -> vec3f {
   );
 }
 
+// Store radiance + incoming light direction for path guiding (L1 SH)
+// Direction encoded as offset u32 for safe atomic accumulation of signed values:
+// val = (dir_component * lum + lum) * GUIDE_SCALE → always positive
+const GUIDE_SCALE: f32 = 10000.0;
+
 fn sharc_store_radiance(wp: vec3f, n: vec3f, rad: vec3f) {
   let key = sharc_make_key(wp, n);
   let slot = sharc_insert_slot(key);
   if slot == 0xFFFFFFFFu { return; }
   let s = max(rad * 1000.0, vec3f(0.0));
-  let aBase = sharc_params.capacity + slot * 4u; // accum region starts after keys
+  let aBase = sharc_params.capacity + slot * 7u; // accum: RGBS + DxDyDz
   if u32(s.x) > 0u { atomicAdd(&sharc_keys_accum[aBase], u32(s.x)); }
   if u32(s.y) > 0u { atomicAdd(&sharc_keys_accum[aBase + 1u], u32(s.y)); }
   if u32(s.z) > 0u { atomicAdd(&sharc_keys_accum[aBase + 2u], u32(s.z)); }
   atomicAdd(&sharc_keys_accum[aBase + 3u], 1u);
+}
+
+// Store with direction (for indirect bounces — records where light came from)
+fn sharc_store_radiance_dir(wp: vec3f, n: vec3f, rad: vec3f, incoming_dir: vec3f) {
+  let key = sharc_make_key(wp, n);
+  let slot = sharc_insert_slot(key);
+  if slot == 0xFFFFFFFFu { return; }
+  let s = max(rad * 1000.0, vec3f(0.0));
+  let aBase = sharc_params.capacity + slot * 7u;
+  if u32(s.x) > 0u { atomicAdd(&sharc_keys_accum[aBase], u32(s.x)); }
+  if u32(s.y) > 0u { atomicAdd(&sharc_keys_accum[aBase + 1u], u32(s.y)); }
+  if u32(s.z) > 0u { atomicAdd(&sharc_keys_accum[aBase + 2u], u32(s.z)); }
+  atomicAdd(&sharc_keys_accum[aBase + 3u], 1u);
+  // Accumulate luminance-weighted direction (offset encoding for signed→unsigned)
+  let lum = dot(rad, vec3f(0.2126, 0.7152, 0.0722));
+  if lum > 0.001 {
+    let d = incoming_dir; // direction FROM which light arrives
+    atomicAdd(&sharc_keys_accum[aBase + 4u], u32((d.x * lum + lum) * GUIDE_SCALE));
+    atomicAdd(&sharc_keys_accum[aBase + 5u], u32((d.y * lum + lum) * GUIDE_SCALE));
+    atomicAdd(&sharc_keys_accum[aBase + 6u], u32((d.z * lum + lum) * GUIDE_SCALE));
+  }
+}
+
+// Read guide direction from resolved cache
+fn sharc_read_guide(wp: vec3f, n: vec3f) -> vec4f {
+  // Returns xyz = dominant direction, w = concentration (0=no info, 1=strong)
+  let key = sharc_make_key(wp, n);
+  let slot = sharc_find_slot(key);
+  if slot == 0xFFFFFFFFu { return vec4f(0.0); }
+  let rBase = slot * 7u;
+  let samples = f32(sharc_resolved[rBase + 3u] & 0xFFFFu);
+  if samples < 4.0 { return vec4f(0.0); } // need minimum samples for reliable direction
+  // Reconstruct direction from resolved L1 SH
+  let dx = bitcast<f32>(sharc_resolved[rBase + 4u]);
+  let dy = bitcast<f32>(sharc_resolved[rBase + 5u]);
+  let dz = bitcast<f32>(sharc_resolved[rBase + 6u]);
+  let dir_len = length(vec3f(dx, dy, dz));
+  if dir_len < 0.01 { return vec4f(0.0); } // isotropic, no dominant direction
+  let dir = vec3f(dx, dy, dz) / dir_len;
+  let concentration = min(dir_len, 1.0); // 0 = diffuse light, 1 = directional
+  return vec4f(dir, concentration);
 }
 
 // ============================================================
@@ -487,11 +547,7 @@ fn trace_bvh_hint(origin: vec3f, dir: vec3f, t_hint: f32) -> HitInfo {
             var ta = 1.0;
             if btx >= 0 { ta = textureSampleLevel(tex_array, tex_sampler_pt, uv, btx, 0.0).a; }
             if am == 1u && ta < max(mat.alpha_cutoff, 0.5) { continue; }
-            if am == 2u {
-              // Stochastic alpha: rand() threshold converges to correct coverage via temporal
-              let blend_rand = fract(f32((ti * 73856093u) ^ (u32(r.x * 1000.0) * 19349663u)) / 4294967295.0 + f32(pcg(&rng_state)) / 4294967295.0);
-              if ta < blend_rand { continue; }
-            }
+            if am == 2u && ta < g_alpha_dither { continue; } // BLEND: R2 spatiotemporal dither
           }
           hit.t=r.x; hit.u=r.y; hit.v=r.z; hit.tri_idx=ti; hit.hit=true;
         }
@@ -535,7 +591,7 @@ fn trace_shadow(origin: vec3f, dir: vec3f, max_t: f32) -> bool {
             var ta = 1.0;
             if btx >= 0 { ta = textureSampleLevel(tex_array, tex_sampler_pt, uv, btx, 0.0).a; }
             if am == 1u && ta < mat.alpha_cutoff { continue; }
-            if am == 2u && ta < 0.5 { continue; } // shadow rays: fixed 0.5 threshold (no RNG in shadow)
+            if am == 2u && ta < g_alpha_dither { continue; } // BLEND: same dither as primary
           }
           return true;
         }
@@ -665,9 +721,10 @@ struct PathResult {
   diffuse: vec3f, specular: vec3f, normal: vec3f, depth: f32,
   hit_pos: vec3f, direct: vec3f, tri_idx: u32, bary: vec2f,
   albedo: vec3f, roughness: f32, hit_dist: f32,
-  // SHaRC backpropagation data
+  // SHaRC backpropagation + path guiding data
   sharc_pos: array<vec3f, 4>, sharc_nrm: array<vec3f, 4>,
-  sharc_rad: array<vec3f, 4>, sharc_count: u32,
+  sharc_rad: array<vec3f, 4>, sharc_dir: array<vec3f, 4>,
+  sharc_count: u32,
 };
 
 var<private> g_depth_hint: f32; // G-buffer depth hint for first bounce acceleration
@@ -690,10 +747,11 @@ fn path_trace(primary_origin: vec3f, primary_dir: vec3f) -> PathResult {
   var specular_bounce = true;
   var is_diffuse_path = true;
   var glass_bounces = 0u;
-  // SHaRC backpropagation: store up to 4 bounce points for cache update
+  // SHaRC backpropagation + path guiding: store up to 4 bounce points
   var sharc_pos: array<vec3f, 4>;
   var sharc_nrm: array<vec3f, 4>;
   var sharc_rad: array<vec3f, 4>;
+  var sharc_dir: array<vec3f, 4>; // incoming light direction per bounce
   var sharc_count = 0u;
 
   for (var bounce = 0u; bounce < uniforms.max_bounces; bounce++) {
@@ -786,11 +844,12 @@ fn path_trace(primary_origin: vec3f, primary_dir: vec3f) -> PathResult {
       let direct = sample_sun_nee(hit_pos, normal, V, base_color, roughness, metallic);
       if is_diffuse_path { diff_rad += throughput * direct; }
       else { spec_rad += throughput * direct; }
-      // SHaRC backpropagation: store direct lighting only (sky needs occlusion check)
+      // SHaRC backpropagation with direction (for path guiding)
       if sharc_count < 4u {
         sharc_pos[sharc_count] = hit_pos;
         sharc_nrm[sharc_count] = normal;
         sharc_rad[sharc_count] = direct;
+        sharc_dir[sharc_count] = -dir; // incoming light direction = reverse of bounce dir
         sharc_count += 1u;
       }
     }
@@ -850,14 +909,27 @@ fn path_trace(primary_origin: vec3f, primary_dir: vec3f) -> PathResult {
       specular_bounce = roughness < 0.1;
       if bounce == 0u { is_diffuse_path = false; }
     } else {
-      // Dielectric: cosine hemisphere → diffuse path
-      dir = cosine_sample_hemisphere(normal);
+      // Dielectric: guided cosine hemisphere → diffuse path
+      // Path guiding: read dominant light direction from SHaRC cache
+      let guide = sharc_read_guide(hit_pos, normal);
+      var bent = normal;
+      if guide.w > 0.1 && dot(guide.xyz, normal) > 0.1 {
+        // Bend normal toward guide direction (L1 SH path guiding)
+        // Strength proportional to concentration: 0 = pure cosine, 0.5 = max bend
+        bent = normalize(mix(normal, guide.xyz, guide.w * 0.5));
+        if dot(bent, normal) < 0.2 { bent = normal; } // safety: don't bend too far
+      }
+      dir = cosine_sample_hemisphere(bent);
       if dot(normal, dir) <= 0.0 { break; }
+      // PDF correction for bent normal: compensate bias for unbiased result
+      // cosine hemisphere PDF relative to bent: cos(dir,bent)/π
+      // actual BRDF uses cos(dir,normal)/π → correction = cos(dir,normal)/cos(dir,bent)
+      let pdf_correction = max(dot(dir, normal), 0.001) / max(dot(dir, bent), 0.001);
       if bounce == 0u {
         is_diffuse_path = true;
-        throughput *= vec3f(1.0 - metallic); // demodulated: no base_color
+        throughput *= vec3f((1.0 - metallic) * pdf_correction);
       } else {
-        throughput *= base_color * (1.0 - metallic);
+        throughput *= base_color * (1.0 - metallic) * pdf_correction;
       }
       specular_bounce = false;
     }
@@ -878,6 +950,7 @@ fn path_trace(primary_origin: vec3f, primary_dir: vec3f) -> PathResult {
   result.sharc_pos = sharc_pos;
   result.sharc_nrm = sharc_nrm;
   result.sharc_rad = sharc_rad;
+  result.sharc_dir = sharc_dir;
   result.sharc_count = sharc_count;
   return result;
 }
@@ -971,12 +1044,27 @@ fn main(@builtin(global_invocation_id) gid: vec3u) {
 
   let idx = pixel.y * res.x + pixel.x;
 
-  // RNG init
+  // RNG init: PCG state + spatio-temporal R2 offset
   rng_state = (pixel.x * 1973u + pixel.y * 9277u + uniforms.frame_seed * 26699u) | 1u;
   _ = pcg(&rng_state);
   g_sun_dir = normalize(uniforms.sun_dir);
+  g_sample_idx = 0u;
+  // R2 offset: spatial (per-pixel stratification) + temporal (per-frame rotation)
+  // Spatial R2 distributes samples across pixels with low discrepancy (blue-noise property)
+  // Temporal R2 rotates pattern each frame (Cranley-Patterson)
   let frame_f = f32(uniforms.frame_seed);
-  g_r2_offset = fract(vec2f(R2_A1 * frame_f, R2_A2 * frame_f));
+  let spatial_offset = fract(vec2f(
+    R2_A1 * f32(pixel.x) + R2_A2 * f32(pixel.y),
+    R2_A2 * f32(pixel.x) + R2_A1 * f32(pixel.y)
+  ));
+  let temporal_offset = fract(vec2f(R2_A1 * frame_f, R2_A2 * frame_f));
+  g_r2_offset = fract(spatial_offset + temporal_offset);
+  // Alpha dither: IGN spatial (Jimenez 2014) + per-pixel phased golden ratio temporal
+  // IGN provides blue-noise-like spatial distribution
+  // Per-pixel phase offset prevents coherent movement across the screen
+  let ign = fract(52.9829189 * fract(dot(vec2f(f32(pixel.x), f32(pixel.y)), vec2f(0.06711056, 0.00583715))));
+  let pixel_phase = f32((pixel.x * 1973u + pixel.y * 9277u) % 256u);
+  g_alpha_dither = fract(ign + (frame_f + pixel_phase) * 0.3819660113);
 
   // Read G-buffer depth hint (rasterized — much faster than BVH for primary visibility)
   let nd = textureLoad(gbuf_nd, vec2i(pixel), 0);
@@ -1016,9 +1104,9 @@ fn main(@builtin(global_invocation_id) gid: vec3u) {
     let bh = ((bx * 73856093u) ^ (by * 19349663u) ^ (uniforms.frame_seed * 83492791u));
     let sx = bx * 5u + (bh % 5u); let sy = by * 5u + ((bh / 5u) % 5u);
     if pixel.x == sx && pixel.y == sy {
-      sharc_store_radiance(pt.hit_pos, pt.normal, pt.direct);
+      sharc_store_radiance(pt.hit_pos, pt.normal, pt.direct); // first hit (no direction)
       for (var si = 0u; si < pt.sharc_count; si++) {
-        sharc_store_radiance(pt.sharc_pos[si], pt.sharc_nrm[si], pt.sharc_rad[si]);
+        sharc_store_radiance_dir(pt.sharc_pos[si], pt.sharc_nrm[si], pt.sharc_rad[si], pt.sharc_dir[si]);
       }
     }
   }

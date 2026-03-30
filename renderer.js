@@ -399,8 +399,9 @@ async function init() {
   // --- SHaRC radiance cache + ReSTIR bind group ---
   const SHARC_CAPACITY = 131072;
   const sharcParamBuf = device.createBuffer({ size: 32, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
-  const sharcKeysAccumBuf = device.createBuffer({ size: SHARC_CAPACITY * 5 * 4, usage: GPUBufferUsage.STORAGE });
-  const sharcResolvedBuf = device.createBuffer({ size: SHARC_CAPACITY * 4 * 4, usage: GPUBufferUsage.STORAGE });
+  // Extended: +3 u32 per slot for direction accumulation (L1 SH path guiding)
+  const sharcKeysAccumBuf = device.createBuffer({ size: SHARC_CAPACITY * 8 * 4, usage: GPUBufferUsage.STORAGE });
+  const sharcResolvedBuf = device.createBuffer({ size: SHARC_CAPACITY * 7 * 4, usage: GPUBufferUsage.STORAGE });
 
   // PT reads resolved as read-only, writes keys_accum as read_write + ReSTIR buffers
   const bg2Layout = device.createBindGroupLayout({ entries: [
