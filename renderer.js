@@ -234,11 +234,19 @@ async function init() {
     primitive: { topology: 'triangle-list', cullMode: 'none' }, // double-sided
   });
   rlog(`Raster pipeline: ${triCount} tris, ${stats.vertices} verts`);
-  const hdrTex   = device.createTexture({ size:[width,height], format:'rgba16float', usage:F16 });   // temporal accumulated
-  const pingTex  = device.createTexture({ size:[width,height], format:'rgba16float', usage:F16 });   // à-trous ping
-  const pongTex  = device.createTexture({ size:[width,height], format:'rgba16float', usage:F16 });   // à-trous pong
-  const historyA = device.createTexture({ size:[width,height], format:'rgba16float', usage:F16C });   // prev denoised (read)
-  const historyB = device.createTexture({ size:[width,height], format:'rgba16float', usage:F16C });   // prev denoised (write)
+  // Diffuse signal textures
+  const hdrTex   = device.createTexture({ size:[width,height], format:'rgba16float', usage:F16 });   // temporal accumulated diffuse
+  const pingTex  = device.createTexture({ size:[width,height], format:'rgba16float', usage:F16 });   // à-trous ping diffuse
+  const pongTex  = device.createTexture({ size:[width,height], format:'rgba16float', usage:F16 });   // à-trous pong diffuse
+  const historyA = device.createTexture({ size:[width,height], format:'rgba16float', usage:F16C });   // prev denoised diffuse (read)
+  const historyB = device.createTexture({ size:[width,height], format:'rgba16float', usage:F16C });   // prev denoised diffuse (write)
+  // Specular signal textures
+  const specNoisyTex = device.createTexture({ size:[width,height], format:'rgba16float', usage:F16 }); // PT specular output
+  const specHdrTex   = device.createTexture({ size:[width,height], format:'rgba16float', usage:F16 }); // temporal accumulated specular
+  const specPingTex  = device.createTexture({ size:[width,height], format:'rgba16float', usage:F16 }); // à-trous ping specular
+  const specPongTex  = device.createTexture({ size:[width,height], format:'rgba16float', usage:F16 }); // à-trous pong specular
+  const specHistoryA = device.createTexture({ size:[width,height], format:'rgba16float', usage:F16C }); // prev denoised specular
+  const specHistoryB = device.createTexture({ size:[width,height], format:'rgba16float', usage:F16C });
   const ptOutputTex = device.createTexture({
     size:[width,height], format:'rgba8unorm',
     usage: GPUTextureUsage.STORAGE_BINDING | GPUTextureUsage.TEXTURE_BINDING,
@@ -341,6 +349,7 @@ async function init() {
       { binding: 3, visibility: GPUShaderStage.COMPUTE, texture: { sampleType: 'float' } },
       { binding: 4, visibility: GPUShaderStage.COMPUTE, storageTexture: { access: 'write-only', format: 'rgba8unorm' } },
       { binding: 5, visibility: GPUShaderStage.COMPUTE, storageTexture: { access: 'write-only', format: 'rgba16float' } },
+      { binding: 6, visibility: GPUShaderStage.COMPUTE, storageTexture: { access: 'write-only', format: 'rgba16float' } },
     ],
   });
   const bg0 = device.createBindGroup({
@@ -352,6 +361,7 @@ async function init() {
       { binding: 3, resource: matIdTex.createView() },
       { binding: 4, resource: albedoTex.createView() },
       { binding: 5, resource: denoiseNdTex.createView() },
+      { binding: 6, resource: specNoisyTex.createView() },
     ],
   });
 
@@ -488,35 +498,48 @@ async function init() {
   const tmpBuf = device.createBuffer({ size: 160, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
   const tmpLayout = device.createBindGroupLayout({ entries: [
     { binding:0, visibility:GPUShaderStage.COMPUTE, buffer:{type:'uniform'} },
-    { binding:1, visibility:GPUShaderStage.COMPUTE, texture:{sampleType:'float'} },          // current noisy
-    { binding:2, visibility:GPUShaderStage.COMPUTE, texture:{sampleType:'float'} },          // prev denoised
+    { binding:1, visibility:GPUShaderStage.COMPUTE, texture:{sampleType:'float'} },          // current noisy diffuse
+    { binding:2, visibility:GPUShaderStage.COMPUTE, texture:{sampleType:'float'} },          // prev denoised diffuse
     { binding:3, visibility:GPUShaderStage.COMPUTE, texture:{sampleType:'float'} },          // depth (ndTex)
-    { binding:4, visibility:GPUShaderStage.COMPUTE, storageTexture:{access:'write-only',format:'rgba16float'} }, // accum out
-    { binding:5, visibility:GPUShaderStage.COMPUTE, storageTexture:{access:'write-only',format:'rgba16float'} }, // history out
+    { binding:4, visibility:GPUShaderStage.COMPUTE, storageTexture:{access:'write-only',format:'rgba16float'} }, // diff accum out
+    { binding:5, visibility:GPUShaderStage.COMPUTE, storageTexture:{access:'write-only',format:'rgba16float'} }, // diff history out
     { binding:6, visibility:GPUShaderStage.COMPUTE, sampler:{type:'filtering'} },
+    { binding:7, visibility:GPUShaderStage.COMPUTE, texture:{sampleType:'float'} },          // current noisy specular
+    { binding:8, visibility:GPUShaderStage.COMPUTE, texture:{sampleType:'float'} },          // prev denoised specular
+    { binding:9, visibility:GPUShaderStage.COMPUTE, storageTexture:{access:'write-only',format:'rgba16float'} }, // spec accum out
+    { binding:10, visibility:GPUShaderStage.COMPUTE, storageTexture:{access:'write-only',format:'rgba16float'} }, // spec history out
   ]});
   const tmpPipeline = device.createComputePipeline({
     layout: device.createPipelineLayout({ bindGroupLayouts:[tmpLayout] }),
     compute: { module:tmpModule, entryPoint:'temporal' },
   });
   // Two bind groups: frame A reads historyA, writes historyB; frame B reads historyB, writes historyA
+  // Temporal reads pre-blurred data from pingTex/specPingTex (written by preblur pass)
   const tmpBG_A = device.createBindGroup({ layout:tmpLayout, entries:[
     { binding:0, resource:{buffer:tmpBuf} },
-    { binding:1, resource:noisyTex.createView() },
+    { binding:1, resource:pingTex.createView() },           // pre-blurred diffuse
     { binding:2, resource:historyA.createView() },
     { binding:3, resource:denoiseNdTex.createView() },
     { binding:4, resource:hdrTex.createView() },
     { binding:5, resource:historyB.createView() },
     { binding:6, resource:sampler },
+    { binding:7, resource:specPingTex.createView() },       // pre-blurred specular
+    { binding:8, resource:specHistoryA.createView() },
+    { binding:9, resource:specHdrTex.createView() },
+    { binding:10, resource:specHistoryB.createView() },
   ]});
   const tmpBG_B = device.createBindGroup({ layout:tmpLayout, entries:[
     { binding:0, resource:{buffer:tmpBuf} },
-    { binding:1, resource:noisyTex.createView() },
+    { binding:1, resource:pingTex.createView() },           // pre-blurred diffuse
     { binding:2, resource:historyB.createView() },
     { binding:3, resource:denoiseNdTex.createView() },
     { binding:4, resource:hdrTex.createView() },
     { binding:5, resource:historyA.createView() },
     { binding:6, resource:sampler },
+    { binding:7, resource:specPingTex.createView() },       // pre-blurred specular
+    { binding:8, resource:specHistoryB.createView() },
+    { binding:9, resource:specHdrTex.createView() },
+    { binding:10, resource:specHistoryA.createView() },
   ]});
 
   // Previous camera state for temporal reprojection
@@ -535,29 +558,46 @@ async function init() {
   const dnCompParamBuf = device.createBuffer({ size: 16, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
   device.queue.writeBuffer(dnCompParamBuf, 0, new Float32Array([width, height, 0, 0]));
 
-  // À-trous layout: params + input(tex) + output(storage) + normalDepth(tex)
+  // À-trous layout: dual-signal (diffuse + specular) + normals + albedo(roughness)
   const dnAtrousLayout = device.createBindGroupLayout({
     entries: [
       { binding: 0, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'uniform' } },
-      { binding: 1, visibility: GPUShaderStage.COMPUTE, texture: { sampleType: 'float' } },
-      { binding: 2, visibility: GPUShaderStage.COMPUTE, storageTexture: { access: 'write-only', format: 'rgba16float' } },
-      { binding: 3, visibility: GPUShaderStage.COMPUTE, texture: { sampleType: 'float' } },
+      { binding: 1, visibility: GPUShaderStage.COMPUTE, texture: { sampleType: 'float' } },          // diffuse in
+      { binding: 2, visibility: GPUShaderStage.COMPUTE, storageTexture: { access: 'write-only', format: 'rgba16float' } }, // diffuse out
+      { binding: 3, visibility: GPUShaderStage.COMPUTE, texture: { sampleType: 'float' } },          // gbuf normal+depth
+      { binding: 4, visibility: GPUShaderStage.COMPUTE, texture: { sampleType: 'float' } },          // specular in
+      { binding: 5, visibility: GPUShaderStage.COMPUTE, storageTexture: { access: 'write-only', format: 'rgba16float' } }, // specular out
+      { binding: 6, visibility: GPUShaderStage.COMPUTE, texture: { sampleType: 'float' } },          // albedo + roughness
     ],
   });
   const dnAtrousPipeline = device.createComputePipeline({
     layout: device.createPipelineLayout({ bindGroupLayouts: [dnAtrousLayout] }),
     compute: { module: dnModule, entryPoint: 'atrous' },
   });
+  // Pre-blur pipeline: same layout as à-trous, lightweight 3×3 bilateral
+  const preblurPipeline = device.createComputePipeline({
+    layout: device.createPipelineLayout({ bindGroupLayouts: [dnAtrousLayout] }),
+    compute: { module: dnModule, entryPoint: 'preblur' },
+  });
+  // Pre-blur bind group: reads noisyTex+specNoisyTex → writes pingTex+specPingTex
+  const preblurBG = device.createBindGroup({ layout: dnAtrousLayout, entries: [
+    { binding: 0, resource: { buffer: dnParamBufs[0] } }, // step_size=1 (unused by preblur, but layout needs it)
+    { binding: 1, resource: noisyTex.createView() },
+    { binding: 2, resource: pingTex.createView() },
+    { binding: 3, resource: denoiseNdTex.createView() },
+    { binding: 4, resource: specNoisyTex.createView() },
+    { binding: 5, resource: specPingTex.createView() },
+    { binding: 6, resource: albedoTex.createView() },
+  ]});
 
-  // Composite layout: reuses atrous bindings 0-3 + adds binding 4 for LDR output
+  // Composite layout: reads denoised diffuse + specular + albedo → LDR
   const dnCompLayout = device.createBindGroupLayout({
     entries: [
       { binding: 0, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'uniform' } },
-      { binding: 1, visibility: GPUShaderStage.COMPUTE, texture: { sampleType: 'float' } },
-      { binding: 2, visibility: GPUShaderStage.COMPUTE, storageTexture: { access: 'write-only', format: 'rgba16float' } },
-      { binding: 3, visibility: GPUShaderStage.COMPUTE, texture: { sampleType: 'float' } },
-      { binding: 4, visibility: GPUShaderStage.COMPUTE, storageTexture: { access: 'write-only', format: 'rgba8unorm' } },
-      { binding: 5, visibility: GPUShaderStage.COMPUTE, texture: { sampleType: 'float' } }, // albedo for remodulation
+      { binding: 1, visibility: GPUShaderStage.COMPUTE, texture: { sampleType: 'float' } },          // denoised diffuse
+      { binding: 4, visibility: GPUShaderStage.COMPUTE, texture: { sampleType: 'float' } },          // denoised specular
+      { binding: 6, visibility: GPUShaderStage.COMPUTE, texture: { sampleType: 'float' } },          // albedo
+      { binding: 7, visibility: GPUShaderStage.COMPUTE, storageTexture: { access: 'write-only', format: 'rgba8unorm' } }, // LDR out
     ],
   });
   const dnCompPipeline = device.createComputePipeline({
@@ -565,48 +605,54 @@ async function init() {
     compute: { module: dnModule, entryPoint: 'composite' },
   });
 
-  // À-trous ping-pong bind groups:
-  // À-trous ping-pong bind groups for up to 5 passes
-  // Pass 0: hdr→ping, 1: ping→pong, 2: pong→ping, 3: ping→pong, 4: pong→ping
+  // À-trous ping-pong bind groups (dual-signal):
+  // Pass 0: diff hdr→ping, spec specHdr→specPing
+  // Pass 1: diff ping→pong, spec specPing→specPong
+  // Pass 2: diff pong→ping, spec specPong→specPing, etc.
   const dnBGs = [];
   for (let i = 0; i < 5; i++) {
     const isFirst = (i === 0);
-    const readFromPing = (i % 2 === 1); // odd passes read ping
-    const inTex = isFirst ? hdrTex : (readFromPing ? pingTex : pongTex);
-    const outTex = isFirst ? pingTex : (readFromPing ? pongTex : pingTex);
+    const readFromPing = (i % 2 === 1);
+    const dIn = isFirst ? hdrTex : (readFromPing ? pingTex : pongTex);
+    const dOut = isFirst ? pingTex : (readFromPing ? pongTex : pingTex);
+    const sIn = isFirst ? specHdrTex : (readFromPing ? specPingTex : specPongTex);
+    const sOut = isFirst ? specPingTex : (readFromPing ? specPongTex : specPingTex);
     dnBGs.push(device.createBindGroup({ layout: dnAtrousLayout, entries: [
       { binding: 0, resource: { buffer: dnParamBufs[i] } },
-      { binding: 1, resource: inTex.createView() },
-      { binding: 2, resource: outTex.createView() },
+      { binding: 1, resource: dIn.createView() },
+      { binding: 2, resource: dOut.createView() },
       { binding: 3, resource: denoiseNdTex.createView() },
+      { binding: 4, resource: sIn.createView() },
+      { binding: 5, resource: sOut.createView() },
+      { binding: 6, resource: albedoTex.createView() },
     ]}));
   }
-  // For spatial-only: first pass reads noisy instead of hdr
+  // For spatial-only: first pass reads noisy directly
   const dnBG_noisy_first = device.createBindGroup({ layout: dnAtrousLayout, entries: [
     { binding: 0, resource: { buffer: dnParamBufs[0] } },
     { binding: 1, resource: noisyTex.createView() },
     { binding: 2, resource: pingTex.createView() },
     { binding: 3, resource: denoiseNdTex.createView() },
+    { binding: 4, resource: specNoisyTex.createView() },
+    { binding: 5, resource: specPingTex.createView() },
+    { binding: 6, resource: albedoTex.createView() },
   ]});
-  // Final output is in ping (even passes) or pong (odd passes)
   const dnFinalInPing = (denoisePasses % 2 === 1); // 3 passes → ping, 4 → pong, 5 → ping
-  // Composite reads from the final denoised buffer (ping or pong depending on pass count)
+  // Composite: reads final denoised diffuse + specular + albedo
   const dnBG_comp = device.createBindGroup({ layout: dnCompLayout, entries: [
     { binding: 0, resource: { buffer: dnCompParamBuf } },
     { binding: 1, resource: (dnFinalInPing ? pingTex : pongTex).createView() },
-    { binding: 2, resource: pongTex.createView() },
-    { binding: 3, resource: denoiseNdTex.createView() },
-    { binding: 4, resource: ptOutputTex.createView() },
-    { binding: 5, resource: albedoTex.createView() },
+    { binding: 4, resource: (dnFinalInPing ? specPingTex : specPongTex).createView() },
+    { binding: 6, resource: albedoTex.createView() },
+    { binding: 7, resource: ptOutputTex.createView() },
   ]});
-  // Raw mode: composite reads noisy directly
+  // Raw mode: composite reads noisy directly (no denoise)
   const dnBG_comp_noisy = device.createBindGroup({ layout: dnCompLayout, entries: [
     { binding: 0, resource: { buffer: dnCompParamBuf } },
     { binding: 1, resource: noisyTex.createView() },
-    { binding: 2, resource: pongTex.createView() },
-    { binding: 3, resource: denoiseNdTex.createView() },
-    { binding: 4, resource: ptOutputTex.createView() },
-    { binding: 5, resource: albedoTex.createView() },
+    { binding: 4, resource: specNoisyTex.createView() },
+    { binding: 6, resource: albedoTex.createView() },
+    { binding: 7, resource: ptOutputTex.createView() },
   ]});
 
   // --- Display pipeline (reads FSR final output) ---
@@ -1246,7 +1292,7 @@ async function init() {
 
     // Write temporal uniforms (current + previous camera)
     const td = new Float32Array(40); // 10 vec4f
-    td[0] = width; td[1] = height; td[2] = settings.temporalAlpha; td[3] = 0;
+    td[0] = width; td[1] = height; td[2] = settings.temporalAlpha; td[3] = framesStill;
     td[4]=right[0];td[5]=right[1];td[6]=right[2];td[7]=0;         // cam_right
     td[8]=up[0];td[9]=up[1];td[10]=up[2];td[11]=0;                // cam_up
     td[12]=forward[0];td[13]=forward[1];td[14]=forward[2];td[15]=0;// cam_fwd
@@ -1255,7 +1301,7 @@ async function init() {
     td[24]=prevCam.up[0];td[25]=prevCam.up[1];td[26]=prevCam.up[2];td[27]=0;
     td[28]=prevCam.fwd[0];td[29]=prevCam.fwd[1];td[30]=prevCam.fwd[2];td[31]=0;
     td[32]=prevCam.pos[0];td[33]=prevCam.pos[1];td[34]=prevCam.pos[2];td[35]=0;
-    td[36]=fovFactor;td[37]=aspect;td[38]=0;td[39]=0;
+    td[36]=fovFactor;td[37]=aspect;td[38]=0.1;td[39]=512.0; // depth_reject_scale, max_history
     device.queue.writeBuffer(tmpBuf, 0, td);
 
     // Save current camera as previous for next frame
@@ -1299,6 +1345,15 @@ async function init() {
       }
 
       if (denoiseMode === 'full') {
+        // Pre-blur: lightweight 3×3 bilateral → stabilizes temporal AABB + removes fireflies
+        // noisy → pingTex, specNoisy → specPingTex (temporal reads from ping)
+        const pbPass = encoder.beginComputePass();
+        pbPass.setPipeline(preblurPipeline);
+        pbPass.setBindGroup(0, preblurBG);
+        pbPass.dispatchWorkgroups(Math.ceil(width/8), Math.ceil(height/8));
+        pbPass.end();
+
+        // Temporal reprojection: reads pre-blurred ping → writes hdrTex
         const tmpPass = encoder.beginComputePass();
         tmpPass.setPipeline(tmpPipeline);
         tmpPass.setBindGroup(0, historyFrame === 0 ? tmpBG_A : tmpBG_B);
@@ -1308,6 +1363,10 @@ async function init() {
       }
 
       if (denoiseMode !== 'off') {
+        // Update denoise params with framesStill for motion-adaptive filtering
+        for (let di = 0; di < denoisePasses; di++) {
+          device.queue.writeBuffer(dnParamBufs[di], 0, new Float32Array([width, height, dnSteps[di], framesStill]));
+        }
         // Variance-guided à-trous (GPU profile controls pass count: 3-5)
         for (let di = 0; di < denoisePasses; di++) {
           const bg = (di === 0 && denoiseMode !== 'full') ? dnBG_noisy_first : dnBGs[di];

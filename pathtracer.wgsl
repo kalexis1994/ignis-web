@@ -42,6 +42,7 @@ struct HitInfo { t: f32, u: f32, v: f32, tri_idx: u32, hit: bool, };
 @group(0) @binding(3) var gbuf_mat_uv: texture_2d<f32>;
 @group(0) @binding(4) var albedo_out: texture_storage_2d<rgba8unorm, write>;
 @group(0) @binding(5) var denoise_nd_out: texture_storage_2d<rgba16float, write>;
+@group(0) @binding(6) var specular_out: texture_storage_2d<rgba16float, write>;
 // accumulation handled by temporal pass (no extra buffer needed)
 
 @group(1) @binding(0) var<storage, read> vertices: array<vec4f>;
@@ -288,6 +289,45 @@ fn eval_cook_torrance(N: vec3f, V: vec3f, L: vec3f, baseColor: vec3f, roughness:
   return (kd * baseColor * INV_PI + spec) * NdotL;
 }
 
+// Split BRDF evaluation: returns demodulated diffuse irradiance + specular radiance separately
+struct BRDFSplit { diffuse: vec3f, specular: vec3f, };
+
+fn eval_ct_split(N: vec3f, V: vec3f, L: vec3f, baseColor: vec3f, roughness: f32, metallic: f32) -> BRDFSplit {
+  let NdotL = max(dot(N, L), 0.0);
+  let NdotV = max(dot(N, V), 0.001);
+  if NdotL <= 0.0 { return BRDFSplit(vec3f(0.0), vec3f(0.0)); }
+  let H = normalize(V + L);
+  let NdotH = max(dot(N, H), 0.0);
+  let VdotH = max(dot(V, H), 0.0);
+  let alpha = max(roughness * roughness, 0.001);
+  let F0 = mix(vec3f(0.04), baseColor, metallic);
+  let F = fresnel_real(VdotH, F0);
+  let D = ggx_d(NdotH, alpha);
+  let G = smith_g1(NdotL, alpha) * smith_g1(NdotV, alpha);
+  let spec = (D * G * F) / max(4.0 * NdotV * NdotL, 0.001);
+  let kd = (1.0 - F) * (1.0 - metallic);
+  return BRDFSplit(
+    vec3f(kd * INV_PI) * NdotL,   // diffuse irradiance (demodulated: no baseColor)
+    spec * NdotL                   // specular radiance (includes F0 color)
+  );
+}
+
+fn sample_sun_nee_split(pos: vec3f, normal: vec3f, V: vec3f, baseColor: vec3f, roughness: f32, metallic: f32) -> BRDFSplit {
+  let origin = pos + normal * BIAS;
+  var shadow_val = 0.0;
+  let L1 = sample_cone(g_sun_dir, COS_SUN_ANGLE);
+  let L2 = sample_cone(g_sun_dir, COS_SUN_ANGLE);
+  if !trace_shadow(origin, L1, 50.0) { shadow_val += 0.5; }
+  if !trace_shadow(origin, L2, 50.0) { shadow_val += 0.5; }
+  if shadow_val <= 0.0 { return BRDFSplit(vec3f(0.0), vec3f(0.0)); }
+  let L = normalize(L1 + L2);
+  let cos_theta = dot(normal, L);
+  if cos_theta <= 0.0 { return BRDFSplit(vec3f(0.0), vec3f(0.0)); }
+  let brdf = eval_ct_split(normal, V, L, baseColor, roughness, metallic);
+  let light = SUN_COLOR * SUN_MULT * SUN_SOLID_ANGLE * shadow_val;
+  return BRDFSplit(brdf.diffuse * light, brdf.specular * light);
+}
+
 // ============================================================
 // Ray-AABB + Triangle intersection
 // ============================================================
@@ -516,7 +556,7 @@ fn apply_normal_map(td: vec4u, N: vec3f, uv: vec2f, tex_idx: i32) -> vec3f {
 // Path tracing with PBR BRDF + texture sampling
 // Returns radiance; writes first-hit normal+depth to out params
 // ============================================================
-struct PathResult { color: vec3f, normal: vec3f, depth: f32, hit_pos: vec3f, direct: vec3f, tri_idx: u32, bary: vec2f, albedo: vec3f, };
+struct PathResult { diffuse: vec3f, specular: vec3f, normal: vec3f, depth: f32, hit_pos: vec3f, direct: vec3f, tri_idx: u32, bary: vec2f, albedo: vec3f, roughness: f32, hit_dist: f32, };
 
 var<private> g_depth_hint: f32; // G-buffer depth hint for first bounce acceleration
 
@@ -526,17 +566,30 @@ fn path_trace(primary_origin: vec3f, primary_dir: vec3f) -> PathResult {
   result.depth = 1e6;
   result.hit_pos = vec3f(0.0);
   result.direct = vec3f(0.0);
+  result.albedo = vec3f(1.0);  // default white (sky/miss pixels)
+  result.roughness = 1.0;
+  result.hit_dist = 1e4;      // default far (sky/no indirect)
 
+  var diff_rad = vec3f(0.0);   // demodulated diffuse irradiance
+  var spec_rad = vec3f(0.0);   // specular radiance
   var throughput = vec3f(1.0);
-  var radiance = vec3f(0.0);
   var origin = primary_origin;
   var dir = primary_dir;
   var specular_bounce = true;
+  var is_diffuse_path = true;  // set at bounce 0 based on BRDF sampling
 
   for (var bounce = 0u; bounce < uniforms.max_bounces; bounce++) {
-    // TODO: re-enable depth hint once raster projection matches compute
     let hit = trace_bvh(origin, dir);
-    if !hit.hit { radiance += throughput * sky_color(dir); break; }
+    if !hit.hit {
+      let sky = throughput * sky_color(dir);
+      // Sky at bounce 0: no surface → specular (not multiplied by albedo in composite)
+      if bounce == 0u || !is_diffuse_path { spec_rad += sky; }
+      else { diff_rad += sky; }
+      break;
+    }
+
+    // Capture first indirect bounce hit distance (for denoiser blur radius)
+    if bounce == 1u { result.hit_dist = hit.t; }
 
     let td = tri_data[hit.tri_idx];
     let mat = material_buf[td.w];
@@ -561,11 +614,6 @@ fn path_trace(primary_origin: vec3f, primary_dir: vec3f) -> PathResult {
       tex_alpha = tc.a;
     }
 
-    // For BLEND: stochastic already converges to correct alpha coverage.
-    // But premultiply base_color by alpha to handle decals with black RGB + low alpha.
-    // Without this, accepted low-alpha hits contribute full black instead of near-nothing.
-    // BLEND materials skipped in BVH — ray passes through to surface behind
-
     // Sample metallic-roughness texture (G=roughness, B=metallic per GLTF spec)
     var metallic = mat.metallic;
     var roughness = mat.roughness;
@@ -587,47 +635,61 @@ fn path_trace(primary_origin: vec3f, primary_dir: vec3f) -> PathResult {
     }
 
     // Capture first-hit G-buffer data
-    if bounce == 0u { result.normal = normal; result.depth = hit.t; result.hit_pos = hit_pos; result.tri_idx = hit.tri_idx; result.bary = vec2f(hit.u, hit.v); result.albedo = base_color; }
+    if bounce == 0u {
+      result.normal = normal; result.depth = hit.t; result.hit_pos = hit_pos;
+      result.tri_idx = hit.tri_idx; result.bary = vec2f(hit.u, hit.v);
+      result.albedo = base_color; result.roughness = roughness;
+    }
 
     // Emission
     if mat_type == 2u {
-      if specular_bounce { radiance += throughput * mat.emission; }
+      if specular_bounce {
+        let e = throughput * mat.emission;
+        if bounce == 0u { spec_rad += e; }
+        else if is_diffuse_path { diff_rad += e; }
+        else { spec_rad += e; }
+      }
       break;
     }
 
-    // NEE: sun direct lighting
-    let direct = sample_sun_nee(hit_pos, normal, V, base_color, roughness, metallic);
-    radiance += throughput * direct;
-
-    if bounce == 0u { result.direct = direct; }
+    // NEE: sun direct lighting — split at bounce 0
+    if bounce == 0u {
+      let nee = sample_sun_nee_split(hit_pos, normal, V, base_color, roughness, metallic);
+      diff_rad += nee.diffuse;
+      spec_rad += nee.specular;
+      result.direct = nee.diffuse * base_color + nee.specular; // combined for SHaRC
+    } else {
+      let direct = sample_sun_nee(hit_pos, normal, V, base_color, roughness, metallic);
+      if is_diffuse_path { diff_rad += throughput * direct; }
+      else { spec_rad += throughput * direct; }
+    }
 
     // Bounce 1+: try SHaRC cache for indirect GI
     if bounce >= 1u && mat_type != 3u {
       let cached_gi = sharc_read_cached(hit_pos, normal);
       let has_cache = dot(cached_gi, vec3f(1.0)) > 0.001;
       if has_cache {
-        radiance += throughput * cached_gi * base_color;
+        let gi = throughput * cached_gi * base_color;
+        if is_diffuse_path { diff_rad += gi; } else { spec_rad += gi; }
         break;
       }
-      // No cache — do NEE at indirect point
       let indirect_direct = sample_sun_nee(hit_pos, normal, V, base_color, roughness, metallic);
-      radiance += throughput * indirect_direct;
+      let ind = throughput * indirect_direct;
+      if is_diffuse_path { diff_rad += ind; } else { spec_rad += ind; }
 
-      // Last bounce: add sky hemisphere irradiance instead of letting energy die
-      // This is the integral of sky_color over the visible hemisphere, weighted by cos(theta)
-      // Physically correct — it's what the ray would collect if we had infinite bounces
       if bounce >= uniforms.max_bounces - 1u {
-        let sky_up = sky_color(normal);       // sky in normal direction
-        let sky_side = sky_color(vec3f(normal.x, 0.0, normal.z)); // horizon contribution
+        let sky_up = sky_color(normal);
+        let sky_side = sky_color(vec3f(normal.x, 0.0, normal.z));
         let sky_irr = mix(sky_side, sky_up, max(normal.y, 0.0)) * INV_PI;
-        radiance += throughput * sky_irr * base_color * (1.0 - metallic);
+        let s = throughput * sky_irr * base_color * (1.0 - metallic);
+        if is_diffuse_path { diff_rad += s; } else { spec_rad += s; }
         break;
       }
     }
 
-    // BRDF sampling
+    // BRDF sampling — at bounce 0, classify path and demodulate diffuse throughput
     if mat_type == 3u {
-      // Glass
+      // Glass → specular path
       let ior = mat.ior;
       var eta = select(ior, 1.0 / ior, front_face);
       let cos_theta = min(dot(V, normal), 1.0);
@@ -642,9 +704,10 @@ fn path_trace(primary_origin: vec3f, primary_dir: vec3f) -> PathResult {
       }
       throughput *= base_color;
       specular_bounce = true;
+      if bounce == 0u { is_diffuse_path = false; }
       continue;
     } else if metallic > 0.5 {
-      // Metal / specular-dominant: GGX VNDF sampling
+      // Metal / specular-dominant: GGX VNDF sampling → specular path
       let alpha = max(roughness * roughness, 0.001);
       let H = sample_ggx_vndf(rand2(), V, normal, alpha);
       dir = reflect(-V, H);
@@ -655,11 +718,17 @@ fn path_trace(primary_origin: vec3f, primary_dir: vec3f) -> PathResult {
       let G1_L = smith_g1(max(dot(normal, dir), 0.0), alpha);
       throughput *= F * G1_L;
       specular_bounce = roughness < 0.1;
+      if bounce == 0u { is_diffuse_path = false; }
     } else {
-      // Dielectric: cosine hemisphere sampling
+      // Dielectric: cosine hemisphere → diffuse path
       dir = cosine_sample_hemisphere(normal);
       if dot(normal, dir) <= 0.0 { break; }
-      throughput *= base_color * (1.0 - metallic);
+      if bounce == 0u {
+        is_diffuse_path = true;
+        throughput *= vec3f(1.0 - metallic); // demodulated: no base_color
+      } else {
+        throughput *= base_color * (1.0 - metallic);
+      }
       specular_bounce = false;
     }
 
@@ -672,7 +741,8 @@ fn path_trace(primary_origin: vec3f, primary_dir: vec3f) -> PathResult {
       throughput /= p;
     }
   }
-  result.color = radiance;
+  result.diffuse = diff_rad;
+  result.specular = spec_rad;
   return result;
 }
 
@@ -793,11 +863,14 @@ fn main(@builtin(global_invocation_id) gid: vec3u) {
 
 
 
-  var color = pt.color;
+  var diff_color = pt.diffuse;
+  var spec_color = pt.specular;
 
-  // Firefly clamp
-  let lum = dot(color, vec3f(0.2126, 0.7152, 0.0722));
-  if lum > MAX_FIREFLY_LUM { color *= MAX_FIREFLY_LUM / lum; }
+  // Firefly clamp (per-signal)
+  let dl = dot(diff_color, vec3f(0.2126, 0.7152, 0.0722));
+  if dl > MAX_FIREFLY_LUM { diff_color *= MAX_FIREFLY_LUM / dl; }
+  let sl = dot(spec_color, vec3f(0.2126, 0.7152, 0.0722));
+  if sl > MAX_FIREFLY_LUM { spec_color *= MAX_FIREFLY_LUM / sl; }
 
   // SHaRC sparse update: 4% of pixels write direct lighting to cache
   if pt.depth < 1e5 {
@@ -809,15 +882,17 @@ fn main(@builtin(global_invocation_id) gid: vec3u) {
     }
   }
 
-  // Write raw 1 SPP — temporal pass handles all accumulation
-  // Demodulate: separate irradiance from albedo for denoiser
-  // Skip demodulation for very dark albedo (BLEND decals, emissives)
-  // to avoid division explosion
-  // Adreno: clamp to fp16 range before textureStore (values >65504 produce artifacts)
-  color = min(color, vec3f(65000.0));
+  // Adreno: clamp to fp16 range (values >65504 produce artifacts)
+  diff_color = min(diff_color, vec3f(65000.0));
+  spec_color = min(spec_color, vec3f(65000.0));
 
-  // Raw 1SPP — temporal pass handles accumulation via history blend
-  textureStore(noisy_out, vec2i(pixel), vec4f(color, 1.0));
-  textureStore(albedo_out, vec2i(pixel), vec4f(1.0, 1.0, 1.0, 1.0));
+  // Diffuse irradiance (demodulated: no first-hit albedo) + specular radiance
+  // Normalize hit distance logarithmically: 0 = contact shadow, 1 = far/sky
+  let norm_hit_dist = clamp(log2(pt.hit_dist + 1.0) / 8.0, 0.0, 1.0);
+
+  textureStore(noisy_out, vec2i(pixel), vec4f(diff_color, 1.0));
+  textureStore(specular_out, vec2i(pixel), vec4f(spec_color, norm_hit_dist));
+  // Albedo.rgb for diffuse remodulation, .a = roughness for specular filter
+  textureStore(albedo_out, vec2i(pixel), vec4f(pt.albedo, pt.roughness));
   textureStore(denoise_nd_out, vec2i(pixel), vec4f(pt.normal, pt.depth));
 }
