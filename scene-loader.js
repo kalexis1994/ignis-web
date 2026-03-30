@@ -593,14 +593,48 @@ export async function loadScene(basePath, onProgress) {
   }
 
   // Collect emissive triangle indices for NEE
-  const emissiveTris = [];
+  // Build emissive triangle buffer (ignis-rt format):
+  // 4 vec4 per tri: [v0.xyz,area] [v1.xyz,CDF] [v2.xyz,totalPower] [emission.rgb,0]
+  // Sorted by power, CDF for importance sampling, max 256 triangles
+  const MAX_EMISSIVE = 256;
+  const emissiveCandidates = [];
   for (let i = 0; i < totalTris; i++) {
     const matIdx = bvh.sortedTriData[i * 4 + 3];
-    if (matIdx < materials.length && materials[matIdx].type === 2) {
-      emissiveTris.push(i);
-    }
+    if (matIdx >= materials.length || materials[matIdx].type !== 2) continue;
+    const m = materials[matIdx];
+    const vi0 = bvh.sortedTriData[i * 4], vi1 = bvh.sortedTriData[i * 4 + 1], vi2 = bvh.sortedTriData[i * 4 + 2];
+    const v0 = [allPos[vi0*3], allPos[vi0*3+1], allPos[vi0*3+2]];
+    const v1 = [allPos[vi1*3], allPos[vi1*3+1], allPos[vi1*3+2]];
+    const v2 = [allPos[vi2*3], allPos[vi2*3+1], allPos[vi2*3+2]];
+    const e1 = [v1[0]-v0[0], v1[1]-v0[1], v1[2]-v0[2]];
+    const e2 = [v2[0]-v0[0], v2[1]-v0[1], v2[2]-v0[2]];
+    const cx = e1[1]*e2[2]-e1[2]*e2[1], cy = e1[2]*e2[0]-e1[0]*e2[2], cz = e1[0]*e2[1]-e1[1]*e2[0];
+    const area = 0.5 * Math.sqrt(cx*cx + cy*cy + cz*cz);
+    if (area < 1e-8) continue;
+    // Store color only (no strength) — shader reads live strength from material_buf
+    const em = [m.emission[0], m.emission[1], m.emission[2]];
+    const str = m.emissionStrength || 1;
+    const lum = 0.2126*em[0]*str + 0.7152*em[1]*str + 0.0722*em[2]*str;
+    const power = area * lum;
+    if (power < 1e-6) continue;
+    emissiveCandidates.push({ power, v0, v1, v2, area, em, matIdx });
   }
-  const gpuEmissiveTris = new Uint32Array(emissiveTris.length > 0 ? emissiveTris : [0]);
+  // Sort by power descending, keep top MAX_EMISSIVE
+  emissiveCandidates.sort((a, b) => b.power - a.power);
+  const emissiveCount = Math.min(emissiveCandidates.length, MAX_EMISSIVE);
+  const totalPower = emissiveCandidates.slice(0, emissiveCount).reduce((s, t) => s + t.power, 0);
+
+  // Build GPU buffer: 16 floats per triangle
+  const gpuEmissiveTris = new Float32Array(Math.max(emissiveCount * 16, 16));
+  let cumulative = 0;
+  for (let i = 0; i < emissiveCount; i++) {
+    const t = emissiveCandidates[i], o = i * 16;
+    cumulative += t.power / totalPower;
+    gpuEmissiveTris[o+0] = t.v0[0]; gpuEmissiveTris[o+1] = t.v0[1]; gpuEmissiveTris[o+2] = t.v0[2]; gpuEmissiveTris[o+3] = t.area;
+    gpuEmissiveTris[o+4] = t.v1[0]; gpuEmissiveTris[o+5] = t.v1[1]; gpuEmissiveTris[o+6] = t.v1[2]; gpuEmissiveTris[o+7] = cumulative;
+    gpuEmissiveTris[o+8] = t.v2[0]; gpuEmissiveTris[o+9] = t.v2[1]; gpuEmissiveTris[o+10]= t.v2[2]; gpuEmissiveTris[o+11]= totalPower;
+    gpuEmissiveTris[o+12]= t.em[0]; gpuEmissiveTris[o+13]= t.em[1]; gpuEmissiveTris[o+14]= t.em[2]; gpuEmissiveTris[o+15]= t.matIdx;
+  }
 
   // Scene bounding box for camera
   let sceneMin = [1e30,1e30,1e30], sceneMax = [-1e30,-1e30,-1e30];
@@ -628,7 +662,7 @@ export async function loadScene(basePath, onProgress) {
     vertices: totalVerts,
     bvhNodes: bvh.nodeCount,
     materials: materials.length,
-    emissiveTris: emissiveTris.length,
+    emissiveTris: emissiveCount,
     sceneMin, sceneMax,
   };
 

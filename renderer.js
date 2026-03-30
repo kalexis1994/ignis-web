@@ -913,7 +913,7 @@ async function init() {
     if (isEmissive) {
       html += `
         <div style="margin-top:8px; padding-top:8px; border-top:1px solid rgba(255,255,255,0.05);">
-          ${sliderRow('Strength', m[o+15], 0.1, 5000, 1)}
+          ${sliderRow('Strength', m[o+15], 0, 100, 0.1)}
           ${sliderRow('Emission R', m[o+4], 0, 1, 0.01)}
           ${sliderRow('Emission G', m[o+5], 0, 1, 0.01)}
           ${sliderRow('Emission B', m[o+6], 0, 1, 0.01)}

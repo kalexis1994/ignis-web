@@ -59,7 +59,8 @@ struct HitInfo { t: f32, u: f32, v: f32, tri_idx: u32, hit: bool, };
 @group(1) @binding(2) var<storage, read> tri_data: array<vec4u>;
 @group(1) @binding(3) var<storage, read> bvh_nodes: array<BVHNode>;
 @group(1) @binding(4) var<storage, read> material_buf: array<Material>;
-@group(1) @binding(5) var<storage, read> emissive_tris: array<u32>;
+// Emissive tris: 4 vec4f each [v0.xyz+area, v1.xyz+CDF, v2.xyz+totalPower, emission.rgb+0]
+@group(1) @binding(5) var<storage, read> emissive_tris: array<vec4f>;
 // SHaRC radiance cache — packed into 2 buffers to fit 8 storage buffer limit
 // keys_accum: [0..cap) = hash keys (atomic), [cap..cap*5) = accum RGBS (atomic)
 // resolved: [0..cap*4) = resolved RGBS (read-only from PT)
@@ -475,44 +476,57 @@ fn eval_ct_split(N: vec3f, V: vec3f, L: vec3f, baseColor: vec3f, roughness: f32,
 
 fn sample_sun_nee_split(pos: vec3f, normal: vec3f, V: vec3f, baseColor: vec3f, roughness: f32, metallic: f32) -> BRDFSplit {
   let origin = pos + normal * BIAS;
+  var result_split = BRDFSplit(vec3f(0.0), vec3f(0.0));
+
+  // Sun NEE
   var shadow_val = 0.0;
   let L1 = sample_cone(g_sun_dir, COS_SUN_ANGLE);
   let L2 = sample_cone(g_sun_dir, COS_SUN_ANGLE);
   if !trace_shadow(origin, L1, 50.0) { shadow_val += 0.5; }
   if !trace_shadow(origin, L2, 50.0) { shadow_val += 0.5; }
-  if shadow_val <= 0.0 { return BRDFSplit(vec3f(0.0), vec3f(0.0)); }
-  let L = normalize(L1 + L2);
-  let cos_theta = dot(normal, L);
-  if cos_theta <= 0.0 { return BRDFSplit(vec3f(0.0), vec3f(0.0)); }
-  let brdf = eval_ct_split(normal, V, L, baseColor, roughness, metallic);
-  let light = SUN_COLOR * SUN_MULT * SUN_SOLID_ANGLE * shadow_val;
-  var result_split = BRDFSplit(brdf.diffuse * light, brdf.specular * light);
+  if shadow_val > 0.0 {
+    let L = normalize(L1 + L2);
+    let cos_theta = dot(normal, L);
+    if cos_theta > 0.0 {
+      let brdf = eval_ct_split(normal, V, L, baseColor, roughness, metallic);
+      let light = SUN_COLOR * SUN_MULT * SUN_SOLID_ANGLE * shadow_val;
+      result_split = BRDFSplit(brdf.diffuse * light, brdf.specular * light);
+    }
+  }
 
-  // NEE to emissive triangles (split diffuse/specular)
+  // NEE to emissive triangles (CDF importance sampling + MIS, split)
   if uniforms.emissive_tri_count > 0u {
-    let eidx = emissive_tris[u32(rand() * f32(uniforms.emissive_tri_count)) % uniforms.emissive_tri_count];
-    let etd = tri_data[eidx];
-    let emat = material_buf[etd.w];
-    let ev0 = vertices[etd.x].xyz;
-    let ev1 = vertices[etd.y].xyz;
-    let ev2 = vertices[etd.z].xyz;
-    var eu = rand(); var ev = rand();
-    if eu + ev > 1.0 { eu = 1.0 - eu; ev = 1.0 - ev; }
-    let epos = ev0 * (1.0 - eu - ev) + ev1 * eu + ev2 * ev;
-    let eedge1 = ev1 - ev0; let eedge2 = ev2 - ev0;
-    let ecross = cross(eedge1, eedge2);
-    let earea = length(ecross) * 0.5;
-    let enormal = ecross / max(length(ecross), 1e-8);
+    let rnd = rand();
+    var lo = 0u; var hi = uniforms.emissive_tri_count - 1u;
+    while lo < hi {
+      let mid = (lo + hi) / 2u;
+      if rnd <= emissive_tris[mid * 4u + 1u].w { hi = mid; } else { lo = mid + 1u; }
+    }
+    let base = lo * 4u;
+    let d0 = emissive_tris[base]; let d1 = emissive_tris[base+1u];
+    let d2 = emissive_tris[base+2u]; let d3 = emissive_tris[base+3u];
+    let ev0 = d0.xyz; let ev1 = d1.xyz; let ev2 = d2.xyz;
+    let earea = d0.w;
+    // Read live emission strength from material buffer (editable at runtime)
+    let ematIdx = u32(d3.w + 0.5);
+    let estrength = material_buf[ematIdx].emission_strength;
+    let eemission = d3.xyz * estrength;
+    let prevCdf = select(emissive_tris[(lo - 1u) * 4u + 1u].w, 0.0, lo == 0u);
+    let triProb = d1.w - prevCdf;
+    var eu = rand(); var ev_r = rand();
+    if eu + ev_r > 1.0 { eu = 1.0 - eu; ev_r = 1.0 - ev_r; }
+    let epos = ev0 * (1.0 - eu - ev_r) + ev1 * eu + ev2 * ev_r;
+    let enormal = normalize(cross(ev1 - ev0, ev2 - ev0));
     let eto = epos - pos;
     let edist = length(eto);
     let edir = eto / max(edist, 1e-6);
     let endotl = dot(normal, edir);
     let ecos_theta = dot(-edir, enormal);
     if endotl > 0.0 && ecos_theta > 0.0 && edist > 0.01 && earea > 1e-6 {
-      if !trace_shadow_skip_mat(origin, edir, edist - 0.01, etd.w) {
+      if !trace_shadow_skip_mat(origin, edir, edist - 0.01, ematIdx) {
         let ebrdf = eval_ct_split(normal, V, edir, baseColor, roughness, metallic);
-        let eradiance = emat.emission * emat.emission_strength * ecos_theta / (edist * edist);
-        let light_pdf = (1.0 / f32(uniforms.emissive_tri_count)) / earea;
+        let eradiance = eemission * ecos_theta / (edist * edist);
+        let light_pdf = triProb / earea;
         let sa_pdf = light_pdf * edist * edist / ecos_theta;
         let bsdf_pdf = endotl * INV_PI;
         let mis_w = (sa_pdf * sa_pdf) / (sa_pdf * sa_pdf + bsdf_pdf * bsdf_pdf + 1e-8);
@@ -709,56 +723,61 @@ fn sky_color(dir: vec3f) -> vec3f {
 }
 
 fn sample_sun_nee(pos: vec3f, normal: vec3f, V: vec3f, baseColor: vec3f, roughness: f32, metallic: f32) -> vec3f {
-  // 2 jittered shadow rays averaged (ignis-rt technique)
   let origin = pos + normal * BIAS;
+  var result = vec3f(0.0);
+
+  // Sun NEE: 2 jittered shadow rays averaged
   var shadow_val = 0.0;
   let L1 = sample_cone(g_sun_dir, COS_SUN_ANGLE);
   let L2 = sample_cone(g_sun_dir, COS_SUN_ANGLE);
   if !trace_shadow(origin, L1, 50.0) { shadow_val += 0.5; }
   if !trace_shadow(origin, L2, 50.0) { shadow_val += 0.5; }
-  if shadow_val <= 0.0 { return vec3f(0.0); }
+  if shadow_val > 0.0 {
+    let L = normalize(L1 + L2);
+    let cos_theta = dot(normal, L);
+    if cos_theta > 0.0 {
+      result = SUN_COLOR * SUN_MULT * eval_cook_torrance(normal, V, L, baseColor, roughness, metallic) * SUN_SOLID_ANGLE * shadow_val;
+    }
+  }
 
-  let L = normalize(L1 + L2);
-  let cos_theta = dot(normal, L);
-  if cos_theta <= 0.0 { return vec3f(0.0); }
-  var result = SUN_COLOR * SUN_MULT * eval_cook_torrance(normal, V, L, baseColor, roughness, metallic) * SUN_SOLID_ANGLE * shadow_val;
-
-  // NEE to emissive triangles (MIS, ported from ignis-rt)
+  // NEE to emissive triangles (CDF importance sampling + MIS, ignis-rt format)
   if uniforms.emissive_tri_count > 0u {
-    // Select random emissive triangle (uniform probability)
-    let eidx = emissive_tris[u32(rand() * f32(uniforms.emissive_tri_count)) % uniforms.emissive_tri_count];
-    let etd = tri_data[eidx];
-    let emat = material_buf[etd.w];
-    let ev0 = vertices[etd.x].xyz;
-    let ev1 = vertices[etd.y].xyz;
-    let ev2 = vertices[etd.z].xyz;
+    // CDF binary search: select triangle proportional to power (area × luminance)
+    let rnd = rand();
+    var lo = 0u; var hi = uniforms.emissive_tri_count - 1u;
+    while lo < hi {
+      let mid = (lo + hi) / 2u;
+      let cdf = emissive_tris[mid * 4u + 1u].w; // d1.w = CDF
+      if rnd <= cdf { hi = mid; } else { lo = mid + 1u; }
+    }
+    let eti = lo;
+    let base = eti * 4u;
+    let d0 = emissive_tris[base]; let d1 = emissive_tris[base+1u];
+    let d2 = emissive_tris[base+2u]; let d3 = emissive_tris[base+3u];
+    let ev0 = d0.xyz; let ev1 = d1.xyz; let ev2 = d2.xyz;
+    let earea = d0.w;
+    let ematIdx2 = u32(d3.w + 0.5);
+    let estrength2 = material_buf[ematIdx2].emission_strength;
+    let eemission = d3.xyz * estrength2;
+    let prevCdf = select(emissive_tris[(eti - 1u) * 4u + 1u].w, 0.0, eti == 0u);
+    let triProb = d1.w - prevCdf;
 
-    // Random point on emissive triangle (uniform barycentric)
-    var eu = rand(); var ev = rand();
-    if eu + ev > 1.0 { eu = 1.0 - eu; ev = 1.0 - ev; }
-    let epos = ev0 * (1.0 - eu - ev) + ev1 * eu + ev2 * ev;
+    var eu = rand(); var ev_r = rand();
+    if eu + ev_r > 1.0 { eu = 1.0 - eu; ev_r = 1.0 - ev_r; }
+    let epos = ev0 * (1.0 - eu - ev_r) + ev1 * eu + ev2 * ev_r;
+    let enormal = normalize(cross(ev1 - ev0, ev2 - ev0));
 
-    // Triangle area and normal
-    let eedge1 = ev1 - ev0;
-    let eedge2 = ev2 - ev0;
-    let ecross = cross(eedge1, eedge2);
-    let earea = length(ecross) * 0.5;
-    let enormal = ecross / max(length(ecross), 1e-8);
-
-    // Direction and distance to emissive point
     let eto = epos - pos;
     let edist = length(eto);
     let edir = eto / max(edist, 1e-6);
-
-    // Geometric checks: facing, distance
     let endotl = dot(normal, edir);
     let ecos_theta = dot(-edir, enormal);
 
     if endotl > 0.0 && ecos_theta > 0.0 && edist > 0.01 && earea > 1e-6 {
-      if !trace_shadow_skip_mat(origin, edir, edist - 0.01, etd.w) {
+      if !trace_shadow_skip_mat(origin, edir, edist - 0.01, ematIdx2) {
         let ebrdf = eval_cook_torrance(normal, V, edir, baseColor, roughness, metallic);
-        let eradiance = emat.emission * emat.emission_strength * ecos_theta / (edist * edist);
-        let light_pdf = (1.0 / f32(uniforms.emissive_tri_count)) / earea;
+        let eradiance = eemission * ecos_theta / (edist * edist);
+        let light_pdf = triProb / earea;
         let solid_angle_pdf = light_pdf * edist * edist / ecos_theta;
         let bsdf_pdf = endotl * INV_PI;
         let mis_w = (solid_angle_pdf * solid_angle_pdf) / (solid_angle_pdf * solid_angle_pdf + bsdf_pdf * bsdf_pdf + 1e-8);
