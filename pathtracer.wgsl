@@ -99,7 +99,7 @@ const SUN_ANGLE: f32 = 0.03;
 const COS_SUN_ANGLE: f32 = 0.99955;
 const SUN_SOLID_ANGLE: f32 = 0.002827;
 const SUN_MULT: f32 = 100.0;
-const MAX_FIREFLY_LUM: f32 = 8.0;
+const MAX_FIREFLY_LUM: f32 = 32.0;
 const MAT_FLAG_THIN_TRANSMISSION: u32 = 1u;
 const MAT_FLAG_DOUBLE_SIDED: u32 = 2u;
 const MAT_FLAG_UNLIT: u32 = 4u;
@@ -1374,14 +1374,16 @@ fn path_trace(primary_origin: vec3f, primary_dir: vec3f) -> PathResult {
       }
     }
 
-    // Bounce 1+: try SHaRC cache for indirect GI
-    if bounce >= 1u && !is_glass {
+    // Bounce 2+: try SHaRC cache for late indirect GI.
+    // The cache currently stores direct illumination at cached bounce points,
+    // so using it at the first indirect hit truncates higher-order transport too early.
+    if bounce >= 2u && !is_glass {
       let cached_gi = sharc_read_cached(hit_pos, normal);
       let has_cache = dot(cached_gi, vec3f(1.0)) > 0.001;
       if has_cache {
-        // cached_gi already includes surface albedo (stored as pt.direct with BRDF)
-        // Don't multiply by base_color again — that would square the albedo
-        let gi = throughput * cached_gi * occlusion;
+        // cached_gi already includes local BRDF/albedo from the cached point.
+        // Do not darken it with glTF AO; AO is not a transport term.
+        let gi = throughput * cached_gi;
         if is_diffuse_path { diff_rad += gi; } else { spec_rad += gi; }
         break;
       }
