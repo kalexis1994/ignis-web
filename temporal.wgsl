@@ -128,7 +128,7 @@ fn accumulate_signal(
   let variance = max(m2 - m1 * m1, vec3f(0.0));
   let stddev = sqrt(variance);
 
-  // Adaptive AABB: tighter when few frames accumulated, wide when converged
+  // Adaptive AABB
   let aabb_scale = mix(4.0, 8.0, motion);
   let aabb_expand = max(stddev * aabb_scale, (mx - mn) * mix(0.25, 0.5, motion));
   mn -= aabb_expand;
@@ -136,9 +136,7 @@ fn accumulate_signal(
 
   let clipped = clip_aabb(mn, mx, history);
 
-  // Adaptive alpha: favor current frame for new pixels, favor history for converged.
-  // SVGF paper uses 1/N but that's too aggressive for 1SPP (injects too much noise).
-  // This heuristic keeps α low even for new pixels, letting pre-blur + spatial handle noise.
+  // Adaptive alpha
   let var_lum = dot(stddev, vec3f(0.2126, 0.7152, 0.0722));
   let motion_alpha = mix(0.08, base_alpha, motion);
   let alpha = max(motion_alpha * 0.1, motion_alpha / (1.0 + var_lum * 10.0));
@@ -191,34 +189,25 @@ fn temporal(@builtin(global_invocation_id) gid: vec3u) {
 
   // Valid reprojection? (UV in bounds)
   if prev_uv_z.x >= 0.0 && prev_uv_z.x <= 1.0 && prev_uv_z.y >= 0.0 && prev_uv_z.y <= 1.0 {
-    // Sample previous frames with bilinear
     let diff_hist_sample = textureSampleLevel(prev_denoised, tex_sampler, prev_uv_z.xy, 0.0);
     let spec_hist_sample = textureSampleLevel(prev_spec, tex_sampler, prev_uv_z.xy, 0.0);
     let diff_hist = diff_hist_sample.rgb;
     let spec_hist = spec_hist_sample.rgb;
-    let prev_history = diff_hist_sample.a;  // history count from previous frame
-    let prev_z = spec_hist_sample.a;        // camera-space Z from previous frame
+    let prev_history = diff_hist_sample.a;
+    let prev_z = spec_hist_sample.a;
 
-    // Depth-based disocclusion: reject if reprojected Z diverges from stored Z
     let z_threshold = max(abs(prev_z) * params.depth_reject_scale, 0.5);
     let depth_valid = abs(prev_uv_z.z - prev_z) < z_threshold;
 
     if depth_valid {
-      // Valid history: increment per-pixel count
       history_len = min(prev_history + 1.0, params.max_history);
       let motion = clamp(history_len / 32.0, 0.0, 1.0);
 
-      // Accumulate both signals with per-pixel adaptive parameters
       diff_blend = accumulate_signal(diff_cur, diff_hist, motion, params.alpha, px, sz, current_hdr);
       spec_blend = accumulate_signal(spec_cur, spec_hist, motion, params.alpha, px, sz, current_spec);
     }
-    // else: depth_valid false → disoccluded, history_len stays 0, use raw current frame
   }
 
-  // Write color + metadata to alpha channels
-  // Diffuse alpha = history length (for denoiser sigma control)
-  // Spec accum alpha = hit distance (for denoiser blur radius)
-  // Spec history alpha = camera-space Z (for next frame's depth rejection)
   textureStore(accum_out, px, vec4f(diff_blend, history_len));
   textureStore(history_out, px, vec4f(diff_blend, history_len));
   textureStore(spec_accum_out, px, vec4f(spec_blend, cur_hit_dist));

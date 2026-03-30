@@ -40,16 +40,10 @@ fn atrous(@builtin(global_invocation_id) gid: vec3u) {
   let diff_sample = textureLoad(in_color, px, 0);
   let cc = diff_sample.rgb;
   let cl = luma(cc);
-  let history_len = diff_sample.a; // per-pixel history count from temporal
   let spec_sample = textureLoad(in_spec, px, 0);
   let cs = spec_sample.rgb;
   let csl = luma(cs);
-  let hit_dist = spec_sample.a; // normalized hit distance: 0=contact, 1=far/sky
-
-  // Per-pixel motion factor: replaces global framesStill
-  // history_len=0 → just disoccluded, needs aggressive blur
-  // history_len>=32 → converged, preserve detail
-  let motion = clamp(history_len / 32.0, 0.0, 1.0);
+  let hit_dist = spec_sample.a;
 
   // Roughness for specular filter width
   let roughness = textureLoad(albedo_tex, px, 0).a;
@@ -64,41 +58,62 @@ fn atrous(@builtin(global_invocation_id) gid: vec3u) {
 
   let step = i32(params.step_size);
 
-  // === VARIANCE ESTIMATION (separate for diffuse and specular) ===
-  var d_m1 = 0.0; var d_m2 = 0.0; // diffuse
-  var s_m1 = 0.0; var s_m2 = 0.0; // specular
-  for (var vy = -1; vy <= 1; vy++) {
-    for (var vx = -1; vx <= 1; vx++) {
-      let vp = clamp(px + vec2i(vx, vy), vec2i(0), sz - 1);
-      let vl = luma(textureLoad(in_color, vp, 0).rgb);
-      d_m1 += vl; d_m2 += vl * vl;
-      let vsl = luma(textureLoad(in_spec, vp, 0).rgb);
-      s_m1 += vsl; s_m2 += vsl * vsl;
+  // === VARIANCE (SVGF §4.2): propagated through à-trous passes ===
+  // Pass 0 (step=1): compute spatial variance, write to alpha
+  // Pass 1+ (step>1): read propagated variance from alpha (filtered by previous passes)
+  // This ensures sigma reflects ORIGINAL noise, not the already-filtered signal.
+  var d_var: f32;
+  var s_m1 = 0.0; var s_m2 = 0.0; // specular always uses spatial (no alpha channel)
+
+  if step <= 1 {
+    // First pass: compute spatial 3×3 variance, initialize alpha chain
+    var d_m1 = 0.0; var d_m2 = 0.0;
+    for (var vy = -1; vy <= 1; vy++) {
+      for (var vx = -1; vx <= 1; vx++) {
+        let vp = clamp(px + vec2i(vx, vy), vec2i(0), sz - 1);
+        let vl = luma(textureLoad(in_color, vp, 0).rgb);
+        d_m1 += vl; d_m2 += vl * vl;
+        let vsl = luma(textureLoad(in_spec, vp, 0).rgb);
+        s_m1 += vsl; s_m2 += vsl * vsl;
+      }
     }
+    d_m1 /= 9.0; d_m2 /= 9.0;
+    d_var = max(d_m2 - d_m1 * d_m1, 0.0);
+  } else {
+    // Subsequent passes: read propagated variance from diffuse alpha
+    // Also Gaussian-filter the variance from 3×3 neighbors for stability
+    var var_sum = 0.0;
+    for (var vy = -1; vy <= 1; vy++) {
+      for (var vx = -1; vx <= 1; vx++) {
+        let vp = clamp(px + vec2i(vx, vy), vec2i(0), sz - 1);
+        var_sum += textureLoad(in_color, vp, 0).a;
+        let vsl = luma(textureLoad(in_spec, vp, 0).rgb);
+        s_m1 += vsl; s_m2 += vsl * vsl;
+      }
+    }
+    d_var = max(var_sum / 9.0, 0.0);
   }
-  d_m1 /= 9.0; d_m2 /= 9.0;
+  let d_std = sqrt(d_var);
   s_m1 /= 9.0; s_m2 /= 9.0;
-  let d_std = sqrt(max(d_m2 - d_m1 * d_m1, 0.0));
   let s_std = sqrt(max(s_m2 - s_m1 * s_m1, 0.0));
 
-  // σ_l = 4.0 per SVGF (Schied 2017, eq.5). Kept constant — variance adapts the blur.
-  // With 1SPP, temporal alone doesn't fully converge, so spatial must stay strong.
+  // σ_l = 4.0 per SVGF (Schied 2017, eq.5)
   let diff_sigma_scale = 4.0;
-  // Specular: roughness modulates filter width (ReLAX, NRD).
-  // Glossy (roughness~0): σ×0.3 → preserve sharp reflections
-  // Rough (roughness~1): σ×1.0 → wider blur, approaches diffuse
+  // Specular: roughness modulates (ReLAX, NRD)
   let spec_sigma_scale = mix(4.0 * 0.3, 4.0, roughness);
 
-  // === FILTER (both signals in one pass) ===
+  // === FILTER (both signals + variance filtering in one pass) ===
   var d_sum = vec3f(0.0); var d_wsum = 0.0;
   var s_sum = vec3f(0.0); var s_wsum = 0.0;
+  var d_var_filtered = 0.0; var d_var_wsum = 0.0; // variance filtering
 
   for (var dy = -2; dy <= 2; dy++) {
     for (var dx = -2; dx <= 2; dx++) {
       let ki = u32((dy + 2) * 5 + (dx + 2));
       let sp = clamp(px + vec2i(dx, dy) * step, vec2i(0), sz - 1);
       let snd = textureLoad(gbuf_nd, sp, 0);
-      let sd = textureLoad(in_color, sp, 0).rgb;
+      let s_diff = textureLoad(in_color, sp, 0);
+      let sd = s_diff.rgb;
       let ss = textureLoad(in_spec, sp, 0).rgb;
 
       // Shared edge-stopping (SVGF, Schied 2017):
@@ -115,6 +130,12 @@ fn atrous(@builtin(global_invocation_id) gid: vec3u) {
       d_sum += sd * d_w;
       d_wsum += d_w;
 
+      // Filter variance through à-trous kernel (SVGF §4.2)
+      // Uses geometry weights only (not luminance) to preserve variance at edges
+      let geom_w = KW[ki] * wn * wz;
+      d_var_filtered += s_diff.a * geom_w;
+      d_var_wsum += geom_w;
+
       // Specular luminance edge-stopping (roughness + hit distance modulated)
       let s_dl = abs(csl - luma(ss));
       let s_sigma = spec_sigma_scale * s_std * hit_factor + 0.01;
@@ -125,8 +146,9 @@ fn atrous(@builtin(global_invocation_id) gid: vec3u) {
     }
   }
 
-  // Propagate per-pixel history length through ping-pong alpha (center pixel only)
-  textureStore(out_color, px, vec4f(d_sum / max(d_wsum, 1e-6), history_len));
+  // Output: color + filtered variance in alpha (propagated to next pass)
+  let out_var = d_var_filtered / max(d_var_wsum, 1e-6);
+  textureStore(out_color, px, vec4f(d_sum / max(d_wsum, 1e-6), out_var));
   textureStore(out_spec, px, vec4f(s_sum / max(s_wsum, 1e-6), textureLoad(in_spec, px, 0).a));
 }
 
