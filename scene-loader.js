@@ -4,6 +4,7 @@ const MAX_LEAF_SIZE = 8;
 const MAT_FLAG_THIN_TRANSMISSION = 1;
 const MAT_FLAG_DOUBLE_SIDED = 2;
 const MAT_FLAG_UNLIT = 4;
+const MAX_SUPPORTED_TEXCOORD_SETS = 4;
 
 // ============================================================
 // Matrix utilities (column-major, GLTF convention)
@@ -46,9 +47,11 @@ function nodeLocalMatrix(node) {
 // ============================================================
 // GLTF data reading
 // ============================================================
-function readAccessor(gltf, bin, accIdx) {
+function readAccessor(gltf, buffers, accIdx) {
   const acc = gltf.accessors[accIdx];
   const bv = gltf.bufferViews[acc.bufferView];
+  const buffer = buffers[bv.buffer ?? 0];
+  if (!buffer) throw new Error(`Missing glTF buffer ${bv.buffer ?? 0}`);
   const byteOff = (bv.byteOffset || 0) + (acc.byteOffset || 0);
   const compCount = {SCALAR:1, VEC2:2, VEC3:3, VEC4:4}[acc.type];
   const count = acc.count;
@@ -56,10 +59,10 @@ function readAccessor(gltf, bin, accIdx) {
   if (acc.componentType === 5126) { // float32
     const stride = bv.byteStride || (4 * compCount);
     if (stride === 4 * compCount && (byteOff % 4) === 0) {
-      return new Float32Array(bin, byteOff, count * compCount);
+      return new Float32Array(buffer, byteOff, count * compCount);
     }
     const out = new Float32Array(count * compCount);
-    const dv = new DataView(bin);
+    const dv = new DataView(buffer);
     for (let i = 0; i < count; i++) {
       const base = byteOff + i * stride;
       for (let c = 0; c < compCount; c++)
@@ -70,10 +73,10 @@ function readAccessor(gltf, bin, accIdx) {
   if (acc.componentType === 5125) { // uint32
     const stride = bv.byteStride || 4;
     if (stride === 4 && (byteOff % 4) === 0) {
-      return new Uint32Array(bin, byteOff, count);
+      return new Uint32Array(buffer, byteOff, count);
     }
     const out = new Uint32Array(count);
-    const dv = new DataView(bin);
+    const dv = new DataView(buffer);
     for (let i = 0; i < count; i++)
       out[i] = dv.getUint32(byteOff + i * stride, true);
     return out;
@@ -81,7 +84,7 @@ function readAccessor(gltf, bin, accIdx) {
   if (acc.componentType === 5123) { // uint16
     const stride = bv.byteStride || 2;
     const out = new Uint32Array(count);
-    const dv = new DataView(bin);
+    const dv = new DataView(buffer);
     for (let i = 0; i < count; i++)
       out[i] = dv.getUint16(byteOff + i * stride, true);
     return out;
@@ -98,6 +101,59 @@ function textureBinding(gltf, texInfo) {
   };
 }
 
+function resolveSceneURI(basePath, uri) {
+  if (/^(?:data:|blob:|https?:)/i.test(uri)) return uri;
+  return `${basePath}/${uri}`;
+}
+
+function dataUriToArrayBuffer(uri) {
+  const comma = uri.indexOf(',');
+  if (comma < 0) throw new Error('Invalid data URI');
+  const header = uri.slice(0, comma);
+  const payload = uri.slice(comma + 1);
+  const binary = /;base64/i.test(header) ? atob(payload) : decodeURIComponent(payload);
+  const out = new Uint8Array(binary.length);
+  for (let i = 0; i < binary.length; i++) out[i] = binary.charCodeAt(i);
+  return out.buffer;
+}
+
+function bytesToDataURI(bytes, mimeType) {
+  let binary = '';
+  const CHUNK = 0x8000;
+  for (let i = 0; i < bytes.length; i += CHUNK) {
+    binary += String.fromCharCode(...bytes.subarray(i, Math.min(i + CHUNK, bytes.length)));
+  }
+  return `data:${mimeType};base64,${btoa(binary)}`;
+}
+
+function parseGLB(glbBuffer) {
+  const dv = new DataView(glbBuffer);
+  const magic = dv.getUint32(0, true);
+  const version = dv.getUint32(4, true);
+  const totalLength = dv.getUint32(8, true);
+  if (magic !== 0x46546C67) throw new Error('Invalid GLB header');
+  if (version !== 2) throw new Error(`Unsupported GLB version ${version}`);
+
+  let offset = 12;
+  let gltfText = null;
+  let binChunk = new ArrayBuffer(0);
+  const decoder = new TextDecoder();
+  while (offset + 8 <= totalLength) {
+    const chunkLength = dv.getUint32(offset, true);
+    const chunkType = dv.getUint32(offset + 4, true);
+    offset += 8;
+    const chunk = glbBuffer.slice(offset, offset + chunkLength);
+    if (chunkType === 0x4E4F534A) {
+      gltfText = decoder.decode(chunk);
+    } else if (chunkType === 0x004E4942) {
+      binChunk = chunk;
+    }
+    offset += chunkLength;
+  }
+  if (!gltfText) throw new Error('GLB is missing JSON chunk');
+  return { gltf: JSON.parse(gltfText), gltfText, binChunk };
+}
+
 // ============================================================
 // Material extraction (PBR metallic-roughness from GLTF)
 // ============================================================
@@ -112,6 +168,18 @@ function extractMaterials(gltf) {
     occlusionTex:-1, occlusionTexCoord:0, occlusionStrength:1.0,
     thicknessTex:-1, thicknessTexCoord:0, transmissionTexCoord:0,
     attenuationColor:[1,1,1], attenuationDistance:1e30,
+    specularFactor:1.0, specularTex:-1, specularTexCoord:0,
+    specularColor:[1,1,1], specularColorTex:-1, specularColorTexCoord:0,
+    clearcoatFactor:0.0, clearcoatTex:-1, clearcoatTexCoord:0,
+    clearcoatRoughness:0.0, clearcoatRoughnessTex:-1, clearcoatRoughnessTexCoord:0,
+    clearcoatNormalTex:-1, clearcoatNormalTexCoord:0, clearcoatNormalScale:1.0,
+    sheenColor:[0,0,0], sheenColorTex:-1, sheenColorTexCoord:0,
+    sheenRoughness:0.0, sheenRoughnessTex:-1, sheenRoughnessTexCoord:0,
+    anisotropyStrength:0.0, anisotropyRotation:0.0, anisotropyTex:-1, anisotropyTexCoord:0,
+    iridescenceFactor:0.0, iridescenceTex:-1, iridescenceTexCoord:0, iridescenceIor:1.3,
+    iridescenceThicknessMin:100.0, iridescenceThicknessMax:400.0,
+    iridescenceThicknessTex:-1, iridescenceThicknessTexCoord:0,
+    dispersion:0.0,
   };
   if (!gltf.materials) return [defaultMat];
 
@@ -157,6 +225,40 @@ function extractMaterials(gltf) {
     let flags = 0;
     let attenuationColor = [1, 1, 1];
     let attenuationDistance = 1e30;
+    let specularFactor = 1.0;
+    let specularTex = -1;
+    let specularTexCoord = 0;
+    let specularColor = [1, 1, 1];
+    let specularColorTex = -1;
+    let specularColorTexCoord = 0;
+    let clearcoatFactor = 0.0;
+    let clearcoatTex = -1;
+    let clearcoatTexCoord = 0;
+    let clearcoatRoughness = 0.0;
+    let clearcoatRoughnessTex = -1;
+    let clearcoatRoughnessTexCoord = 0;
+    let clearcoatNormalTex = -1;
+    let clearcoatNormalTexCoord = 0;
+    let clearcoatNormalScale = 1.0;
+    let sheenColor = [0, 0, 0];
+    let sheenColorTex = -1;
+    let sheenColorTexCoord = 0;
+    let sheenRoughness = 0.0;
+    let sheenRoughnessTex = -1;
+    let sheenRoughnessTexCoord = 0;
+    let anisotropyStrength = 0.0;
+    let anisotropyRotation = 0.0;
+    let anisotropyTex = -1;
+    let anisotropyTexCoord = 0;
+    let iridescenceFactor = 0.0;
+    let iridescenceTex = -1;
+    let iridescenceTexCoord = 0;
+    let iridescenceIor = 1.3;
+    let iridescenceThicknessMin = 100.0;
+    let iridescenceThicknessMax = 400.0;
+    let iridescenceThicknessTex = -1;
+    let iridescenceThicknessTexCoord = 0;
+    let dispersion = 0.0;
 
     if (mat.emissiveFactor) {
       emission = [mat.emissiveFactor[0], mat.emissiveFactor[1], mat.emissiveFactor[2]];
@@ -169,6 +271,12 @@ function extractMaterials(gltf) {
 
     const transmissionExt = mat.extensions?.KHR_materials_transmission;
     const volumeExt = mat.extensions?.KHR_materials_volume;
+    const specularExt = mat.extensions?.KHR_materials_specular;
+    const clearcoatExt = mat.extensions?.KHR_materials_clearcoat;
+    const sheenExt = mat.extensions?.KHR_materials_sheen;
+    const anisotropyExt = mat.extensions?.KHR_materials_anisotropy;
+    const iridescenceExt = mat.extensions?.KHR_materials_iridescence;
+    const dispersionExt = mat.extensions?.KHR_materials_dispersion;
     if (transmissionExt) {
       transmission = transmissionExt.transmissionFactor ?? 0.0;
       const txBinding = textureBinding(gltf, transmissionExt.transmissionTexture);
@@ -188,6 +296,68 @@ function extractMaterials(gltf) {
         // glTF volume becomes active only when thicknessFactor > 0.
         if (thickness <= 0.0) flags |= MAT_FLAG_THIN_TRANSMISSION;
       }
+    }
+
+    if (specularExt) {
+      const specularBinding = textureBinding(gltf, specularExt.specularTexture);
+      const specularColorBinding = textureBinding(gltf, specularExt.specularColorTexture);
+      specularFactor = specularExt.specularFactor ?? 1.0;
+      specularTex = specularBinding.index;
+      specularTexCoord = specularBinding.texCoord;
+      specularColor = specularExt.specularColorFactor || specularColor;
+      specularColorTex = specularColorBinding.index;
+      specularColorTexCoord = specularColorBinding.texCoord;
+    }
+
+    if (clearcoatExt) {
+      const clearcoatBinding = textureBinding(gltf, clearcoatExt.clearcoatTexture);
+      const clearcoatRoughBinding = textureBinding(gltf, clearcoatExt.clearcoatRoughnessTexture);
+      const clearcoatNormalBinding = textureBinding(gltf, clearcoatExt.clearcoatNormalTexture);
+      clearcoatFactor = clearcoatExt.clearcoatFactor ?? 0.0;
+      clearcoatTex = clearcoatBinding.index;
+      clearcoatTexCoord = clearcoatBinding.texCoord;
+      clearcoatRoughness = clearcoatExt.clearcoatRoughnessFactor ?? 0.0;
+      clearcoatRoughnessTex = clearcoatRoughBinding.index;
+      clearcoatRoughnessTexCoord = clearcoatRoughBinding.texCoord;
+      clearcoatNormalTex = clearcoatNormalBinding.index;
+      clearcoatNormalTexCoord = clearcoatNormalBinding.texCoord;
+      clearcoatNormalScale = clearcoatExt.clearcoatNormalTexture?.scale ?? 1.0;
+    }
+
+    if (sheenExt) {
+      const sheenColorBinding = textureBinding(gltf, sheenExt.sheenColorTexture);
+      const sheenRoughBinding = textureBinding(gltf, sheenExt.sheenRoughnessTexture);
+      sheenColor = sheenExt.sheenColorFactor || sheenColor;
+      sheenColorTex = sheenColorBinding.index;
+      sheenColorTexCoord = sheenColorBinding.texCoord;
+      sheenRoughness = sheenExt.sheenRoughnessFactor ?? 0.0;
+      sheenRoughnessTex = sheenRoughBinding.index;
+      sheenRoughnessTexCoord = sheenRoughBinding.texCoord;
+    }
+
+    if (anisotropyExt) {
+      const anisotropyBinding = textureBinding(gltf, anisotropyExt.anisotropyTexture);
+      anisotropyStrength = anisotropyExt.anisotropyStrength ?? 0.0;
+      anisotropyRotation = anisotropyExt.anisotropyRotation ?? 0.0;
+      anisotropyTex = anisotropyBinding.index;
+      anisotropyTexCoord = anisotropyBinding.texCoord;
+    }
+
+    if (iridescenceExt) {
+      const iridescenceBinding = textureBinding(gltf, iridescenceExt.iridescenceTexture);
+      const iridescenceThicknessBinding = textureBinding(gltf, iridescenceExt.iridescenceThicknessTexture);
+      iridescenceFactor = iridescenceExt.iridescenceFactor ?? 0.0;
+      iridescenceTex = iridescenceBinding.index;
+      iridescenceTexCoord = iridescenceBinding.texCoord;
+      iridescenceIor = iridescenceExt.iridescenceIor ?? 1.3;
+      iridescenceThicknessMin = iridescenceExt.iridescenceThicknessMinimum ?? 100.0;
+      iridescenceThicknessMax = iridescenceExt.iridescenceThicknessMaximum ?? 400.0;
+      iridescenceThicknessTex = iridescenceThicknessBinding.index;
+      iridescenceThicknessTexCoord = iridescenceThicknessBinding.texCoord;
+    }
+
+    if (dispersionExt) {
+      dispersion = dispersionExt.dispersion ?? 0.0;
     }
 
     let alphaMode = 0; // OPAQUE
@@ -215,14 +385,63 @@ function extractMaterials(gltf) {
       emissiveTex, emissiveTexCoord, occlusionTex, occlusionTexCoord, occlusionStrength,
       thicknessTex, thicknessTexCoord, transmissionTexCoord,
       attenuationColor, attenuationDistance,
+      specularFactor, specularTex, specularTexCoord,
+      specularColor, specularColorTex, specularColorTexCoord,
+      clearcoatFactor, clearcoatTex, clearcoatTexCoord,
+      clearcoatRoughness, clearcoatRoughnessTex, clearcoatRoughnessTexCoord,
+      clearcoatNormalTex, clearcoatNormalTexCoord, clearcoatNormalScale,
+      sheenColor, sheenColorTex, sheenColorTexCoord,
+      sheenRoughness, sheenRoughnessTex, sheenRoughnessTexCoord,
+      anisotropyStrength, anisotropyRotation, anisotropyTex, anisotropyTexCoord,
+      iridescenceFactor, iridescenceTex, iridescenceTexCoord, iridescenceIor,
+      iridescenceThicknessMin, iridescenceThicknessMax,
+      iridescenceThicknessTex, iridescenceThicknessTexCoord,
+      dispersion,
     };
   });
+}
+
+function extractPunctualLights(gltf, worldMats) {
+  const lightDefs = gltf.extensions?.KHR_lights_punctual?.lights;
+  if (!lightDefs?.length) return [];
+
+  const lights = [];
+  for (let ni = 0; ni < gltf.nodes.length; ni++) {
+    const node = gltf.nodes[ni];
+    const lightRef = node.extensions?.KHR_lights_punctual?.light;
+    if (lightRef == null || !worldMats[ni]) continue;
+
+    const def = lightDefs[lightRef];
+    if (!def) continue;
+    const wm = worldMats[ni];
+    const position = [wm[12], wm[13], wm[14]];
+    const direction = normalize3([-wm[8], -wm[9], -wm[10]]);
+    const color = def.color || [1, 1, 1];
+    const spot = def.spot || {};
+    lights.push({
+      type: def.type || 'point',
+      color,
+      intensity: def.intensity ?? 1.0,
+      range: Number.isFinite(def.range) ? def.range : 0.0,
+      innerConeAngle: spot.innerConeAngle ?? 0.0,
+      outerConeAngle: spot.outerConeAngle ?? (Math.PI * 0.25),
+      position,
+      direction,
+      name: def.name || node.name || `light_${ni}`,
+    });
+  }
+  return lights;
 }
 
 // Inverse-transpose of upper-left 3x3 for correct normal transform
 function normalMatrix3x3(m) {
   const a=m[0],b=m[4],c=m[8], d=m[1],e=m[5],f=m[9], g=m[2],h=m[6],k=m[10];
   return [e*k-f*h, f*g-d*k, d*h-e*g, c*h-b*k, a*k-c*g, b*g-a*h, b*f-c*e, c*d-a*f, a*e-b*d];
+}
+
+function normalize3(v) {
+  const len = Math.hypot(v[0], v[1], v[2]) || 1;
+  return [v[0] / len, v[1] / len, v[2] / len];
 }
 
 // ============================================================
@@ -476,16 +695,102 @@ async function hashBuffer(buf) {
 }
 
 export async function loadScene(basePath, onProgress) {
-  onProgress?.('Loading scene.gltf...');
-  const gltf = await (await fetch(`${basePath}/scene.gltf`)).json();
+  let gltf = null;
+  let gltfText = '';
+  let buffers = [];
+  let sceneLabel = '';
+
+  const gltfURL = `${basePath}/scene.gltf`;
+  const glbURL = `${basePath}/scene.glb`;
+  const entryURL = `${basePath}/.entry`;
+
+  onProgress?.('Loading scene...');
+  let preferredScene = null;
+  try {
+    const entryResp = await fetch(entryURL);
+    if (entryResp.ok) {
+      const entryText = (await entryResp.text()).trim();
+      if (entryText === 'scene.gltf' || entryText === 'scene.glb') {
+        preferredScene = entryText;
+      }
+    }
+  } catch (_) {
+    // Fallback below.
+  }
+
+  let sceneResp = null;
+  if (preferredScene === 'scene.glb') {
+    sceneResp = await fetch(glbURL);
+  } else if (preferredScene === 'scene.gltf') {
+    sceneResp = await fetch(gltfURL);
+  } else {
+    sceneResp = await fetch(gltfURL);
+  }
+
+  if ((preferredScene === 'scene.gltf' || preferredScene == null) && sceneResp.ok) {
+    sceneLabel = 'scene.gltf';
+    gltfText = await sceneResp.text();
+    gltf = JSON.parse(gltfText);
+    buffers = await Promise.all((gltf.buffers || []).map(async (bufferDef, index) => {
+      if (!bufferDef.uri) {
+        throw new Error(`glTF buffer ${index} is missing a uri`);
+      }
+      if (/^data:/i.test(bufferDef.uri)) {
+        return dataUriToArrayBuffer(bufferDef.uri);
+      }
+      const resp = await fetch(resolveSceneURI(basePath, bufferDef.uri));
+      if (!resp.ok) {
+        throw new Error(`Failed to load glTF buffer ${bufferDef.uri}`);
+      }
+      return await resp.arrayBuffer();
+    }));
+  } else {
+    sceneResp = preferredScene === 'scene.glb' && sceneResp ? sceneResp : await fetch(glbURL);
+    if (!sceneResp.ok) {
+      throw new Error(`Could not load ${gltfURL} or ${glbURL}`);
+    }
+    sceneLabel = 'scene.glb';
+    const glbBuffer = await sceneResp.arrayBuffer();
+    const glb = parseGLB(glbBuffer);
+    gltf = glb.gltf;
+    gltfText = glb.gltfText;
+    buffers = gltf.buffers?.length ? new Array(gltf.buffers.length).fill(null) : [];
+    if (buffers.length > 0) {
+      buffers[0] = glb.binChunk;
+    } else {
+      buffers = [glb.binChunk];
+    }
+    for (let i = 0; i < (gltf.buffers || []).length; i++) {
+      if (buffers[i]) continue;
+      const bufferDef = gltf.buffers[i];
+      if (!bufferDef?.uri) {
+        throw new Error(`GLB buffer ${i} is missing data`);
+      }
+      if (/^data:/i.test(bufferDef.uri)) {
+        buffers[i] = dataUriToArrayBuffer(bufferDef.uri);
+        continue;
+      }
+      const resp = await fetch(resolveSceneURI(basePath, bufferDef.uri));
+      if (!resp.ok) {
+        throw new Error(`Failed to load GLB external buffer ${bufferDef.uri}`);
+      }
+      buffers[i] = await resp.arrayBuffer();
+    }
+  }
 
   // Check cache first
   let db, cacheKey, cached;
   try {
     db = await openDB();
-    // Hash based on gltf file size + accessor count (changes if scene changes)
-    const gltfSig = `${JSON.stringify(gltf.accessors?.length)}-${gltf.buffers?.[0]?.byteLength}`;
-    cacheKey = 'scene-v4-' + gltfSig;
+    // Hash JSON + binary buffers so material-only and geometry-only edits both invalidate cache.
+    let gltfHash = 2166136261 >>> 0;
+    for (let i = 0; i < gltfText.length; i++) {
+      gltfHash ^= gltfText.charCodeAt(i);
+      gltfHash = Math.imul(gltfHash, 16777619);
+    }
+    const gltfSig = `${sceneLabel}-${gltfText.length}-${(gltfHash >>> 0).toString(16)}`;
+    const bufferSigs = await Promise.all(buffers.map(async (buf, index) => `${index}:${await hashBuffer(buf)}`));
+    cacheKey = 'scene-v6-' + gltfSig + '-' + bufferSigs.join('.');
     cached = await dbGet(db, cacheKey);
   } catch(e) { /* IndexedDB not available, proceed without cache */ }
 
@@ -493,10 +798,6 @@ export async function loadScene(basePath, onProgress) {
     onProgress?.('Loading from cache (instant)...');
     return cached;
   }
-
-  onProgress?.('Loading scene.bin (147 MB, first time only)...');
-  const binResp = await fetch(`${basePath}/scene.bin`);
-  const bin = await binResp.arrayBuffer();
 
   onProgress?.('Extracting meshes...');
 
@@ -511,11 +812,13 @@ export async function loadScene(basePath, onProgress) {
   }
   const scene = gltf.scenes[gltf.scene || 0];
   for (const ri of scene.nodes) walkNodes(ri, mat4Identity());
+  const punctualLights = extractPunctualLights(gltf, worldMats);
 
   // Count totals first
   let totalVerts = 0, totalTris = 0;
   for (let ni = 0; ni < gltf.nodes.length; ni++) {
     const node = gltf.nodes[ni];
+    if (!worldMats[ni]) continue;
     if (node.mesh === undefined) continue;
     const mesh = gltf.meshes[node.mesh];
     for (const prim of mesh.primitives) {
@@ -534,11 +837,14 @@ export async function loadScene(basePath, onProgress) {
   const allNrm = new Float32Array(totalVerts * 3);
   const allUV0 = new Float32Array(totalVerts * 2);
   const allUV1 = new Float32Array(totalVerts * 2);
+  const allUV2 = new Float32Array(totalVerts * 2);
+  const allUV3 = new Float32Array(totalVerts * 2);
   const allTriData = new Uint32Array(totalTris * 4);
   let vOff = 0, tOff = 0;
 
   for (let ni = 0; ni < gltf.nodes.length; ni++) {
     const node = gltf.nodes[ni];
+    if (!worldMats[ni]) continue;
     if (node.mesh === undefined) continue;
     const mesh = gltf.meshes[node.mesh];
     const wm = worldMats[ni];
@@ -547,11 +853,13 @@ export async function loadScene(basePath, onProgress) {
     for (const prim of mesh.primitives) {
       if (prim.mode !== undefined && prim.mode !== 4) continue;
 
-      const positions = readAccessor(gltf, bin, prim.attributes.POSITION);
-      const normals = prim.attributes.NORMAL != null ? readAccessor(gltf, bin, prim.attributes.NORMAL) : null;
-      const uv0s = prim.attributes.TEXCOORD_0 != null ? readAccessor(gltf, bin, prim.attributes.TEXCOORD_0) : null;
-      const uv1s = prim.attributes.TEXCOORD_1 != null ? readAccessor(gltf, bin, prim.attributes.TEXCOORD_1) : null;
-      const indices = readAccessor(gltf, bin, prim.indices);
+      const positions = readAccessor(gltf, buffers, prim.attributes.POSITION);
+      const normals = prim.attributes.NORMAL != null ? readAccessor(gltf, buffers, prim.attributes.NORMAL) : null;
+      const uv0s = prim.attributes.TEXCOORD_0 != null ? readAccessor(gltf, buffers, prim.attributes.TEXCOORD_0) : null;
+      const uv1s = prim.attributes.TEXCOORD_1 != null ? readAccessor(gltf, buffers, prim.attributes.TEXCOORD_1) : null;
+      const uv2s = prim.attributes.TEXCOORD_2 != null ? readAccessor(gltf, buffers, prim.attributes.TEXCOORD_2) : null;
+      const uv3s = prim.attributes.TEXCOORD_3 != null ? readAccessor(gltf, buffers, prim.attributes.TEXCOORD_3) : null;
+      const indices = readAccessor(gltf, buffers, prim.indices);
       const matIdx = prim.material ?? 0;
       const vertCount = gltf.accessors[prim.attributes.POSITION].count;
 
@@ -582,6 +890,14 @@ export async function loadScene(basePath, onProgress) {
         if (uv1s) {
           allUV1[(vOff+v)*2]   = uv1s[v*2];
           allUV1[(vOff+v)*2+1] = uv1s[v*2+1];
+        }
+        if (uv2s) {
+          allUV2[(vOff+v)*2]   = uv2s[v*2];
+          allUV2[(vOff+v)*2+1] = uv2s[v*2+1];
+        }
+        if (uv3s) {
+          allUV3[(vOff+v)*2]   = uv3s[v*2];
+          allUV3[(vOff+v)*2+1] = uv3s[v*2+1];
         }
       }
 
@@ -620,10 +936,11 @@ export async function loadScene(basePath, onProgress) {
     gpuTriFlat[base+11] = 0;
   }
 
-  // Pack vertex data: position.xyz + UV0.x, normal.xyz + UV0.y, UV1 in separate buffer
+  // Pack vertex data: position.xyz + UV0.x, normal.xyz + UV0.y,
+  // plus a compact buffer with UV1/UV2/UV3 for materials using higher texcoord sets.
   const gpuPositions = new Float32Array(totalVerts * 4);
   const gpuNormals = new Float32Array(totalVerts * 4);
-  const gpuUV1 = new Float32Array(totalVerts * 2);
+  const gpuUVExtra = new Float32Array(totalVerts * 6);
   for (let v = 0; v < totalVerts; v++) {
     gpuPositions[v*4]   = allPos[v*3];
     gpuPositions[v*4+1] = allPos[v*3+1];
@@ -633,15 +950,20 @@ export async function loadScene(basePath, onProgress) {
     gpuNormals[v*4+1] = allNrm[v*3+1];
     gpuNormals[v*4+2] = allNrm[v*3+2];
     gpuNormals[v*4+3] = allUV0[v*2+1];   // UV0.y packed in normal.w
-    gpuUV1[v*2] = allUV1[v*2];
-    gpuUV1[v*2+1] = allUV1[v*2+1];
+    gpuUVExtra[v*6]   = allUV1[v*2];
+    gpuUVExtra[v*6+1] = allUV1[v*2+1];
+    gpuUVExtra[v*6+2] = allUV2[v*2];
+    gpuUVExtra[v*6+3] = allUV2[v*2+1];
+    gpuUVExtra[v*6+4] = allUV3[v*2];
+    gpuUVExtra[v*6+5] = allUV3[v*2+1];
   }
 
-  // Materials -> GPU format (160 bytes / 40 floats per material)
+  // Materials -> GPU format (320 bytes / 80 floats per material)
   const materials = extractMaterials(gltf);
-  const gpuMaterials = new Float32Array(materials.length * 40);
+  const gpuMaterials = new Float32Array(materials.length * 80);
+  let maxMaterialTexCoord = 0;
   for (let i = 0; i < materials.length; i++) {
-    const m = materials[i], o = i * 40;
+    const m = materials[i], o = i * 80;
     gpuMaterials[o]    = m.albedo[0];
     gpuMaterials[o+1]  = m.albedo[1];
     gpuMaterials[o+2]  = m.albedo[2];
@@ -682,6 +1004,77 @@ export async function loadScene(basePath, onProgress) {
     gpuMaterials[o+37] = 0.0;
     gpuMaterials[o+38] = 0.0;
     gpuMaterials[o+39] = 0.0;
+
+    gpuMaterials[o+40] = m.specularFactor ?? 1.0;
+    gpuMaterials[o+41] = m.specularTex ?? -1;
+    gpuMaterials[o+42] = m.specularColorTex ?? -1;
+    gpuMaterials[o+43] = m.specularColor?.[0] ?? 1.0;
+    gpuMaterials[o+44] = m.specularColor?.[1] ?? 1.0;
+    gpuMaterials[o+45] = m.specularColor?.[2] ?? 1.0;
+    gpuMaterials[o+46] = m.specularTexCoord ?? 0;
+    gpuMaterials[o+47] = m.specularColorTexCoord ?? 0;
+
+    gpuMaterials[o+48] = m.clearcoatFactor ?? 0.0;
+    gpuMaterials[o+49] = m.clearcoatTex ?? -1;
+    gpuMaterials[o+50] = m.clearcoatRoughness ?? 0.0;
+    gpuMaterials[o+51] = m.clearcoatRoughnessTex ?? -1;
+    gpuMaterials[o+52] = m.clearcoatTexCoord ?? 0;
+    gpuMaterials[o+53] = m.clearcoatRoughnessTexCoord ?? 0;
+    gpuMaterials[o+54] = m.clearcoatNormalTex ?? -1;
+    gpuMaterials[o+55] = m.clearcoatNormalTexCoord ?? 0;
+
+    gpuMaterials[o+56] = m.clearcoatNormalScale ?? 1.0;
+    gpuMaterials[o+57] = m.sheenColor?.[0] ?? 0.0;
+    gpuMaterials[o+58] = m.sheenColor?.[1] ?? 0.0;
+    gpuMaterials[o+59] = m.sheenColor?.[2] ?? 0.0;
+    gpuMaterials[o+60] = m.sheenRoughness ?? 0.0;
+    gpuMaterials[o+61] = m.sheenColorTex ?? -1;
+    gpuMaterials[o+62] = m.sheenRoughnessTex ?? -1;
+    gpuMaterials[o+63] = m.sheenColorTexCoord ?? 0;
+
+    gpuMaterials[o+64] = m.sheenRoughnessTexCoord ?? 0;
+    gpuMaterials[o+65] = m.anisotropyStrength ?? 0.0;
+    gpuMaterials[o+66] = m.anisotropyRotation ?? 0.0;
+    gpuMaterials[o+67] = m.anisotropyTex ?? -1;
+    gpuMaterials[o+68] = m.anisotropyTexCoord ?? 0;
+    gpuMaterials[o+69] = m.iridescenceFactor ?? 0.0;
+    gpuMaterials[o+70] = m.iridescenceTex ?? -1;
+    gpuMaterials[o+71] = m.iridescenceIor ?? 1.3;
+
+    gpuMaterials[o+72] = m.iridescenceThicknessMin ?? 100.0;
+    gpuMaterials[o+73] = m.iridescenceThicknessMax ?? 400.0;
+    gpuMaterials[o+74] = m.iridescenceThicknessTex ?? -1;
+    gpuMaterials[o+75] = m.iridescenceTexCoord ?? 0;
+    gpuMaterials[o+76] = m.iridescenceThicknessTexCoord ?? 0;
+    gpuMaterials[o+77] = m.dispersion ?? 0.0;
+    gpuMaterials[o+78] = 0.0;
+    gpuMaterials[o+79] = 0.0;
+
+    maxMaterialTexCoord = Math.max(
+      maxMaterialTexCoord,
+      m.baseTexCoord ?? 0,
+      m.mrTexCoord ?? 0,
+      m.normalTexCoord ?? 0,
+      m.emissiveTexCoord ?? 0,
+      m.occlusionTexCoord ?? 0,
+      m.thicknessTexCoord ?? 0,
+      m.transmissionTexCoord ?? 0,
+      m.specularTexCoord ?? 0,
+      m.specularColorTexCoord ?? 0,
+      m.clearcoatTexCoord ?? 0,
+      m.clearcoatRoughnessTexCoord ?? 0,
+      m.clearcoatNormalTexCoord ?? 0,
+      m.sheenColorTexCoord ?? 0,
+      m.sheenRoughnessTexCoord ?? 0,
+      m.anisotropyTexCoord ?? 0,
+      m.iridescenceTexCoord ?? 0,
+      m.iridescenceThicknessTexCoord ?? 0,
+    );
+  }
+  if (maxMaterialTexCoord >= MAX_SUPPORTED_TEXCOORD_SETS) {
+    throw new Error(
+      `glTF material references TEXCOORD_${maxMaterialTexCoord}, but the renderer currently supports TEXCOORD_0..${MAX_SUPPORTED_TEXCOORD_SETS - 1}.`
+    );
   }
 
   // Collect emissive triangle indices for NEE
@@ -752,7 +1145,24 @@ export async function loadScene(basePath, onProgress) {
   let textureInfo = null;
   if (gltf.images && gltf.images.length > 0) {
     textureInfo = {
-      imageURIs: gltf.images.map(img => img.uri),
+      imageURIs: gltf.images.map((img, index) => {
+        if (img.uri) return img.uri;
+        if (img.bufferView == null) {
+          throw new Error(`glTF image ${index} is missing both uri and bufferView`);
+        }
+        const bv = gltf.bufferViews?.[img.bufferView];
+        if (!bv) {
+          throw new Error(`glTF image ${index} references missing bufferView ${img.bufferView}`);
+        }
+        const buffer = buffers[bv.buffer ?? 0];
+        if (!buffer) {
+          throw new Error(`glTF image ${index} references missing buffer ${bv.buffer ?? 0}`);
+        }
+        const byteOffset = bv.byteOffset || 0;
+        const byteLength = bv.byteLength || 0;
+        const bytes = new Uint8Array(buffer, byteOffset, byteLength);
+        return bytesToDataURI(bytes, img.mimeType || 'application/octet-stream');
+      }),
       count: gltf.images.length,
     };
   }
@@ -762,9 +1172,11 @@ export async function loadScene(basePath, onProgress) {
     vertices: totalVerts,
     bvhNodes: bvh.nodeCount,
     materials: materials.length,
+    punctualLights: punctualLights.length,
     emissiveTris: emissiveCount,
     emissiveSourceTris: emissiveSourceCount,
     emissiveTruncated,
+    maxTexCoordSet: maxMaterialTexCoord,
     sceneMin, sceneMax,
   };
 
@@ -801,13 +1213,14 @@ export async function loadScene(basePath, onProgress) {
   const result = {
     gpuPositions,
     gpuNormals,
-    gpuUV1,
+    gpuUVExtra,
     gpuTriData: bvh.sortedTriData,
     gpuTriFlat,
     gpuBVHNodes: bvh.nodesF32,
     gpuMaterials,
-    materialStride: 40,
+    materialStride: 80,
     gpuEmissiveTris,
+    punctualLights,
     rasterIndices,
     vertMatIds,
     textureInfo,

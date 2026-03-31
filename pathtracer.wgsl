@@ -7,6 +7,13 @@
 // - AgX Punchy tone mapping (Blender 4 / Troy Sobotka)
 // - Firefly luminance clamping
 
+struct PunctualLight {
+  pos_range: vec4f,
+  dir_inner: vec4f,
+  color_intensity: vec4f,
+  params: vec4f,
+};
+
 struct Uniforms {
   resolution: vec2f,
   sample_count: u32,
@@ -34,6 +41,10 @@ struct Uniforms {
   _pad8: f32,
   prev_up: vec3f,
   _pad9: f32,
+  light_count: u32,
+  sun_enabled: u32,
+  _pad10: vec2u,
+  lights: array<PunctualLight, 16>,
 };
 
 struct BVHNode { aabb_min: vec3f, left_first: u32, aabb_max: vec3f, tri_count: u32, };
@@ -48,6 +59,16 @@ struct Material {
   d7: vec4f, // transmission_texcoord + emissive_texcoord + occlusion_texcoord + thickness_texcoord
   d8: vec4f, // occlusion_strength + attenuation_distance + attenuation_color.rg
   d9: vec4f, // attenuation_color.b + pad
+  d10: vec4f, // specular_factor + specular_tex + specular_color_tex + specular_color.r
+  d11: vec4f, // specular_color.gb + specular_texcoord + specular_color_texcoord
+  d12: vec4f, // clearcoat_factor + clearcoat_tex + clearcoat_roughness + clearcoat_rough_tex
+  d13: vec4f, // clearcoat_texcoord + clearcoat_rough_texcoord + clearcoat_normal_tex + clearcoat_normal_texcoord
+  d14: vec4f, // clearcoat_normal_scale + sheen_color.rgb
+  d15: vec4f, // sheen_roughness + sheen_color_tex + sheen_rough_tex + sheen_color_texcoord
+  d16: vec4f, // sheen_rough_texcoord + anisotropy_strength + anisotropy_rotation + anisotropy_tex
+  d17: vec4f, // anisotropy_texcoord + iridescence_factor + iridescence_tex + iridescence_ior
+  d18: vec4f, // iridescence_thickness_min + iridescence_thickness_max + iridescence_thickness_tex + iridescence_texcoord
+  d19: vec4f, // iridescence_thickness_texcoord + dispersion + pad
 };
 struct HitInfo { t: f32, u: f32, v: f32, tri_idx: u32, hit: bool, };
 
@@ -67,7 +88,7 @@ struct HitInfo { t: f32, u: f32, v: f32, tri_idx: u32, hit: bool, };
 @group(1) @binding(4) var<storage, read> material_buf: array<Material>;
 // Emissive tris: 1 vec4f each [tri_idx(bitcast u32), area, CDF, 0]
 @group(1) @binding(5) var<storage, read> emissive_tris: array<vec4f>;
-@group(1) @binding(6) var<storage, read> vert_uv1: array<vec2f>;
+@group(1) @binding(6) var<storage, read> vert_uv_extra: array<f32>;
 // SHaRC radiance cache — packed into 2 buffers to fit 8 storage buffer limit
 // keys_accum: [0..cap) = hash keys (atomic), [cap..cap*5) = accum RGBS (atomic)
 // resolved: [0..cap*4) = resolved RGBS (read-only from PT)
@@ -105,6 +126,9 @@ const MAT_FLAG_DOUBLE_SIDED: u32 = 2u;
 const MAT_FLAG_UNLIT: u32 = 4u;
 const MAX_THIN_GLASS_PASSES: u32 = 4u;
 const MAX_VOLUME_STACK: u32 = 4u;
+const LIGHT_TYPE_DIRECTIONAL: u32 = 0u;
+const LIGHT_TYPE_POINT: u32 = 1u;
+const LIGHT_TYPE_SPOT: u32 = 2u;
 
 // ============================================================
 // RNG: PCG + spatio-temporal R2 blue noise stratification
@@ -470,6 +494,40 @@ fn mat_thickness_texcoord(mat: Material) -> u32 { return u32(mat.d7.w + 0.5); }
 fn mat_occlusion_strength(mat: Material) -> f32 { return clamp(mat.d8.x, 0.0, 1.0); }
 fn mat_attenuation_distance(mat: Material) -> f32 { return max(mat.d8.y, 1e-6); }
 fn mat_attenuation_color(mat: Material) -> vec3f { return vec3f(mat.d8.z, mat.d8.w, mat.d9.x); }
+fn mat_specular_factor(mat: Material) -> f32 { return clamp(mat.d10.x, 0.0, 1.0); }
+fn mat_specular_tex(mat: Material) -> i32 { return decode_tex_index(mat.d10.y); }
+fn mat_specular_color_tex(mat: Material) -> i32 { return decode_tex_index(mat.d10.z); }
+fn mat_specular_color_factor(mat: Material) -> vec3f { return vec3f(mat.d10.w, mat.d11.x, mat.d11.y); }
+fn mat_specular_texcoord(mat: Material) -> u32 { return u32(mat.d11.z + 0.5); }
+fn mat_specular_color_texcoord(mat: Material) -> u32 { return u32(mat.d11.w + 0.5); }
+fn mat_clearcoat_factor(mat: Material) -> f32 { return clamp(mat.d12.x, 0.0, 1.0); }
+fn mat_clearcoat_tex(mat: Material) -> i32 { return decode_tex_index(mat.d12.y); }
+fn mat_clearcoat_roughness_factor(mat: Material) -> f32 { return clamp(mat.d12.z, 0.0, 1.0); }
+fn mat_clearcoat_rough_tex(mat: Material) -> i32 { return decode_tex_index(mat.d12.w); }
+fn mat_clearcoat_texcoord(mat: Material) -> u32 { return u32(mat.d13.x + 0.5); }
+fn mat_clearcoat_rough_texcoord(mat: Material) -> u32 { return u32(mat.d13.y + 0.5); }
+fn mat_clearcoat_normal_tex(mat: Material) -> i32 { return decode_tex_index(mat.d13.z); }
+fn mat_clearcoat_normal_texcoord(mat: Material) -> u32 { return u32(mat.d13.w + 0.5); }
+fn mat_clearcoat_normal_scale(mat: Material) -> f32 { return mat.d14.x; }
+fn mat_sheen_color_factor(mat: Material) -> vec3f { return vec3f(mat.d14.y, mat.d14.z, mat.d14.w); }
+fn mat_sheen_roughness_factor(mat: Material) -> f32 { return clamp(mat.d15.x, 0.0, 1.0); }
+fn mat_sheen_color_tex(mat: Material) -> i32 { return decode_tex_index(mat.d15.y); }
+fn mat_sheen_rough_tex(mat: Material) -> i32 { return decode_tex_index(mat.d15.z); }
+fn mat_sheen_color_texcoord(mat: Material) -> u32 { return u32(mat.d15.w + 0.5); }
+fn mat_sheen_rough_texcoord(mat: Material) -> u32 { return u32(mat.d16.x + 0.5); }
+fn mat_anisotropy_strength(mat: Material) -> f32 { return clamp(mat.d16.y, 0.0, 1.0); }
+fn mat_anisotropy_rotation(mat: Material) -> f32 { return mat.d16.z; }
+fn mat_anisotropy_tex(mat: Material) -> i32 { return decode_tex_index(mat.d16.w); }
+fn mat_anisotropy_texcoord(mat: Material) -> u32 { return u32(mat.d17.x + 0.5); }
+fn mat_iridescence_factor(mat: Material) -> f32 { return clamp(mat.d17.y, 0.0, 1.0); }
+fn mat_iridescence_tex(mat: Material) -> i32 { return decode_tex_index(mat.d17.z); }
+fn mat_iridescence_ior(mat: Material) -> f32 { return max(mat.d17.w, 1.0); }
+fn mat_iridescence_thickness_min(mat: Material) -> f32 { return max(mat.d18.x, 0.0); }
+fn mat_iridescence_thickness_max(mat: Material) -> f32 { return max(mat.d18.y, mat.d18.x); }
+fn mat_iridescence_thickness_tex(mat: Material) -> i32 { return decode_tex_index(mat.d18.z); }
+fn mat_iridescence_texcoord(mat: Material) -> u32 { return u32(mat.d18.w + 0.5); }
+fn mat_iridescence_thickness_texcoord(mat: Material) -> u32 { return u32(mat.d19.x + 0.5); }
+fn mat_dispersion(mat: Material) -> f32 { return max(mat.d19.y, 0.0); }
 
 fn material_is_unlit(mat: Material) -> bool {
   return (mat_flags(mat) & MAT_FLAG_UNLIT) != 0u || mat_type(mat) == 1u;
@@ -510,65 +568,267 @@ fn smith_g1(NdotV: f32, alpha: f32) -> f32 {
   return 2.0 * NdotV / (NdotV + sqrt(a2 + (1.0 - a2) * NdotV * NdotV));
 }
 
-fn eval_cook_torrance(N: vec3f, V: vec3f, L: vec3f, baseColor: vec3f, roughness: f32, metallic: f32, transmission: f32) -> vec3f {
-  let NdotL = max(dot(N, L), 0.0);
-  let NdotV = max(dot(N, V), 0.001);
-  if NdotL <= 0.0 { return vec3f(0.0); }
-  let H = normalize(V + L);
-  let NdotH = max(dot(N, H), 0.0);
-  let VdotH = max(dot(V, H), 0.0);
-  let alpha = max(roughness * roughness, 0.001);
-  let F0 = mix(vec3f(0.04), baseColor, metallic);
-  let F = fresnel_real(VdotH, F0);
-  let D = ggx_d(NdotH, alpha);
-  let G = smith_g1(NdotL, alpha) * smith_g1(NdotV, alpha);
-  let spec = (D * G * F) / max(4.0 * NdotV * NdotL, 0.001);
-  let kd = (1.0 - F) * (1.0 - metallic) * (1.0 - transmission);
-  return (kd * baseColor * INV_PI + spec) * NdotL;
-}
-
 // Split BRDF evaluation: returns demodulated diffuse irradiance + specular radiance separately
 struct BRDFSplit { diffuse: vec3f, specular: vec3f, };
 
-fn eval_ct_split(N: vec3f, V: vec3f, L: vec3f, baseColor: vec3f, roughness: f32, metallic: f32, transmission: f32) -> BRDFSplit {
-  let NdotL = max(dot(N, L), 0.0);
-  let NdotV = max(dot(N, V), 0.001);
-  if NdotL <= 0.0 { return BRDFSplit(vec3f(0.0), vec3f(0.0)); }
-  let H = normalize(V + L);
-  let NdotH = max(dot(N, H), 0.0);
-  let VdotH = max(dot(V, H), 0.0);
-  let alpha = max(roughness * roughness, 0.001);
-  let F0 = mix(vec3f(0.04), baseColor, metallic);
-  let F = fresnel_real(VdotH, F0);
-  let D = ggx_d(NdotH, alpha);
-  let G = smith_g1(NdotL, alpha) * smith_g1(NdotV, alpha);
-  let spec = (D * G * F) / max(4.0 * NdotV * NdotL, 0.001);
-  let kd = (1.0 - F) * (1.0 - metallic) * (1.0 - transmission);
-  return BRDFSplit(
-    vec3f(kd * INV_PI) * NdotL,   // diffuse irradiance (demodulated: no baseColor)
-    spec * NdotL                   // specular radiance (includes F0 color)
+fn ggx_d_anisotropic(NdotH: f32, TdotH: f32, BdotH: f32, at: f32, ab: f32) -> f32 {
+  let a2 = at * ab;
+  let f = vec3f(ab * TdotH, at * BdotH, a2 * NdotH);
+  let denom = dot(f, f);
+  if denom <= 1e-8 { return 0.0; }
+  let w2 = a2 / denom;
+  return a2 * w2 * w2 * INV_PI;
+}
+
+fn ggx_v_anisotropic(NdotL: f32, NdotV: f32, BdotV: f32, TdotV: f32, TdotL: f32, BdotL: f32, at: f32, ab: f32) -> f32 {
+  let ggxv = NdotL * length(vec3f(at * TdotV, ab * BdotV, NdotV));
+  let ggxl = NdotV * length(vec3f(at * TdotL, ab * BdotL, NdotL));
+  let denom = ggxv + ggxl;
+  if denom <= 1e-6 { return 0.0; }
+  return clamp(0.5 / denom, 0.0, 1.0);
+}
+
+fn sheen_charlie_distribution(NdotH: f32, sheen_roughness: f32) -> f32 {
+  let alpha_g = max(sheen_roughness * sheen_roughness, 1e-4);
+  let inv_r = 1.0 / alpha_g;
+  let sin2h = max(1.0 - NdotH * NdotH, 0.0);
+  return (2.0 + inv_r) * pow(sin2h, 0.5 * inv_r) / (2.0 * PI);
+}
+
+fn sheen_visibility_ashikhmin(NdotL: f32, NdotV: f32) -> f32 {
+  return 1.0 / max(4.0 * (NdotL + NdotV - NdotL * NdotV), 1e-4);
+}
+
+struct SurfaceEval {
+  normal: vec3f,
+  roughness: f32,
+  base_color: vec3f,
+  metallic: f32,
+  transmission: f32,
+  dielectric_f0: vec3f,
+  dielectric_f90: f32,
+  clearcoat_normal: vec3f,
+  clearcoat: f32,
+  clearcoat_roughness: f32,
+  sheen_color: vec3f,
+  sheen_roughness: f32,
+  anisotropic_t: vec3f,
+  anisotropy: f32,
+  anisotropic_b: vec3f,
+  _pad: f32,
+};
+
+fn build_surface_eval(td: vec4u, mat: Material, normal: vec3f, base_color: vec3f, roughness: f32, metallic: f32, transmission: f32, uv0: vec2f, uv1: vec2f, uv2: vec2f, uv3: vec2f) -> SurfaceEval {
+  let specular_params = sample_specular_params(mat, uv0, uv1, uv2, uv3);
+  let ior = max(mat_ior(mat), 1.0);
+  let base_f0 = pow((ior - 1.0) / max(ior + 1.0, 1e-6), 2.0);
+  let dielectric_f0 = min(vec3f(base_f0) * specular_params.rgb, vec3f(1.0)) * specular_params.a;
+  let dielectric_f90 = specular_params.a;
+
+  let clearcoat_params = sample_clearcoat_params(mat, uv0, uv1, uv2, uv3);
+  var clearcoat_normal = normal;
+  if clearcoat_params.x > 0.001 {
+    clearcoat_normal = apply_detail_normal(
+      mat_clearcoat_normal_tex(mat),
+      mat_clearcoat_normal_texcoord(mat),
+      mat_clearcoat_normal_scale(mat),
+      td, normal, uv0, uv1, uv2, uv3
+    );
+  }
+
+  let sheen_params = sample_sheen_params(mat, uv0, uv1, uv2, uv3);
+  let anisotropy_params = sample_anisotropy_params(mat, uv0, uv1, uv2, uv3);
+  let anisotropy_uv = select(mat_anisotropy_texcoord(mat), mat_normal_texcoord(mat), mat_anisotropy_tex(mat) < 0);
+  let tbn = tangent_basis_from_texcoord(td, normal, anisotropy_uv);
+  let anisotropic_t = normalize(tbn * vec3f(anisotropy_params.xy, 0.0));
+  let anisotropic_b = normalize(cross(normal, anisotropic_t));
+
+  return SurfaceEval(
+    normal,
+    roughness,
+    base_color,
+    metallic,
+    transmission,
+    dielectric_f0,
+    dielectric_f90,
+    clearcoat_normal,
+    clearcoat_params.x,
+    max(clearcoat_params.y, 0.001),
+    sheen_params.rgb,
+    sheen_params.a,
+    anisotropic_t,
+    anisotropy_params.z,
+    anisotropic_b,
+    0.0
   );
 }
 
-fn sample_sun_nee_split(pos: vec3f, normal: vec3f, V: vec3f, baseColor: vec3f, roughness: f32, metallic: f32, transmission: f32) -> BRDFSplit {
+fn build_surface_eval_basic(mat: Material, normal: vec3f, base_color: vec3f, roughness: f32, metallic: f32, transmission: f32) -> SurfaceEval {
+  let ior = max(mat_ior(mat), 1.0);
+  let base_f0 = pow((ior - 1.0) / max(ior + 1.0, 1e-6), 2.0);
+  let onb = build_onb(normal);
+  return SurfaceEval(
+    normal,
+    roughness,
+    base_color,
+    metallic,
+    transmission,
+    vec3f(base_f0),
+    1.0,
+    normal,
+    0.0,
+    0.0,
+    vec3f(0.0),
+    0.0,
+    onb[0],
+    0.0,
+    onb[1],
+    0.0
+  );
+}
+
+fn eval_surface_split(surface: SurfaceEval, V: vec3f, L: vec3f) -> BRDFSplit {
+  let N = surface.normal;
+  let NdotL = max(dot(N, L), 0.0);
+  let NdotV = max(dot(N, V), 0.001);
+  if NdotL <= 0.0 { return BRDFSplit(vec3f(0.0), vec3f(0.0)); }
+
+  let H = normalize(V + L);
+  let NdotH = max(dot(N, H), 0.0);
+  let VdotH = max(dot(V, H), 0.0);
+  let alpha = max(surface.roughness * surface.roughness, 0.001);
+  let dielectric_f90 = vec3f(surface.dielectric_f90);
+  let F0 = mix(surface.dielectric_f0, surface.base_color, surface.metallic);
+  let F90 = mix(dielectric_f90, vec3f(1.0), surface.metallic);
+  let F = fresnel_schlick_vec(F0, F90, VdotH);
+
+  var D = ggx_d(NdotH, alpha);
+  var Vterm = smith_g1(NdotL, alpha) * smith_g1(NdotV, alpha) / max(4.0 * NdotL * NdotV, 1e-4);
+  if surface.anisotropy > 0.001 {
+    let at = mix(alpha, 1.0, surface.anisotropy * surface.anisotropy);
+    let ab = alpha;
+    let TdotV = dot(surface.anisotropic_t, V);
+    let BdotV = dot(surface.anisotropic_b, V);
+    let TdotL = dot(surface.anisotropic_t, L);
+    let BdotL = dot(surface.anisotropic_b, L);
+    let TdotH = dot(surface.anisotropic_t, H);
+    let BdotH = dot(surface.anisotropic_b, H);
+    D = ggx_d_anisotropic(NdotH, TdotH, BdotH, at, ab);
+    Vterm = ggx_v_anisotropic(NdotL, NdotV, BdotV, TdotV, TdotL, BdotL, at, ab);
+  }
+
+  let specular = F * D * Vterm * NdotL;
+  let diffuse_weight = (1.0 - surface.metallic) * (1.0 - surface.transmission) * (1.0 - max_component(F));
+  var diffuse = vec3f(diffuse_weight * INV_PI) * NdotL;
+  var spec_total = specular;
+
+  if max_component(surface.sheen_color) > 0.001 {
+    let sheen_d = sheen_charlie_distribution(NdotH, max(surface.sheen_roughness, 0.001));
+    let sheen_v = sheen_visibility_ashikhmin(NdotL, NdotV);
+    spec_total += surface.sheen_color * sheen_d * sheen_v * NdotL;
+  }
+
+  if surface.clearcoat > 0.001 {
+    let Nc = surface.clearcoat_normal;
+    let NcdotL = max(dot(Nc, L), 0.0);
+    let NcdotV = max(dot(Nc, V), 0.001);
+    if NcdotL > 0.0 {
+      let Hc = normalize(V + L);
+      let NcdotH = max(dot(Nc, Hc), 0.0);
+      let VdotHc = max(dot(V, Hc), 0.0);
+      let alpha_c = max(surface.clearcoat_roughness * surface.clearcoat_roughness, 0.001);
+      let Dc = ggx_d(NcdotH, alpha_c);
+      let Vc = smith_g1(NcdotL, alpha_c) * smith_g1(NcdotV, alpha_c) / max(4.0 * NcdotL * NcdotV, 1e-4);
+      let layer_f = surface.clearcoat * fresnel_schlick_scalar(0.04, 1.0, abs(dot(Nc, V)));
+      let Fc = fresnel_schlick_vec(vec3f(0.04), vec3f(1.0), VdotHc);
+      diffuse *= max(1.0 - layer_f, 0.0);
+      spec_total *= max(1.0 - layer_f, 0.0);
+      spec_total += layer_f * Fc * Dc * Vc * NcdotL;
+    }
+  }
+
+  return BRDFSplit(diffuse, spec_total);
+}
+
+fn eval_surface_total(surface: SurfaceEval, V: vec3f, L: vec3f) -> vec3f {
+  let split = eval_surface_split(surface, V, L);
+  return split.diffuse * surface.base_color + split.specular;
+}
+
+fn punctual_distance_attenuation(dist: f32, range: f32) -> f32 {
+  let dist2 = max(dist * dist, 1e-4);
+  if range <= 0.0 { return 1.0 / dist2; }
+  let falloff = clamp(1.0 - pow(dist / range, 4.0), 0.0, 1.0);
+  return falloff / dist2;
+}
+
+fn sample_punctual_nee_split(pos: vec3f, origin: vec3f, V: vec3f, surface: SurfaceEval) -> BRDFSplit {
+  var result = BRDFSplit(vec3f(0.0), vec3f(0.0));
+  for (var li = 0u; li < uniforms.light_count; li++) {
+    let light = uniforms.lights[li];
+    let light_type = u32(light.params.x + 0.5);
+    var L = vec3f(0.0);
+    var max_t = 1e30;
+    var light_radiance = vec3f(0.0);
+
+    if light_type == LIGHT_TYPE_DIRECTIONAL {
+      L = normalize(-light.dir_inner.xyz);
+      if dot(surface.normal, L) <= 0.0 { continue; }
+      if trace_shadow(origin, L, 1e6) { continue; }
+      light_radiance = light.color_intensity.rgb * light.color_intensity.w;
+    } else {
+      let to_light = light.pos_range.xyz - pos;
+      let dist = length(to_light);
+      if dist <= 1e-4 { continue; }
+      L = to_light / dist;
+      if dot(surface.normal, L) <= 0.0 { continue; }
+      max_t = dist - 0.01;
+      if max_t <= 0.0 { continue; }
+      var attenuation = punctual_distance_attenuation(dist, light.pos_range.w);
+      if light_type == LIGHT_TYPE_SPOT {
+        let cd = dot(normalize(light.dir_inner.xyz), -L);
+        let angle_scale = 1.0 / max(0.001, light.dir_inner.w - light.params.y);
+        let angle_offset = -light.params.y * angle_scale;
+        let angular = clamp(cd * angle_scale + angle_offset, 0.0, 1.0);
+        attenuation *= angular * angular;
+      }
+      if attenuation <= 0.0 || trace_shadow(origin, L, max_t) { continue; }
+      light_radiance = light.color_intensity.rgb * light.color_intensity.w * attenuation;
+    }
+
+    let brdf = eval_surface_split(surface, V, L);
+    result.diffuse += brdf.diffuse * light_radiance;
+    result.specular += brdf.specular * light_radiance;
+  }
+  return result;
+}
+
+fn sample_sun_nee_split(pos: vec3f, normal: vec3f, V: vec3f, td: vec4u, mat: Material, uv0: vec2f, uv1: vec2f, uv2: vec2f, uv3: vec2f, baseColor: vec3f, roughness: f32, metallic: f32, transmission: f32) -> BRDFSplit {
   let origin = pos + normal * BIAS;
+  let surface = build_surface_eval(td, mat, normal, baseColor, roughness, metallic, transmission, uv0, uv1, uv2, uv3);
   var result_split = BRDFSplit(vec3f(0.0), vec3f(0.0));
 
   // Sun NEE
-  var shadow_val = 0.0;
-  let L1 = sample_cone(g_sun_dir, COS_SUN_ANGLE);
-  let L2 = sample_cone(g_sun_dir, COS_SUN_ANGLE);
-  if !trace_shadow(origin, L1, 50.0) { shadow_val += 0.5; }
-  if !trace_shadow(origin, L2, 50.0) { shadow_val += 0.5; }
-  if shadow_val > 0.0 {
-    let L = normalize(L1 + L2);
-    let cos_theta = dot(normal, L);
-    if cos_theta > 0.0 {
-      let brdf = eval_ct_split(normal, V, L, baseColor, roughness, metallic, transmission);
-      let light = SUN_COLOR * SUN_MULT * SUN_SOLID_ANGLE * shadow_val;
-      result_split = BRDFSplit(brdf.diffuse * light, brdf.specular * light);
+  if uniforms.sun_enabled != 0u {
+    var shadow_val = 0.0;
+    let L1 = sample_cone(g_sun_dir, COS_SUN_ANGLE);
+    let L2 = sample_cone(g_sun_dir, COS_SUN_ANGLE);
+    if !trace_shadow(origin, L1, 50.0) { shadow_val += 0.5; }
+    if !trace_shadow(origin, L2, 50.0) { shadow_val += 0.5; }
+    if shadow_val > 0.0 {
+      let L = normalize(L1 + L2);
+      if dot(normal, L) > 0.0 {
+        let brdf = eval_surface_split(surface, V, L);
+        let light = SUN_COLOR * SUN_MULT * SUN_SOLID_ANGLE * shadow_val;
+        result_split.diffuse += brdf.diffuse * light;
+        result_split.specular += brdf.specular * light;
+      }
     }
   }
+
+  let punctual_split = sample_punctual_nee_split(pos, origin, V, surface);
+  result_split.diffuse += punctual_split.diffuse;
+  result_split.specular += punctual_split.specular;
 
   // NEE to emissive triangles (CDF importance sampling + MIS, split)
   if uniforms.emissive_tri_count > 0u {
@@ -580,11 +840,11 @@ fn sample_sun_nee_split(pos: vec3f, normal: vec3f, V: vec3f, baseColor: vec3f, r
     }
     let etri = emissive_tris[lo];
     let tri_idx = bitcast<u32>(etri.x);
-    let td = tri_data[tri_idx];
-    let emat = material_buf[td.w];
-    let ev0 = vertices[td.x].xyz;
-    let ev1 = vertices[td.y].xyz;
-    let ev2 = vertices[td.z].xyz;
+    let etd = tri_data[tri_idx];
+    let emat = material_buf[etd.w];
+    let ev0 = vertices[etd.x].xyz;
+    let ev1 = vertices[etd.y].xyz;
+    let ev2 = vertices[etd.z].xyz;
     let earea = etri.y;
     var prevCdf = 0.0;
     if lo > 0u { prevCdf = emissive_tris[lo - 1u].z; }
@@ -594,17 +854,19 @@ fn sample_sun_nee_split(pos: vec3f, normal: vec3f, V: vec3f, baseColor: vec3f, r
     let ew = 1.0 - eu - ev_r;
     let epos = ev0 * (1.0 - eu - ev_r) + ev1 * eu + ev2 * ev_r;
     let enormal = normalize(cross(ev1 - ev0, ev2 - ev0));
-    let euv0 = get_uv0(td, ew, eu, ev_r);
-    let euv1 = get_uv1(td, ew, eu, ev_r);
-    let eemission = sample_emissive(emat, euv0, euv1) * alpha_coverage_factor(emat, euv0, euv1);
+    let euv0 = get_uv0(etd, ew, eu, ev_r);
+    let euv1 = get_uv1(etd, ew, eu, ev_r);
+    let euv2 = get_uv2(etd, ew, eu, ev_r);
+    let euv3 = get_uv3(etd, ew, eu, ev_r);
+    let eemission = sample_emissive(emat, euv0, euv1, euv2, euv3) * alpha_coverage_factor(emat, euv0, euv1, euv2, euv3);
     let eto = epos - pos;
     let edist = length(eto);
     let edir = eto / max(edist, 1e-6);
     let endotl = dot(normal, edir);
     let ecos_theta = dot(-edir, enormal);
     if endotl > 0.0 && ecos_theta > 0.0 && edist > 0.01 && earea > 1e-6 && dot(eemission, vec3f(1.0)) > 1e-6 {
-      if !trace_shadow_skip_mat(origin, edir, edist - 0.01, td.w) {
-        let ebrdf = eval_ct_split(normal, V, edir, baseColor, roughness, metallic, transmission);
+      if !trace_shadow_skip_mat(origin, edir, edist - 0.01, etd.w) {
+        let ebrdf = eval_surface_split(surface, V, edir);
         let eradiance = eemission * ecos_theta / (edist * edist);
         let light_pdf = triProb / earea;
         let sa_pdf = light_pdf * edist * edist / ecos_theta;
@@ -618,6 +880,87 @@ fn sample_sun_nee_split(pos: vec3f, normal: vec3f, V: vec3f, baseColor: vec3f, r
   }
 
   return result_split;
+}
+
+fn sample_sun_nee(pos: vec3f, normal: vec3f, V: vec3f, td: vec4u, mat: Material, uv0: vec2f, uv1: vec2f, uv2: vec2f, uv3: vec2f, baseColor: vec3f, roughness: f32, metallic: f32, transmission: f32) -> vec3f {
+  let split = sample_sun_nee_split(pos, normal, V, td, mat, uv0, uv1, uv2, uv3, baseColor, roughness, metallic, transmission);
+  return split.diffuse * baseColor + split.specular;
+}
+
+fn sample_scene_nee_basic(pos: vec3f, normal: vec3f, V: vec3f, surface: SurfaceEval) -> vec3f {
+  let origin = pos + normal * BIAS;
+  var result_split = BRDFSplit(vec3f(0.0), vec3f(0.0));
+
+  if uniforms.sun_enabled != 0u {
+    var shadow_val = 0.0;
+    let L1 = sample_cone(g_sun_dir, COS_SUN_ANGLE);
+    let L2 = sample_cone(g_sun_dir, COS_SUN_ANGLE);
+    if !trace_shadow(origin, L1, 50.0) { shadow_val += 0.5; }
+    if !trace_shadow(origin, L2, 50.0) { shadow_val += 0.5; }
+    if shadow_val > 0.0 {
+      let L = normalize(L1 + L2);
+      if dot(normal, L) > 0.0 {
+        let brdf = eval_surface_split(surface, V, L);
+        let light = SUN_COLOR * SUN_MULT * SUN_SOLID_ANGLE * shadow_val;
+        result_split.diffuse += brdf.diffuse * light;
+        result_split.specular += brdf.specular * light;
+      }
+    }
+  }
+
+  let punctual_split = sample_punctual_nee_split(pos, origin, V, surface);
+  result_split.diffuse += punctual_split.diffuse;
+  result_split.specular += punctual_split.specular;
+
+  if uniforms.emissive_tri_count > 0u {
+    let rnd = rand();
+    var lo = 0u; var hi = uniforms.emissive_tri_count - 1u;
+    while lo < hi {
+      let mid = (lo + hi) / 2u;
+      if rnd <= emissive_tris[mid].z { hi = mid; } else { lo = mid + 1u; }
+    }
+    let etri = emissive_tris[lo];
+    let tri_idx = bitcast<u32>(etri.x);
+    let etd = tri_data[tri_idx];
+    let emat = material_buf[etd.w];
+    let ev0 = vertices[etd.x].xyz;
+    let ev1 = vertices[etd.y].xyz;
+    let ev2 = vertices[etd.z].xyz;
+    let earea = etri.y;
+    var prevCdf = 0.0;
+    if lo > 0u { prevCdf = emissive_tris[lo - 1u].z; }
+    let triProb = etri.z - prevCdf;
+    var eu = rand(); var ev_r = rand();
+    if eu + ev_r > 1.0 { eu = 1.0 - eu; ev_r = 1.0 - ev_r; }
+    let ew = 1.0 - eu - ev_r;
+    let epos = ev0 * ew + ev1 * eu + ev2 * ev_r;
+    let enormal = normalize(cross(ev1 - ev0, ev2 - ev0));
+    let euv0 = get_uv0(etd, ew, eu, ev_r);
+    let euv1 = get_uv1(etd, ew, eu, ev_r);
+    let euv2 = get_uv2(etd, ew, eu, ev_r);
+    let euv3 = get_uv3(etd, ew, eu, ev_r);
+    let eemission = sample_emissive(emat, euv0, euv1, euv2, euv3) * alpha_coverage_factor(emat, euv0, euv1, euv2, euv3);
+    let eto = epos - pos;
+    let edist = length(eto);
+    let edir = eto / max(edist, 1e-6);
+    let endotl = dot(normal, edir);
+    let ecos_theta = dot(-edir, enormal);
+    if endotl > 0.0 && ecos_theta > 0.0 && edist > 0.01 && earea > 1e-6 && dot(eemission, vec3f(1.0)) > 1e-6 {
+      if !trace_shadow_skip_mat(origin, edir, edist - 0.01, etd.w) {
+        let ebrdf = eval_surface_split(surface, V, edir);
+        let eradiance = eemission * ecos_theta / (edist * edist);
+        let light_pdf = triProb / earea;
+        let sa_pdf = light_pdf * edist * edist / ecos_theta;
+        let bsdf_pdf = endotl * INV_PI;
+        let mis_w = (sa_pdf * sa_pdf) / (sa_pdf * sa_pdf + bsdf_pdf * bsdf_pdf + 1e-8);
+        let escale = eradiance * mis_w / max(light_pdf, 1e-6);
+        result_split.diffuse += ebrdf.diffuse * escale;
+        result_split.specular += ebrdf.specular * escale;
+      }
+    }
+  }
+
+  return result_split.diffuse * surface.base_color + result_split.specular;
 }
 
 // ============================================================
@@ -674,7 +1017,9 @@ fn trace_bvh_hint(origin: vec3f, dir: vec3f, t_hint: f32) -> HitInfo {
           let bw = 1.0 - r.y - r.z;
           let uv0 = get_uv0(td, bw, r.y, r.z);
           let uv1 = get_uv1(td, bw, r.y, r.z);
-          if !passes_alpha_surface_hit(mat, uv0, uv1) { continue; }
+          let uv2 = get_uv2(td, bw, r.y, r.z);
+          let uv3 = get_uv3(td, bw, r.y, r.z);
+          if !passes_alpha_surface_hit(mat, uv0, uv1, uv2, uv3) { continue; }
           hit.t=r.x; hit.u=r.y; hit.v=r.z; hit.tri_idx=ti; hit.hit=true;
         }
       }
@@ -715,9 +1060,11 @@ fn trace_shadow_skip_mat(origin: vec3f, dir: vec3f, max_t: f32, skip_mat: u32) -
           let bw = 1.0 - r.y - r.z;
           let uv0 = get_uv0(td, bw, r.y, r.z);
           let uv1 = get_uv1(td, bw, r.y, r.z);
-          if !passes_alpha_shadow(td, bw, r.y, r.z, mat, uv0, uv1) { continue; }
+          let uv2 = get_uv2(td, bw, r.y, r.z);
+          let uv3 = get_uv3(td, bw, r.y, r.z);
+          if !passes_alpha_shadow(td, bw, r.y, r.z, mat, uv0, uv1, uv2, uv3) { continue; }
           if material_has_transmission(mat) {
-            let thickness = sample_thickness(mat, uv0, uv1);
+            let thickness = sample_thickness(mat, uv0, uv1, uv2, uv3);
             if material_is_thin(mat) || thickness <= 1e-5 { continue; }
           }
           return true;
@@ -760,9 +1107,11 @@ fn trace_shadow(origin: vec3f, dir: vec3f, max_t: f32) -> bool {
           let bw = 1.0 - r.y - r.z;
           let uv0 = get_uv0(td, bw, r.y, r.z);
           let uv1 = get_uv1(td, bw, r.y, r.z);
-          if !passes_alpha_shadow(td, bw, r.y, r.z, mat, uv0, uv1) { continue; }
+          let uv2 = get_uv2(td, bw, r.y, r.z);
+          let uv3 = get_uv3(td, bw, r.y, r.z);
+          if !passes_alpha_shadow(td, bw, r.y, r.z, mat, uv0, uv1, uv2, uv3) { continue; }
           if material_has_transmission(mat) {
-            let thickness = sample_thickness(mat, uv0, uv1);
+            let thickness = sample_thickness(mat, uv0, uv1, uv2, uv3);
             if material_is_thin(mat) || thickness <= 1e-5 { continue; }
           }
           return true;
@@ -792,78 +1141,6 @@ fn sky_color(dir: vec3f) -> vec3f {
   var sky = mix(vec3f(0.3, 0.3, 0.35), SKY_COLOR, t);
   if dot(dir, g_sun_dir) > COS_SUN_ANGLE { sky += SUN_COLOR * SUN_MULT; }
   return sky;
-}
-
-fn sample_sun_nee(pos: vec3f, normal: vec3f, V: vec3f, baseColor: vec3f, roughness: f32, metallic: f32, transmission: f32) -> vec3f {
-  let origin = pos + normal * BIAS;
-  var result = vec3f(0.0);
-
-  // Sun NEE: 2 jittered shadow rays averaged
-  var shadow_val = 0.0;
-  let L1 = sample_cone(g_sun_dir, COS_SUN_ANGLE);
-  let L2 = sample_cone(g_sun_dir, COS_SUN_ANGLE);
-  if !trace_shadow(origin, L1, 50.0) { shadow_val += 0.5; }
-  if !trace_shadow(origin, L2, 50.0) { shadow_val += 0.5; }
-  if shadow_val > 0.0 {
-    let L = normalize(L1 + L2);
-    let cos_theta = dot(normal, L);
-    if cos_theta > 0.0 {
-      result = SUN_COLOR * SUN_MULT * eval_cook_torrance(normal, V, L, baseColor, roughness, metallic, transmission) * SUN_SOLID_ANGLE * shadow_val;
-    }
-  }
-
-  // NEE to emissive triangles (CDF importance sampling + MIS, ignis-rt format)
-  if uniforms.emissive_tri_count > 0u {
-    // CDF binary search: select triangle proportional to power (area × luminance)
-    let rnd = rand();
-    var lo = 0u; var hi = uniforms.emissive_tri_count - 1u;
-    while lo < hi {
-      let mid = (lo + hi) / 2u;
-      let cdf = emissive_tris[mid].z;
-      if rnd <= cdf { hi = mid; } else { lo = mid + 1u; }
-    }
-    let eti = lo;
-    let etri = emissive_tris[eti];
-    let tri_idx = bitcast<u32>(etri.x);
-    let td = tri_data[tri_idx];
-    let emat = material_buf[td.w];
-    let ev0 = vertices[td.x].xyz;
-    let ev1 = vertices[td.y].xyz;
-    let ev2 = vertices[td.z].xyz;
-    let earea = etri.y;
-    var prevCdf = 0.0;
-    if eti > 0u { prevCdf = emissive_tris[eti - 1u].z; }
-    let triProb = etri.z - prevCdf;
-
-    var eu = rand(); var ev_r = rand();
-    if eu + ev_r > 1.0 { eu = 1.0 - eu; ev_r = 1.0 - ev_r; }
-    let ew = 1.0 - eu - ev_r;
-    let epos = ev0 * ew + ev1 * eu + ev2 * ev_r;
-    let enormal = normalize(cross(ev1 - ev0, ev2 - ev0));
-    let euv0 = get_uv0(td, ew, eu, ev_r);
-    let euv1 = get_uv1(td, ew, eu, ev_r);
-    let eemission = sample_emissive(emat, euv0, euv1) * alpha_coverage_factor(emat, euv0, euv1);
-
-    let eto = epos - pos;
-    let edist = length(eto);
-    let edir = eto / max(edist, 1e-6);
-    let endotl = dot(normal, edir);
-    let ecos_theta = dot(-edir, enormal);
-
-    if endotl > 0.0 && ecos_theta > 0.0 && edist > 0.01 && earea > 1e-6 && dot(eemission, vec3f(1.0)) > 1e-6 {
-      if !trace_shadow_skip_mat(origin, edir, edist - 0.01, td.w) {
-        let ebrdf = eval_cook_torrance(normal, V, edir, baseColor, roughness, metallic, transmission);
-        let eradiance = eemission * ecos_theta / (edist * edist);
-        let light_pdf = triProb / earea;
-        let solid_angle_pdf = light_pdf * edist * edist / ecos_theta;
-        let bsdf_pdf = endotl * INV_PI;
-        let mis_w = (solid_angle_pdf * solid_angle_pdf) / (solid_angle_pdf * solid_angle_pdf + bsdf_pdf * bsdf_pdf + 1e-8);
-        result += ebrdf * eradiance * mis_w / max(light_pdf, 1e-6);
-      }
-    }
-  }
-
-  return result;
 }
 
 // ============================================================
@@ -921,12 +1198,28 @@ fn get_uv0(td: vec4u, bw: f32, u: f32, v: f32) -> vec2f {
        + v * vec2f(vertices[td.z].w, vert_normals[td.z].w);
 }
 
-fn get_uv1(td: vec4u, bw: f32, u: f32, v: f32) -> vec2f {
-  return bw * vert_uv1[td.x] + u * vert_uv1[td.y] + v * vert_uv1[td.z];
+fn load_uv_extra(vertex_idx: u32, set_idx: u32) -> vec2f {
+  let base = vertex_idx * 6u + set_idx * 2u;
+  return vec2f(vert_uv_extra[base], vert_uv_extra[base + 1u]);
 }
 
-fn select_uv(uv0: vec2f, uv1: vec2f, texcoord: u32) -> vec2f {
-  return select(uv0, uv1, texcoord == 1u);
+fn get_uv1(td: vec4u, bw: f32, u: f32, v: f32) -> vec2f {
+  return bw * load_uv_extra(td.x, 0u) + u * load_uv_extra(td.y, 0u) + v * load_uv_extra(td.z, 0u);
+}
+
+fn get_uv2(td: vec4u, bw: f32, u: f32, v: f32) -> vec2f {
+  return bw * load_uv_extra(td.x, 1u) + u * load_uv_extra(td.y, 1u) + v * load_uv_extra(td.z, 1u);
+}
+
+fn get_uv3(td: vec4u, bw: f32, u: f32, v: f32) -> vec2f {
+  return bw * load_uv_extra(td.x, 2u) + u * load_uv_extra(td.y, 2u) + v * load_uv_extra(td.z, 2u);
+}
+
+fn select_uv(uv0: vec2f, uv1: vec2f, uv2: vec2f, uv3: vec2f, texcoord: u32) -> vec2f {
+  if texcoord == 1u { return uv1; }
+  if texcoord == 2u { return uv2; }
+  if texcoord == 3u { return uv3; }
+  return uv0;
 }
 
 fn triangle_geo_normal(td: vec4u) -> vec3f {
@@ -938,23 +1231,54 @@ fn triangle_geo_normal(td: vec4u) -> vec3f {
   return n / sqrt(len2);
 }
 
-fn sample_base_rgba(mat: Material, uv0: vec2f, uv1: vec2f) -> vec4f {
+fn tangent_basis_from_texcoord(td: vec4u, N: vec3f, texcoord: u32) -> mat3x3f {
+  let v0 = vertices[td.x].xyz;
+  let v1 = vertices[td.y].xyz;
+  let v2 = vertices[td.z].xyz;
+  let tuv0 = select_uv(vec2f(vertices[td.x].w, vert_normals[td.x].w), load_uv_extra(td.x, 0u), load_uv_extra(td.x, 1u), load_uv_extra(td.x, 2u), texcoord);
+  let tuv1 = select_uv(vec2f(vertices[td.y].w, vert_normals[td.y].w), load_uv_extra(td.y, 0u), load_uv_extra(td.y, 1u), load_uv_extra(td.y, 2u), texcoord);
+  let tuv2 = select_uv(vec2f(vertices[td.z].w, vert_normals[td.z].w), load_uv_extra(td.z, 0u), load_uv_extra(td.z, 1u), load_uv_extra(td.z, 2u), texcoord);
+  let dp1 = v1 - v0;
+  let dp2 = v2 - v0;
+  let duv1 = tuv1 - tuv0;
+  let duv2 = tuv2 - tuv0;
+  let det = duv1.x * duv2.y - duv2.x * duv1.y;
+  if abs(det) < 1e-8 {
+    return build_onb(N);
+  }
+  let inv_det = 1.0 / det;
+  var T = normalize((dp1 * duv2.y - dp2 * duv1.y) * inv_det);
+  T = normalize(T - N * dot(N, T));
+  let B = normalize(cross(N, T));
+  return mat3x3f(T, B, N);
+}
+
+fn apply_detail_normal(tex_idx: i32, texcoord: u32, scale: f32, td: vec4u, N: vec3f, uv0: vec2f, uv1: vec2f, uv2: vec2f, uv3: vec2f) -> vec3f {
+  if tex_idx < 0 { return N; }
+  let uv = select_uv(uv0, uv1, uv2, uv3, texcoord);
+  let ns = textureSampleLevel(tex_array, tex_sampler_pt, uv, tex_idx, 0.0);
+  let tn = vec3f((ns.rg * 2.0 - vec2f(1.0)) * scale, ns.b * 2.0 - 1.0);
+  let tbn = tangent_basis_from_texcoord(td, N, texcoord);
+  return normalize(tbn[0] * tn.x + tbn[1] * tn.y + tbn[2] * tn.z);
+}
+
+fn sample_base_rgba(mat: Material, uv0: vec2f, uv1: vec2f, uv2: vec2f, uv3: vec2f) -> vec4f {
   var rgba = vec4f(mat_base_color_factor(mat), mat_base_alpha(mat));
   let base_tex_idx = mat_base_tex(mat);
   if base_tex_idx >= 0 {
-    let uv = select_uv(uv0, uv1, mat_base_texcoord(mat));
+    let uv = select_uv(uv0, uv1, uv2, uv3, mat_base_texcoord(mat));
     let tc = textureSampleLevel(tex_array, tex_sampler_pt, uv, base_tex_idx, 0.0);
     rgba *= vec4f(srgb_to_linear(tc.rgb), tc.a);
   }
   return vec4f(clamp(rgba.rgb, vec3f(0.0), vec3f(1e6)), clamp(rgba.a, 0.0, 1.0));
 }
 
-fn sample_metallic_roughness(mat: Material, uv0: vec2f, uv1: vec2f) -> vec2f {
+fn sample_metallic_roughness(mat: Material, uv0: vec2f, uv1: vec2f, uv2: vec2f, uv3: vec2f) -> vec2f {
   var roughness = clamp(mat_roughness_factor(mat), 0.0, 1.0);
   var metallic = clamp(mat_metallic_factor(mat), 0.0, 1.0);
   let mr_tex_idx = mat_mr_tex(mat);
   if mr_tex_idx >= 0 {
-    let uv = select_uv(uv0, uv1, mat_mr_texcoord(mat));
+    let uv = select_uv(uv0, uv1, uv2, uv3, mat_mr_texcoord(mat));
     let mr = textureSampleLevel(tex_array, tex_sampler_pt, uv, mr_tex_idx, 0.0);
     roughness *= mr.g;
     metallic *= mr.b;
@@ -962,42 +1286,129 @@ fn sample_metallic_roughness(mat: Material, uv0: vec2f, uv1: vec2f) -> vec2f {
   return vec2f(clamp(metallic, 0.0, 1.0), clamp(roughness, 0.0, 1.0));
 }
 
-fn sample_emissive(mat: Material, uv0: vec2f, uv1: vec2f) -> vec3f {
+fn sample_emissive(mat: Material, uv0: vec2f, uv1: vec2f, uv2: vec2f, uv3: vec2f) -> vec3f {
   var emission = max(mat_emissive_factor(mat), vec3f(0.0));
   let emissive_tex_idx = mat_emissive_tex(mat);
   if emissive_tex_idx >= 0 {
-    let uv = select_uv(uv0, uv1, mat_emissive_texcoord(mat));
+    let uv = select_uv(uv0, uv1, uv2, uv3, mat_emissive_texcoord(mat));
     emission *= srgb_to_linear(textureSampleLevel(tex_array, tex_sampler_pt, uv, emissive_tex_idx, 0.0).rgb);
   }
   return emission * mat_emission_strength(mat);
 }
 
-fn sample_occlusion(mat: Material, uv0: vec2f, uv1: vec2f) -> f32 {
+fn sample_occlusion(mat: Material, uv0: vec2f, uv1: vec2f, uv2: vec2f, uv3: vec2f) -> f32 {
   let occlusion_tex_idx = mat_occlusion_tex(mat);
   if occlusion_tex_idx < 0 { return 1.0; }
-  let uv = select_uv(uv0, uv1, mat_occlusion_texcoord(mat));
+  let uv = select_uv(uv0, uv1, uv2, uv3, mat_occlusion_texcoord(mat));
   let ao = textureSampleLevel(tex_array, tex_sampler_pt, uv, occlusion_tex_idx, 0.0).r;
   return mix(1.0, ao, mat_occlusion_strength(mat));
 }
 
-fn sample_transmission(mat: Material, uv0: vec2f, uv1: vec2f, metallic: f32) -> f32 {
+fn sample_transmission(mat: Material, uv0: vec2f, uv1: vec2f, uv2: vec2f, uv3: vec2f, metallic: f32) -> f32 {
   var transmission = mat_transmission_factor(mat);
   let tx = mat_transmission_tex(mat);
   if tx >= 0 {
-    let uv = select_uv(uv0, uv1, mat_transmission_texcoord(mat));
+    let uv = select_uv(uv0, uv1, uv2, uv3, mat_transmission_texcoord(mat));
     transmission *= textureSampleLevel(tex_array, tex_sampler_pt, uv, tx, 0.0).r;
   }
   return clamp(transmission * (1.0 - metallic), 0.0, 1.0);
 }
 
-fn sample_thickness(mat: Material, uv0: vec2f, uv1: vec2f) -> f32 {
+fn sample_thickness(mat: Material, uv0: vec2f, uv1: vec2f, uv2: vec2f, uv3: vec2f) -> f32 {
   var thickness = mat_thickness_factor(mat);
   let tx = mat_thickness_tex(mat);
   if tx >= 0 {
-    let uv = select_uv(uv0, uv1, mat_thickness_texcoord(mat));
+    let uv = select_uv(uv0, uv1, uv2, uv3, mat_thickness_texcoord(mat));
     thickness *= textureSampleLevel(tex_array, tex_sampler_pt, uv, tx, 0.0).g;
   }
   return max(thickness, 0.0);
+}
+
+fn max_component(v: vec3f) -> f32 {
+  return max(v.x, max(v.y, v.z));
+}
+
+fn fresnel_schlick_vec(F0: vec3f, F90: vec3f, cos_theta: f32) -> vec3f {
+  let f = pow(1.0 - clamp(cos_theta, 0.0, 1.0), 5.0);
+  return F0 + (F90 - F0) * f;
+}
+
+fn fresnel_schlick_scalar(f0: f32, f90: f32, cos_theta: f32) -> f32 {
+  let f = pow(1.0 - clamp(cos_theta, 0.0, 1.0), 5.0);
+  return f0 + (f90 - f0) * f;
+}
+
+fn sample_specular_params(mat: Material, uv0: vec2f, uv1: vec2f, uv2: vec2f, uv3: vec2f) -> vec4f {
+  var specular_weight = mat_specular_factor(mat);
+  let spec_tex_idx = mat_specular_tex(mat);
+  if spec_tex_idx >= 0 {
+    let uv = select_uv(uv0, uv1, uv2, uv3, mat_specular_texcoord(mat));
+    specular_weight *= textureSampleLevel(tex_array, tex_sampler_pt, uv, spec_tex_idx, 0.0).a;
+  }
+
+  var specular_color = clamp(mat_specular_color_factor(mat), vec3f(0.0), vec3f(1.0));
+  let spec_color_tex_idx = mat_specular_color_tex(mat);
+  if spec_color_tex_idx >= 0 {
+    let uv = select_uv(uv0, uv1, uv2, uv3, mat_specular_color_texcoord(mat));
+    specular_color *= srgb_to_linear(textureSampleLevel(tex_array, tex_sampler_pt, uv, spec_color_tex_idx, 0.0).rgb);
+  }
+  return vec4f(specular_color, clamp(specular_weight, 0.0, 1.0));
+}
+
+fn sample_clearcoat_params(mat: Material, uv0: vec2f, uv1: vec2f, uv2: vec2f, uv3: vec2f) -> vec2f {
+  var clearcoat = mat_clearcoat_factor(mat);
+  let clearcoat_tex_idx = mat_clearcoat_tex(mat);
+  if clearcoat_tex_idx >= 0 {
+    let uv = select_uv(uv0, uv1, uv2, uv3, mat_clearcoat_texcoord(mat));
+    clearcoat *= textureSampleLevel(tex_array, tex_sampler_pt, uv, clearcoat_tex_idx, 0.0).r;
+  }
+
+  var clearcoat_roughness = mat_clearcoat_roughness_factor(mat);
+  let clearcoat_rough_tex_idx = mat_clearcoat_rough_tex(mat);
+  if clearcoat_rough_tex_idx >= 0 {
+    let uv = select_uv(uv0, uv1, uv2, uv3, mat_clearcoat_rough_texcoord(mat));
+    clearcoat_roughness *= textureSampleLevel(tex_array, tex_sampler_pt, uv, clearcoat_rough_tex_idx, 0.0).g;
+  }
+  return vec2f(clamp(clearcoat, 0.0, 1.0), clamp(clearcoat_roughness, 0.0, 1.0));
+}
+
+fn sample_sheen_params(mat: Material, uv0: vec2f, uv1: vec2f, uv2: vec2f, uv3: vec2f) -> vec4f {
+  var sheen_color = max(mat_sheen_color_factor(mat), vec3f(0.0));
+  let sheen_color_tex_idx = mat_sheen_color_tex(mat);
+  if sheen_color_tex_idx >= 0 {
+    let uv = select_uv(uv0, uv1, uv2, uv3, mat_sheen_color_texcoord(mat));
+    sheen_color *= srgb_to_linear(textureSampleLevel(tex_array, tex_sampler_pt, uv, sheen_color_tex_idx, 0.0).rgb);
+  }
+
+  var sheen_roughness = mat_sheen_roughness_factor(mat);
+  let sheen_rough_tex_idx = mat_sheen_rough_tex(mat);
+  if sheen_rough_tex_idx >= 0 {
+    let uv = select_uv(uv0, uv1, uv2, uv3, mat_sheen_rough_texcoord(mat));
+    sheen_roughness *= textureSampleLevel(tex_array, tex_sampler_pt, uv, sheen_rough_tex_idx, 0.0).a;
+  }
+  return vec4f(sheen_color, clamp(sheen_roughness, 0.0, 1.0));
+}
+
+fn sample_anisotropy_params(mat: Material, uv0: vec2f, uv1: vec2f, uv2: vec2f, uv3: vec2f) -> vec3f {
+  var direction = vec2f(cos(mat_anisotropy_rotation(mat)), sin(mat_anisotropy_rotation(mat)));
+  var strength = mat_anisotropy_strength(mat);
+  let anisotropy_tex_idx = mat_anisotropy_tex(mat);
+  if anisotropy_tex_idx >= 0 {
+    let uv = select_uv(uv0, uv1, uv2, uv3, mat_anisotropy_texcoord(mat));
+    let anisotropy_tex = textureSampleLevel(tex_array, tex_sampler_pt, uv, anisotropy_tex_idx, 0.0).rgb;
+    let map_dir_raw = anisotropy_tex.rg * 2.0 - vec2f(1.0);
+    if dot(map_dir_raw, map_dir_raw) > 1e-6 {
+      let map_dir = normalize(map_dir_raw);
+      let c = cos(mat_anisotropy_rotation(mat));
+      let s = sin(mat_anisotropy_rotation(mat));
+      direction = vec2f(
+        c * map_dir.x + s * map_dir.y,
+        -s * map_dir.x + c * map_dir.y
+      );
+    }
+    strength *= anisotropy_tex.b;
+  }
+  return vec3f(direction, clamp(strength, 0.0, 1.0));
 }
 
 fn apply_volume_attenuation(distance: f32, attenuation_color: vec3f, attenuation_distance: f32) -> vec3f {
@@ -1006,14 +1417,14 @@ fn apply_volume_attenuation(distance: f32, attenuation_color: vec3f, attenuation
   return exp(log(safe_color) * (distance / max(attenuation_distance, 1e-6)));
 }
 
-fn sample_alpha_coverage(mat: Material, uv0: vec2f, uv1: vec2f) -> f32 {
-  return sample_base_rgba(mat, uv0, uv1).a;
+fn sample_alpha_coverage(mat: Material, uv0: vec2f, uv1: vec2f, uv2: vec2f, uv3: vec2f) -> f32 {
+  return sample_base_rgba(mat, uv0, uv1, uv2, uv3).a;
 }
 
-fn alpha_coverage_factor(mat: Material, uv0: vec2f, uv1: vec2f) -> f32 {
+fn alpha_coverage_factor(mat: Material, uv0: vec2f, uv1: vec2f, uv2: vec2f, uv3: vec2f) -> f32 {
   let alpha_mode = mat_alpha_mode(mat);
   if alpha_mode == 0u { return 1.0; }
-  let alpha = sample_alpha_coverage(mat, uv0, uv1);
+  let alpha = sample_alpha_coverage(mat, uv0, uv1, uv2, uv3);
   if alpha_mode == 1u {
     return select(0.0, 1.0, alpha >= mat_alpha_cutoff(mat));
   }
@@ -1030,8 +1441,8 @@ fn hash_u32(x_in: u32) -> u32 {
   return x;
 }
 
-fn blend_alpha_threshold(td: vec4u, bw: f32, u: f32, v: f32, mat: Material, uv0: vec2f, uv1: vec2f) -> f32 {
-  let base_uv = select_uv(uv0, uv1, mat_base_texcoord(mat));
+fn blend_alpha_threshold(td: vec4u, bw: f32, u: f32, v: f32, mat: Material, uv0: vec2f, uv1: vec2f, uv2: vec2f, uv3: vec2f) -> f32 {
+  let base_uv = select_uv(uv0, uv1, uv2, uv3, mat_base_texcoord(mat));
   let pos = bw * vertices[td.x].xyz + u * vertices[td.y].xyz + v * vertices[td.z].xyz;
   let uv_q = vec2u(floor(fract(base_uv) * 4096.0));
   let cell = vec3i(floor(pos * 64.0));
@@ -1044,43 +1455,24 @@ fn blend_alpha_threshold(td: vec4u, bw: f32, u: f32, v: f32, mat: Material, uv0:
   return f32(h & 0x00ffffffu) * (1.0 / 16777216.0);
 }
 
-fn passes_alpha_surface_hit(mat: Material, uv0: vec2f, uv1: vec2f) -> bool {
+fn passes_alpha_surface_hit(mat: Material, uv0: vec2f, uv1: vec2f, uv2: vec2f, uv3: vec2f) -> bool {
   let alpha_mode = mat_alpha_mode(mat);
   if alpha_mode == 0u { return true; }
-  let alpha = sample_alpha_coverage(mat, uv0, uv1);
+  let alpha = sample_alpha_coverage(mat, uv0, uv1, uv2, uv3);
   if alpha_mode == 1u { return alpha >= mat_alpha_cutoff(mat); }
   return alpha > 0.001;
 }
 
-fn passes_alpha_shadow(td: vec4u, bw: f32, u: f32, v: f32, mat: Material, uv0: vec2f, uv1: vec2f) -> bool {
+fn passes_alpha_shadow(td: vec4u, bw: f32, u: f32, v: f32, mat: Material, uv0: vec2f, uv1: vec2f, uv2: vec2f, uv3: vec2f) -> bool {
   let alpha_mode = mat_alpha_mode(mat);
   if alpha_mode == 0u { return true; }
-  let alpha = sample_alpha_coverage(mat, uv0, uv1);
+  let alpha = sample_alpha_coverage(mat, uv0, uv1, uv2, uv3);
   if alpha_mode == 1u { return alpha >= mat_alpha_cutoff(mat); }
-  return alpha > blend_alpha_threshold(td, bw, u, v, mat, uv0, uv1);
+  return alpha > blend_alpha_threshold(td, bw, u, v, mat, uv0, uv1, uv2, uv3);
 }
 
-fn apply_normal_map(td: vec4u, N: vec3f, uv0: vec2f, uv1: vec2f, mat: Material) -> vec3f {
-  let tex_idx = mat_normal_tex(mat);
-  if tex_idx < 0 { return N; }
-  let uv = select_uv(uv0, uv1, mat_normal_texcoord(mat));
-  let ns = textureSampleLevel(tex_array, tex_sampler_pt, uv, tex_idx, 0.0);
-  var tn = ns.rgb * 2.0 - 1.0;
-  tn = vec3f(tn.xy * mat_normal_scale(mat), tn.z);
-  // Compute tangent frame from UV deltas (no stored tangents needed)
-  let v0 = vertices[td.x].xyz; let v1 = vertices[td.y].xyz; let v2 = vertices[td.z].xyz;
-  let tuv0 = select_uv(vec2f(vertices[td.x].w, vert_normals[td.x].w), vert_uv1[td.x], mat_normal_texcoord(mat));
-  let tuv1 = select_uv(vec2f(vertices[td.y].w, vert_normals[td.y].w), vert_uv1[td.y], mat_normal_texcoord(mat));
-  let tuv2 = select_uv(vec2f(vertices[td.z].w, vert_normals[td.z].w), vert_uv1[td.z], mat_normal_texcoord(mat));
-  let dp1 = v1 - v0; let dp2 = v2 - v0;
-  let duv1 = tuv1 - tuv0; let duv2 = tuv2 - tuv0;
-  let det = duv1.x * duv2.y - duv2.x * duv1.y;
-  if abs(det) < 1e-8 { return N; }
-  let inv_det = 1.0 / det;
-  var T = normalize((dp1 * duv2.y - dp2 * duv1.y) * inv_det);
-  T = normalize(T - N * dot(N, T)); // Gram-Schmidt orthogonalization
-  let B = cross(N, T);
-  return normalize(T * tn.x + B * tn.y + N * tn.z);
+fn apply_normal_map(td: vec4u, N: vec3f, uv0: vec2f, uv1: vec2f, uv2: vec2f, uv3: vec2f, mat: Material) -> vec3f {
+  return apply_detail_normal(mat_normal_tex(mat), mat_normal_texcoord(mat), mat_normal_scale(mat), td, N, uv0, uv1, uv2, uv3);
 }
 
 // ============================================================
@@ -1163,16 +1555,22 @@ fn path_trace(primary_origin: vec3f, primary_dir: vec3f) -> PathResult {
     let V = -dir;
     let uv0 = get_uv0(td, bw, hit.u, hit.v);
     let uv1 = get_uv1(td, bw, hit.u, hit.v);
-    let base_rgba = sample_base_rgba(mat, uv0, uv1);
+    let uv2 = get_uv2(td, bw, hit.u, hit.v);
+    let uv3 = get_uv3(td, bw, hit.u, hit.v);
+    let base_rgba = sample_base_rgba(mat, uv0, uv1, uv2, uv3);
     let base_color = base_rgba.rgb;
     let surface_alpha = base_rgba.a;
     let alpha_mode = mat_alpha_mode(mat);
-    let mr = sample_metallic_roughness(mat, uv0, uv1);
+    let mr = sample_metallic_roughness(mat, uv0, uv1, uv2, uv3);
     let metallic = mr.x;
     let roughness = max(mr.y, 0.04);
-    let emissive = sample_emissive(mat, uv0, uv1);
-    let occlusion = sample_occlusion(mat, uv0, uv1);
-    var normal = apply_normal_map(td, smooth_normal, uv0, uv1, mat);
+    let emissive = sample_emissive(mat, uv0, uv1, uv2, uv3);
+    let specular_params = sample_specular_params(mat, uv0, uv1, uv2, uv3);
+    let clearcoat_params = sample_clearcoat_params(mat, uv0, uv1, uv2, uv3);
+    var normal = apply_normal_map(td, smooth_normal, uv0, uv1, uv2, uv3, mat);
+    let material_ior = max(mat_ior(mat), 1.0);
+    let dielectric_base_f0 = pow((material_ior - 1.0) / max(material_ior + 1.0, 1e-6), 2.0);
+    let dielectric_f0 = min(vec3f(dielectric_base_f0) * specular_params.rgb, vec3f(1.0)) * specular_params.a;
 
     // Fix normal facing
     if dot(smooth_normal, V) < 0.01 {
@@ -1187,8 +1585,8 @@ fn path_trace(primary_origin: vec3f, primary_dir: vec3f) -> PathResult {
     var glass_transmission = 0.0;
     var glass_thickness = 0.0;
     if material_has_transmission(mat) {
-      glass_transmission = sample_transmission(mat, uv0, uv1, metallic);
-      glass_thickness = sample_thickness(mat, uv0, uv1);
+      glass_transmission = sample_transmission(mat, uv0, uv1, uv2, uv3, metallic);
+      glass_thickness = sample_thickness(mat, uv0, uv1, uv2, uv3);
     }
     let is_glass = glass_transmission > 0.01;
     let thin_glass = is_glass && (material_is_thin(mat) || glass_thickness <= 1e-5);
@@ -1201,7 +1599,7 @@ fn path_trace(primary_origin: vec3f, primary_dir: vec3f) -> PathResult {
     }
 
     if is_glass {
-      let glass_ior = max(mat_ior(mat), 1.01);
+      let glass_ior = max(material_ior, 1.01);
       let transmission_tint = clamp(base_color, vec3f(0.0), vec3f(1.0));
 
       if thin_glass {
@@ -1312,12 +1710,12 @@ fn path_trace(primary_origin: vec3f, primary_dir: vec3f) -> PathResult {
         blend_spec += base_color;
       } else {
         if use_primary_split {
-          let nee = sample_sun_nee_split(hit_pos, normal, V, base_color, roughness, metallic, 0.0);
+          let nee = sample_sun_nee_split(hit_pos, normal, V, td, mat, uv0, uv1, uv2, uv3, base_color, roughness, metallic, 0.0);
           blend_diff += nee.diffuse * base_color;
           blend_spec += nee.specular;
           result.direct += blend_weight * (nee.diffuse * base_color + nee.specular);
         } else {
-          let direct = sample_sun_nee(hit_pos, normal, V, base_color, roughness, metallic, 0.0);
+          let direct = sample_sun_nee(hit_pos, normal, V, td, mat, uv0, uv1, uv2, uv3, base_color, roughness, metallic, 0.0);
           if is_diffuse_path { blend_diff += direct; }
           else { blend_spec += direct; }
         }
@@ -1355,12 +1753,12 @@ fn path_trace(primary_origin: vec3f, primary_dir: vec3f) -> PathResult {
     // NEE: use the demodulated primary split only before crossing any glass interface.
     let use_primary_split = bounce == 0u && !went_through_glass;
     if use_primary_split {
-      let nee = sample_sun_nee_split(hit_pos, normal, V, base_color, roughness, metallic, glass_transmission);
+      let nee = sample_sun_nee_split(hit_pos, normal, V, td, mat, uv0, uv1, uv2, uv3, base_color, roughness, metallic, glass_transmission);
       diff_rad += throughput * nee.diffuse;
       spec_rad += throughput * nee.specular;
       result.direct = nee.diffuse * base_color + nee.specular;
     } else {
-      let direct = sample_sun_nee(hit_pos, normal, V, base_color, roughness, metallic, glass_transmission);
+      let direct = sample_sun_nee(hit_pos, normal, V, td, mat, uv0, uv1, uv2, uv3, base_color, roughness, metallic, glass_transmission);
       if is_diffuse_path { diff_rad += throughput * direct; }
       else { spec_rad += throughput * direct; }
       if bounce == 0u { result.direct = direct; }
@@ -1387,7 +1785,7 @@ fn path_trace(primary_origin: vec3f, primary_dir: vec3f) -> PathResult {
         if is_diffuse_path { diff_rad += gi; } else { spec_rad += gi; }
         break;
       }
-      let indirect_direct = sample_sun_nee(hit_pos, normal, V, base_color, roughness, metallic, glass_transmission);
+      let indirect_direct = sample_sun_nee(hit_pos, normal, V, td, mat, uv0, uv1, uv2, uv3, base_color, roughness, metallic, glass_transmission);
       let ind = throughput * indirect_direct;
       if is_diffuse_path { diff_rad += ind; } else { spec_rad += ind; }
 
@@ -1396,15 +1794,35 @@ fn path_trace(primary_origin: vec3f, primary_dir: vec3f) -> PathResult {
     }
 
     // BRDF sampling — at bounce 0, classify path and demodulate diffuse throughput
-    if metallic > 0.5 {
+    let clearcoat_prob = clamp(clearcoat_params.x * 0.25, 0.0, 0.5);
+    let base_specular_prob = clamp(mix(specular_params.a, 1.0, metallic), 0.05, 0.95);
+    if clearcoat_prob > 0.001 && rand() < clearcoat_prob {
+      let clearcoat_normal = apply_detail_normal(
+        mat_clearcoat_normal_tex(mat),
+        mat_clearcoat_normal_texcoord(mat),
+        mat_clearcoat_normal_scale(mat),
+        td, normal, uv0, uv1, uv2, uv3
+      );
+      let alpha_c = max(clearcoat_params.y * clearcoat_params.y, 0.001);
+      let Hc = sample_ggx_vndf(rand2(), V, clearcoat_normal, alpha_c);
+      dir = reflect(-V, Hc);
+      if dot(clearcoat_normal, dir) <= 0.0 { break; }
+      let VdotHc = max(dot(V, Hc), 0.0);
+      let Fc = fresnel_schlick_vec(vec3f(0.04), vec3f(1.0), VdotHc);
+      let G1c = smith_g1(max(dot(clearcoat_normal, dir), 0.0), alpha_c);
+      throughput *= Fc * G1c / max(clearcoat_prob, 0.01);
+      specular_bounce = true;
+      if bounce == 0u { is_diffuse_path = false; }
+    } else if metallic > 0.5 || base_specular_prob > 0.35 || roughness < 0.18 {
       // Metal / specular-dominant: GGX VNDF sampling → specular path
       let alpha = max(roughness * roughness, 0.001);
       let H = sample_ggx_vndf(rand2(), V, normal, alpha);
       dir = reflect(-V, H);
       if dot(normal, dir) <= 0.0 { break; }
       let VdotH = max(dot(V, H), 0.0);
-      let F0 = mix(vec3f(0.04), base_color, metallic);
-      let F = fresnel_real(VdotH, F0);
+      let F0 = mix(dielectric_f0, base_color, metallic);
+      let F90 = mix(vec3f(specular_params.a), vec3f(1.0), metallic);
+      let F = fresnel_schlick_vec(F0, F90, VdotH);
       let G1_L = smith_g1(max(dot(normal, dir), 0.0), alpha);
       throughput *= F * G1_L;
       specular_bounce = roughness < 0.1;
@@ -1426,11 +1844,12 @@ fn path_trace(primary_origin: vec3f, primary_dir: vec3f) -> PathResult {
       // cosine hemisphere PDF relative to bent: cos(dir,bent)/π
       // actual BRDF uses cos(dir,normal)/π → correction = cos(dir,normal)/cos(dir,bent)
       let pdf_correction = max(dot(dir, normal), 0.001) / max(dot(dir, bent), 0.001);
+      let diffuse_scale = max((1.0 - metallic) * (1.0 - glass_transmission) * (1.0 - max_component(dielectric_f0)), 0.0);
       if bounce == 0u && !went_through_glass {
         // True primary diffuse surface: store demodulated irradiance for the denoiser.
-        throughput *= vec3f((1.0 - metallic) * (1.0 - glass_transmission) * pdf_correction);
+        throughput *= vec3f(diffuse_scale * pdf_correction);
       } else {
-        throughput *= base_color * (1.0 - metallic) * (1.0 - glass_transmission) * pdf_correction;
+        throughput *= base_color * diffuse_scale * pdf_correction;
       }
       if bounce == 0u { is_diffuse_path = true; }
       specular_bounce = false;
@@ -1470,14 +1889,15 @@ fn path_trace_from_gbuffer(hit_pos: vec3f, normal_in: vec3f, view_dir: vec3f, ma
   if dot(normal, V) < 0.01 { normal = normalize(normal + V * 0.2); }
 
   // Sample textures using rasterized UVs
-  let base_color = sample_base_rgba(mat, uv, uv).rgb;
-  let mr = sample_metallic_roughness(mat, uv, uv);
+  let base_color = sample_base_rgba(mat, uv, uv, uv, uv).rgb;
+  let mr = sample_metallic_roughness(mat, uv, uv, uv, uv);
   let metallic = mr.x;
   let roughness = max(mr.y, 0.04);
-  let transmission = sample_transmission(mat, uv, uv, metallic);
+  let transmission = sample_transmission(mat, uv, uv, uv, uv, metallic);
+  let surface = build_surface_eval_basic(mat, normal, base_color, roughness, metallic, transmission);
 
   // Direct lighting (NEE to sun)
-  let direct = sample_sun_nee(hit_pos, normal, V, base_color, roughness, metallic, transmission);
+  let direct = sample_scene_nee_basic(hit_pos, normal, V, surface);
   var radiance = direct;
 
   // SHaRC store (sparse)
@@ -1500,14 +1920,15 @@ fn path_trace_from_gbuffer(hit_pos: vec3f, normal_in: vec3f, view_dir: vec3f, ma
         var bnormal = normalize(bbw*vert_normals[btd.x].xyz + bounce_hit.u*vert_normals[btd.y].xyz + bounce_hit.v*vert_normals[btd.z].xyz);
         if dot(bounce_dir, bnormal) > 0.0 { bnormal = -bnormal; }
 
-        let cached = sharc_read_cached(bhit_pos, bnormal);
-        if dot(cached, vec3f(1.0)) > 0.001 {
-          radiance += base_color * (1.0 - metallic) * cached * mat_base_color_factor(bmat);
-        } else {
-          let bV = -bounce_dir;
-          let bbase = mat_base_color_factor(bmat);
-          let bind = sample_sun_nee(bhit_pos, bnormal, bV, bbase, max(mat_roughness_factor(bmat), 0.04), mat_metallic_factor(bmat), 0.0);
-          radiance += base_color * (1.0 - metallic) * bind;
+          let cached = sharc_read_cached(bhit_pos, bnormal);
+          if dot(cached, vec3f(1.0)) > 0.001 {
+            radiance += base_color * (1.0 - metallic) * cached * mat_base_color_factor(bmat);
+          } else {
+            let bV = -bounce_dir;
+            let bbase = mat_base_color_factor(bmat);
+            let bsurface = build_surface_eval_basic(bmat, bnormal, bbase, max(mat_roughness_factor(bmat), 0.04), mat_metallic_factor(bmat), 0.0);
+            let bind = sample_scene_nee_basic(bhit_pos, bnormal, bV, bsurface);
+            radiance += base_color * (1.0 - metallic) * bind;
 
           // Sky irradiance on last bounce
           if uniforms.max_bounces <= 3u {

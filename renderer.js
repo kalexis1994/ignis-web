@@ -11,6 +11,11 @@ function rlog(...args) {
 window.onerror = (msg, src, line) => rlog(`ERROR: ${msg} at ${src}:${line}`);
 window.onunhandledrejection = (e) => rlog(`REJECT: ${e.reason}`);
 
+function resolveSceneAssetURL(uri) {
+  if (!uri) return null;
+  return /^(?:data:|blob:|https?:)/i.test(uri) ? uri : `scene/${uri}`;
+}
+
 const info = document.getElementById('info');
 const errorDiv = document.getElementById('error');
 
@@ -27,6 +32,7 @@ function createGPUBuffer(device, data, usage) {
 }
 
 async function init() {
+  const MAX_PUNCTUAL_LIGHTS = 16;
   if (!navigator.gpu) {
     showError('WebGPU not supported. Try Chrome 113+, Edge 113+, or Firefox Nightly.');
     return;
@@ -107,6 +113,19 @@ async function init() {
   }
   const stats = scene.stats;
   rlog('Scene loaded:', stats);
+  const punctualLights = [...(scene.punctualLights || [])]
+    .sort((a, b) => {
+      const la = (0.2126 * a.color[0] + 0.7152 * a.color[1] + 0.0722 * a.color[2]) * a.intensity * Math.max(a.range || 1, 1);
+      const lb = (0.2126 * b.color[0] + 0.7152 * b.color[1] + 0.0722 * b.color[2]) * b.intensity * Math.max(b.range || 1, 1);
+      return lb - la;
+    })
+    .slice(0, MAX_PUNCTUAL_LIGHTS);
+  if ((scene.punctualLights || []).length > MAX_PUNCTUAL_LIGHTS) {
+    rlog(`Punctual lights: ${punctualLights.length}/${scene.punctualLights.length} (truncated)`);
+  } else if (punctualLights.length > 0) {
+    rlog(`Punctual lights: ${punctualLights.length}`);
+    rlog('Synthetic sun disabled because scene punctual lights are present');
+  }
   if (stats.emissiveSourceTris !== undefined) {
     const trunc = stats.emissiveTruncated ? ' (truncated)' : '';
     rlog(`Emissive sampling: ${stats.emissiveTris}/${stats.emissiveSourceTris} tris${trunc}`);
@@ -187,8 +206,8 @@ async function init() {
   rlog(`Shaders OK | Internal:${width}x${height} Display:${displayWidth}x${displayHeight} FSR:${fsrRatio.toFixed(1)}x`);
 
   // --- Uniform buffer ---
-  // Added: sun_dir (vec3f) + emissive_tri_count (u32) = 16 more bytes
-  const uniformBufferSize = 256; // expanded for prev camera (ReSTIR reprojection)
+  // Base camera/sun state + fixed-size punctual light array.
+  const uniformBufferSize = 1280;
   const uniformBuffer = device.createBuffer({
     size: uniformBufferSize,
     usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
@@ -214,7 +233,7 @@ async function init() {
   const gbufUniformBuf = device.createBuffer({ size: 80, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST }); // mat4x4 + vec3 + pad = 80
   const posVB = createGPUBuffer(device, scene.gpuPositions, GPUBufferUsage.VERTEX);
   const nrmVB = createGPUBuffer(device, scene.gpuNormals, GPUBufferUsage.VERTEX);
-  const uv1VB = createGPUBuffer(device, scene.gpuUV1, GPUBufferUsage.VERTEX);
+  const uvExtraVB = createGPUBuffer(device, scene.gpuUVExtra, GPUBufferUsage.VERTEX | GPUBufferUsage.STORAGE);
   const matIdVB = createGPUBuffer(device, scene.vertMatIds, GPUBufferUsage.VERTEX);
   const indexBuf = createGPUBuffer(device, scene.rasterIndices, GPUBufferUsage.INDEX);
   const triCount = stats.triangles;
@@ -235,7 +254,11 @@ async function init() {
         { arrayStride: 16, attributes: [{ shaderLocation: 0, offset: 0, format: 'float32x4' }] }, // pos.xyz + uv.x
         { arrayStride: 16, attributes: [{ shaderLocation: 1, offset: 0, format: 'float32x4' }] }, // normal.xyz + uv.y
         { arrayStride: 4,  attributes: [{ shaderLocation: 2, offset: 0, format: 'float32' }] },    // matId
-        { arrayStride: 8,  attributes: [{ shaderLocation: 3, offset: 0, format: 'float32x2' }] },   // UV1.xy
+        { arrayStride: 24, attributes: [
+          { shaderLocation: 3, offset: 0,  format: 'float32x2' },  // UV1.xy
+          { shaderLocation: 4, offset: 8,  format: 'float32x2' },  // UV2.xy
+          { shaderLocation: 5, offset: 16, format: 'float32x2' },  // UV3.xy
+        ]},
       ],
     },
     fragment: {
@@ -311,8 +334,10 @@ async function init() {
     for (let b = 0; b < texCount; b += BATCH) {
       const batch = [];
       for (let i = b; i < Math.min(b + BATCH, texCount); i++) {
+        const texURL = resolveSceneAssetURL(texInfo.imageURIs[i]);
+        if (!texURL) throw new Error(`Texture ${i} is missing a URI`);
         batch.push(
-          fetch(`scene/${texInfo.imageURIs[i]}`)
+          fetch(texURL)
             .then(r => r.blob())
             .then(blob => createImageBitmap(blob, {
               resizeWidth: TEX_SIZE, resizeHeight: TEX_SIZE,
@@ -359,7 +384,7 @@ async function init() {
   const bvhBuf = createGPUBuffer(device, scene.gpuBVHNodes, GPUBufferUsage.STORAGE);
   const matBuf = createGPUBuffer(device, scene.gpuMaterials, GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST);
   const emsBuf = createGPUBuffer(device, scene.gpuEmissiveTris, GPUBufferUsage.STORAGE);
-  const uv1Buf = createGPUBuffer(device, scene.gpuUV1, GPUBufferUsage.STORAGE);
+  const uvExtraBuf = uvExtraVB;
 
   // --- Bind group 0: uniforms + accumulation + output ---
   const bg0Layout = device.createBindGroupLayout({
@@ -407,7 +432,7 @@ async function init() {
       { binding: 3, resource: { buffer: bvhBuf } },
       { binding: 4, resource: { buffer: matBuf } },
       { binding: 5, resource: { buffer: emsBuf } },
-      { binding: 6, resource: { buffer: uv1Buf } },
+      { binding: 6, resource: { buffer: uvExtraBuf } },
     ],
   });
 
@@ -897,7 +922,7 @@ async function init() {
 
   // Upload material changes to GPU (both buffers)
   function uploadMaterial(matIdx) {
-    const stride = scene.materialStride || 40;
+    const stride = scene.materialStride || 80;
     const byteOffset = matIdx * stride * 4;
     const slice = new Float32Array(scene.gpuMaterials.buffer, byteOffset, stride);
     device.queue.writeBuffer(matBuf, byteOffset, slice);
@@ -906,7 +931,7 @@ async function init() {
 
   function showPickInfo(pick) {
     if (!pick) { debugContent.textContent = 'No hit (sky)'; return; }
-    const stride = scene.materialStride || 40;
+    const stride = scene.materialStride || 80;
     const m = scene.gpuMaterials, o = pick.matIdx * stride;
     const names = scene.materialNames || [];
     const types = ['PBR','Unlit','Reserved','Transmission'];
@@ -1022,9 +1047,10 @@ async function init() {
       for (const [key, idx] of Object.entries(texIds)) {
         const ti = Math.round(idx);
         if (ti >= 0 && ti < texInfo.count) {
+          const texURL = resolveSceneAssetURL(texInfo.imageURIs[ti]);
           texHTML += `<div style="margin-bottom:8px;">
             <div style="font-size:10px; text-transform:uppercase; letter-spacing:1px; color:#0a0; margin-bottom:4px;">${texLabels[key]} <span style="color:#444;">(#${ti})</span></div>
-            <img src="scene/${texInfo.imageURIs[ti]}" style="width:100%; max-height:140px; object-fit:contain; border-radius:4px; border:1px solid rgba(255,255,255,0.08); background:#111;">
+            <img src="${texURL || ''}" style="width:100%; max-height:140px; object-fit:contain; border-radius:4px; border:1px solid rgba(255,255,255,0.08); background:#111;">
           </div>`;
         } else {
           texHTML += `<div style="margin-bottom:4px;"><span style="font-size:10px; text-transform:uppercase; color:#333;">${texLabels[key]}: none</span></div>`;
@@ -1420,7 +1446,7 @@ async function init() {
       rp.setVertexBuffer(0, posVB);
       rp.setVertexBuffer(1, nrmVB);
       rp.setVertexBuffer(2, matIdVB);
-      rp.setVertexBuffer(3, uv1VB);
+      rp.setVertexBuffer(3, uvExtraVB);
       rp.setIndexBuffer(indexBuf, 'uint32');
       rp.drawIndexed(triCount * 3);
       rp.end();
@@ -1449,6 +1475,34 @@ async function init() {
     f32[32] = prevCam.fwd[0]; f32[33] = prevCam.fwd[1]; f32[34] = prevCam.fwd[2]; f32[35] = 0;
     f32[36] = prevCam.right[0]; f32[37] = prevCam.right[1]; f32[38] = prevCam.right[2]; f32[39] = 0;
     f32[40] = prevCam.up[0]; f32[41] = prevCam.up[1]; f32[42] = prevCam.up[2]; f32[43] = 0;
+    u32[44] = punctualLights.length;
+    u32[45] = punctualLights.length === 0 ? 1 : 0;
+    u32[46] = 0;
+    u32[47] = 0;
+    for (let i = 0; i < MAX_PUNCTUAL_LIGHTS; i++) {
+      const light = punctualLights[i];
+      const base = 48 + i * 16;
+      if (!light) {
+        for (let j = 0; j < 16; j++) f32[base + j] = 0;
+        continue;
+      }
+      f32[base] = light.position[0];
+      f32[base + 1] = light.position[1];
+      f32[base + 2] = light.position[2];
+      f32[base + 3] = light.range || 0;
+      f32[base + 4] = light.direction[0];
+      f32[base + 5] = light.direction[1];
+      f32[base + 6] = light.direction[2];
+      f32[base + 7] = Math.cos(light.innerConeAngle || 0);
+      f32[base + 8] = light.color[0];
+      f32[base + 9] = light.color[1];
+      f32[base + 10] = light.color[2];
+      f32[base + 11] = light.intensity || 1;
+      f32[base + 12] = light.type === 'directional' ? 0 : (light.type === 'spot' ? 2 : 1);
+      f32[base + 13] = Math.cos(light.outerConeAngle ?? (Math.PI * 0.25));
+      f32[base + 14] = 0;
+      f32[base + 15] = 0;
+    }
     device.queue.writeBuffer(uniformBuffer, 0, ud);
 
     // Write temporal uniforms (current + previous camera)

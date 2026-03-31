@@ -17,8 +17,23 @@ if env_path.exists():
             if key.strip() == 'SCENE_PATH':
                 SCENE_PATH = val.strip()
 
+SCENE_ROOT = None
+SCENE_FILE = None
+SCENE_FILE_ALIAS = None
+if SCENE_PATH:
+    scene_path = Path(SCENE_PATH)
+    if scene_path.is_file() and scene_path.suffix.lower() in ('.gltf', '.glb'):
+        SCENE_FILE = str(scene_path)
+        SCENE_FILE_ALIAS = f'scene{scene_path.suffix.lower()}'
+    SCENE_ROOT = scene_path.parent if scene_path.is_file() else scene_path
+    SCENE_ROOT = str(SCENE_ROOT)
+
 if SCENE_PATH:
     print(f'Scene path: {SCENE_PATH}')
+if SCENE_ROOT:
+    print(f'Scene root: {SCENE_ROOT}')
+if SCENE_FILE:
+    print(f'Scene file: {SCENE_FILE}')
 
 with open('client.log', 'w') as f:
     f.write(f'=== {datetime.now()} ===\n')
@@ -28,11 +43,24 @@ class H(http.server.SimpleHTTPRequestHandler):
         self.send_header('Cache-Control', 'no-store')
         super().end_headers()
 
+    def do_GET(self):
+        if self.path == '/scene/.entry' and SCENE_FILE_ALIAS:
+            data = SCENE_FILE_ALIAS.encode('utf-8')
+            self.send_response(200)
+            self.send_header('Content-Type', 'text/plain; charset=utf-8')
+            self.send_header('Content-Length', str(len(data)))
+            self.end_headers()
+            self.wfile.write(data)
+            return
+        super().do_GET()
+
     def translate_path(self, path):
         # Redirect /scene/* requests to SCENE_PATH if configured
-        if SCENE_PATH and path.startswith('/scene/'):
+        if SCENE_ROOT and path.startswith('/scene/'):
             rel = path[len('/scene/'):]
-            return os.path.join(SCENE_PATH, rel)
+            if SCENE_FILE and rel == SCENE_FILE_ALIAS:
+                return SCENE_FILE
+            return os.path.join(SCENE_ROOT, rel)
         return super().translate_path(path)
 
     def do_POST(self):
