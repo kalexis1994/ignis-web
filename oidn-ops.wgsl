@@ -99,7 +99,27 @@ fn input_assembly(
   let specular = textureLoad(specular_tex, px, 0).rgb;
 
   // Combine beauty pass: OIDN expects albedo * diffuse_irradiance + specular
-  let beauty = max(albedo, vec3f(0.02)) * diffuse + specular;
+  var beauty = max(albedo, vec3f(0.02)) * diffuse + specular;
+
+  // Inline firefly rejection: clamp luminance to 3σ of 3x3 neighborhood
+  // Only clamps extremes — no blur, preserves noise pattern for OIDN
+  let center_lum = dot(beauty, vec3f(0.2126, 0.7152, 0.0722));
+  var m1 = 0.0; var m2 = 0.0;
+  for (var fy = -1; fy <= 1; fy++) {
+    for (var fx = -1; fx <= 1; fx++) {
+      let fp = clamp(px + vec2i(fx, fy), vec2i(0), vec2i(i32(W)-1, i32(H)-1));
+      let fd = textureLoad(diffuse_tex, fp, 0).rgb;
+      let fs = textureLoad(specular_tex, fp, 0).rgb;
+      let fl = dot(max(textureLoad(albedo_tex, fp, 0).rgb, vec3f(0.02)) * fd + fs, vec3f(0.2126, 0.7152, 0.0722));
+      m1 += fl; m2 += fl * fl;
+    }
+  }
+  let mean = m1 / 9.0;
+  let std_dev = sqrt(max(m2 / 9.0 - mean * mean, 0.0));
+  let max_lum = mean + 2.0 * std_dev + 0.1;
+  if center_lum > max_lum && center_lum > 0.01 {
+    beauty *= max_lum / center_lum;
+  }
 
   // LDR model: expects sRGB gamma-encoded [0,1] (like a final render)
   let tonemapped = beauty / (beauty + 1.0);          // Reinhard tonemap → [0,1)

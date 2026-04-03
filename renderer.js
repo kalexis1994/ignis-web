@@ -160,7 +160,7 @@ async function init() {
   if (!FSR_MODES[fsrMode]) fsrMode = 'balanced';
   const displayCap = cfg.displayCap || gpuProfile.displayCap || 1080;
   const texSize = cfg.texSize ?? gpuProfile.texSize ?? 512;
-  const denoiseMode = cfg.denoise || gpuProfile.denoise || 'oidn';
+  const denoiseMode = cfg.denoise || gpuProfile.denoise || 'full';
   const maxBounces = cfg.bounces || gpuProfile.maxBounces || 3;
   const sppPerFrame = cfg.spp || gpuProfile.spp || 1;
   const sharcEnabled = cfg.sharc !== undefined ? cfg.sharc : (gpuProfile.sharc !== false);
@@ -891,6 +891,18 @@ async function init() {
         { binding: 5, resource: denoiseNdTex.createView() },      // normals
         { binding: 6, resource: pingTex.createView() },           // unused for input (write texture)
         { binding: 7, resource: specNoisyTex.createView() },      // noisy specular radiance
+      ]});
+
+      // Input BG reading from preblurred textures (pingTex/specPingTex after anti-firefly pass)
+      oidn.inputBG_pb = device.createBindGroup({ layout: oidn.ioBGL, entries: [
+        { binding: 0, resource: { buffer: ioParams } },
+        { binding: 1, resource: { buffer: oidnDummy } },
+        { binding: 2, resource: { buffer: oidn.skipInput } },
+        { binding: 3, resource: pingTex.createView() },             // preblurred diffuse
+        { binding: 4, resource: albedoTex.createView() },
+        { binding: 5, resource: denoiseNdTex.createView() },
+        { binding: 6, resource: pongTex.createView() },             // unused write slot (not pingTex!)
+        { binding: 7, resource: specPingTex.createView() },         // preblurred specular
       ]});
 
       // Output extraction: 3ch denoised beauty → pingTex
@@ -1740,7 +1752,8 @@ async function init() {
       }
 
       if (denoiseMode.startsWith('oidn') && oidn) {
-        // Neural denoiser: replaces preblur + temporal + à-trous
+        // Neural denoiser (reads raw noisy input — OIDN expects unfiltered 1SPP)
+        // Firefly rejection is done inline in input_assembly via luminance clamp
         oidn.encode(encoder, oidn.inputBG, oidn.outputBG);
 
         // Temporal blend: mix current denoised (pingTex) with previous (history)
