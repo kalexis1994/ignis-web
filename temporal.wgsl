@@ -147,7 +147,7 @@ fn accumulate_signal(
   return mix(clipped, current, alpha);
 }
 
-@compute @workgroup_size(8, 8)
+@compute @workgroup_size(16, 16)
 fn temporal(@builtin(global_invocation_id) gid: vec3u) {
   let px = vec2i(gid.xy);
   let sz = vec2i(params.resolution);

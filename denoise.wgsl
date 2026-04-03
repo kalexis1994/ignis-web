@@ -62,7 +62,7 @@ const KW = array<f32, 25>(
   1.0/256.0,  4.0/256.0,  6.0/256.0,  4.0/256.0, 1.0/256.0,
 );
 
-@compute @workgroup_size(8, 8)
+@compute @workgroup_size(16, 16)
 fn atrous(@builtin(global_invocation_id) gid: vec3u) {
   let px = vec2i(gid.xy);
   let sz = vec2i(params.resolution);
@@ -187,7 +187,7 @@ fn atrous(@builtin(global_invocation_id) gid: vec3u) {
 
 // === PRE-BLUR: anti-firefly percentile clamp + lightweight 3x3 bilateral ===
 // Stabilizes temporal AABB and eliminates bright speckles adaptively.
-@compute @workgroup_size(8, 8)
+@compute @workgroup_size(16, 16)
 fn preblur(@builtin(global_invocation_id) gid: vec3u) {
   let px = vec2i(gid.xy);
   let sz = vec2i(params.resolution);
@@ -355,7 +355,7 @@ fn tonemap_standard(v: vec3f) -> vec3f {
   return clamp(v, vec3f(0.0), vec3f(1.0));
 }
 
-@compute @workgroup_size(8, 8)
+@compute @workgroup_size(16, 16)
 fn composite(@builtin(global_invocation_id) gid: vec3u) {
   let px = vec2i(gid.xy);
   let sz = vec2i(params.resolution);

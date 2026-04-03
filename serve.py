@@ -35,7 +35,7 @@ if SCENE_ROOT:
 if SCENE_FILE:
     print(f'Scene file: {SCENE_FILE}')
 
-with open('client.log', 'w') as f:
+with open('client.log', 'w', encoding='utf-8') as f:
     f.write(f'=== {datetime.now()} ===\n')
 
 class H(http.server.SimpleHTTPRequestHandler):
@@ -68,7 +68,7 @@ class H(http.server.SimpleHTTPRequestHandler):
         body = self.rfile.read(n).decode()
         line = f'[{datetime.now().strftime("%H:%M:%S")}] {body}'
         print(line, flush=True)
-        with open('client.log', 'a') as f:
+        with open('client.log', 'a', encoding='utf-8') as f:
             f.write(line + '\n')
         self.send_response(200)
         self.end_headers()

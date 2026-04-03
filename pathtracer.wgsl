@@ -297,16 +297,21 @@ fn sharc_read_cached(wp: vec3f, n: vec3f) -> vec3f {
 // val = (dir_component * lum + lum) * GUIDE_SCALE → always positive
 const GUIDE_SCALE: f32 = 10000.0;
 
+// Atomic RGB+count accumulation helper (shared by both store functions)
+fn sharc_accum_rgbs(aBase: u32, s: vec3f) {
+  if u32(s.x) > 0u { atomicAdd(&sharc_keys_accum[aBase], u32(s.x)); }
+  if u32(s.y) > 0u { atomicAdd(&sharc_keys_accum[aBase + 1u], u32(s.y)); }
+  if u32(s.z) > 0u { atomicAdd(&sharc_keys_accum[aBase + 2u], u32(s.z)); }
+  atomicAdd(&sharc_keys_accum[aBase + 3u], 1u);
+}
+
 fn sharc_store_radiance(wp: vec3f, n: vec3f, rad: vec3f) {
   let key = sharc_make_key(wp, n);
   let slot = sharc_insert_slot(key);
   if slot == 0xFFFFFFFFu { return; }
   let s = max(rad * 1000.0, vec3f(0.0));
-  let aBase = sharc_params.capacity + slot * 7u; // accum: RGBS + DxDyDz
-  if u32(s.x) > 0u { atomicAdd(&sharc_keys_accum[aBase], u32(s.x)); }
-  if u32(s.y) > 0u { atomicAdd(&sharc_keys_accum[aBase + 1u], u32(s.y)); }
-  if u32(s.z) > 0u { atomicAdd(&sharc_keys_accum[aBase + 2u], u32(s.z)); }
-  atomicAdd(&sharc_keys_accum[aBase + 3u], 1u);
+  let aBase = sharc_params.capacity + slot * 7u;
+  sharc_accum_rgbs(aBase, s);
 }
 
 // Store with direction (for indirect bounces — records where light came from)
@@ -316,10 +321,7 @@ fn sharc_store_radiance_dir(wp: vec3f, n: vec3f, rad: vec3f, incoming_dir: vec3f
   if slot == 0xFFFFFFFFu { return; }
   let s = max(rad * 1000.0, vec3f(0.0));
   let aBase = sharc_params.capacity + slot * 7u;
-  if u32(s.x) > 0u { atomicAdd(&sharc_keys_accum[aBase], u32(s.x)); }
-  if u32(s.y) > 0u { atomicAdd(&sharc_keys_accum[aBase + 1u], u32(s.y)); }
-  if u32(s.z) > 0u { atomicAdd(&sharc_keys_accum[aBase + 2u], u32(s.z)); }
-  atomicAdd(&sharc_keys_accum[aBase + 3u], 1u);
+  sharc_accum_rgbs(aBase, s);
   // Accumulate luminance-weighted direction (offset encoding for signed→unsigned)
   let lum = dot(rad, vec3f(0.2126, 0.7152, 0.0722));
   if lum > 0.001 {
@@ -1948,7 +1950,7 @@ fn path_trace_from_gbuffer(hit_pos: vec3f, normal_in: vec3f, view_dir: vec3f, ma
 // ============================================================
 // Main compute entry
 // ============================================================
-@compute @workgroup_size(8, 8)
+@compute @workgroup_size(16, 16)
 fn main(@builtin(global_invocation_id) gid: vec3u) {
   let pixel = vec2u(gid.xy);
   let res = vec2u(uniforms.resolution);

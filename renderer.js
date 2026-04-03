@@ -50,7 +50,12 @@ async function init() {
     return;
   }
 
+  const hasSubgroups = adapter.features.has('subgroups');
+  const requiredFeatures = [];
+  if (hasSubgroups) requiredFeatures.push('subgroups');
+
   const device = await adapter.requestDevice({
+    requiredFeatures,
     requiredLimits: {
       maxStorageBufferBindingSize: adapter.limits.maxStorageBufferBindingSize,
       maxBufferSize: adapter.limits.maxBufferSize,
@@ -175,7 +180,7 @@ async function init() {
 
   // --- Load shaders ---
   const v = Date.now(); // cache bust
-  const [ptCode, dispCode, fsrCode, dnCode, tmpCode, gbCode] = await Promise.all([
+  let [ptCode, dispCode, fsrCode, dnCode, tmpCode, gbCode] = await Promise.all([
     fetch(`pathtracer.wgsl?v=${v}`).then(r => r.text()),
     fetch(`display.wgsl?v=${v}`).then(r => r.text()),
     fetch(`fsr.wgsl?v=${v}`).then(r => r.text()),
@@ -183,12 +188,19 @@ async function init() {
     fetch(`temporal.wgsl?v=${v}`).then(r => r.text()),
     fetch(`gbuffer.wgsl?v=${v}`).then(r => r.text()),
   ]);
-  const ptModule = device.createShaderModule({ code: ptCode });
-  const dispModule = device.createShaderModule({ code: dispCode });
-  const fsrModule = device.createShaderModule({ code: fsrCode });
-  const dnModule = device.createShaderModule({ code: dnCode });
-  const tmpModule = device.createShaderModule({ code: tmpCode });
-  const gbModule = device.createShaderModule({ code: gbCode });
+
+  // Subgroups: detected and requested for use in denoiser/temporal shaders (Phase 6).
+  // NOT usable in pathtracer.wgsl — WGSL uniformity analysis rejects subgroup ops
+  // after any non-uniform return (even the bounds check at the top of main).
+  if (hasSubgroups) rlog('Subgroups available (reserved for denoiser)');
+
+  const smOpts = { strictMath: false };
+  const ptModule = device.createShaderModule({ code: ptCode, ...smOpts });
+  const dispModule = device.createShaderModule({ code: dispCode, ...smOpts });
+  const fsrModule = device.createShaderModule({ code: fsrCode, ...smOpts });
+  const dnModule = device.createShaderModule({ code: dnCode, ...smOpts });
+  const tmpModule = device.createShaderModule({ code: tmpCode, ...smOpts });
+  const gbModule = device.createShaderModule({ code: gbCode, ...smOpts });
 
   // Check shader compilation
   for (const [name, mod] of [['pathtracer',ptModule],['display',dispModule],['fsr',fsrModule],['denoise',dnModule],['temporal',tmpModule],['gbuffer',gbModule]]) {
@@ -481,7 +493,7 @@ async function init() {
     { binding: 1, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } },
     { binding: 2, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } },
   ]});
-  const sharcModule = device.createShaderModule({ code: await fetch(`sharc.wgsl?v=${v}`).then(r=>r.text()) });
+  const sharcModule = device.createShaderModule({ code: await fetch(`sharc.wgsl?v=${v}`).then(r=>r.text()), ...smOpts });
   const sharcCI = await sharcModule.getCompilationInfo();
   for (const m of sharcCI.messages) { if(m.type==='error') rlog('SHARC SHADER ERROR:',m.lineNum,m.message); }
 
@@ -1546,7 +1558,7 @@ async function init() {
         ptPass.setBindGroup(1, bg1);
         ptPass.setBindGroup(2, restirFrame === 0 ? bg2_A : bg2_B);
         ptPass.setBindGroup(3, bg3);
-        ptPass.dispatchWorkgroups(Math.ceil(width/8), Math.ceil(height/8));
+        ptPass.dispatchWorkgroups(Math.ceil(width/16), Math.ceil(height/16));
         ptPass.end();
       }
 
@@ -1565,14 +1577,14 @@ async function init() {
         const pbPass = encoder.beginComputePass();
         pbPass.setPipeline(preblurPipeline);
         pbPass.setBindGroup(0, preblurBG);
-        pbPass.dispatchWorkgroups(Math.ceil(width/8), Math.ceil(height/8));
+        pbPass.dispatchWorkgroups(Math.ceil(width/16), Math.ceil(height/16));
         pbPass.end();
 
         // Temporal reprojection: reads pre-blurred ping → writes hdrTex
         const tmpPass = encoder.beginComputePass();
         tmpPass.setPipeline(tmpPipeline);
         tmpPass.setBindGroup(0, historyFrame === 0 ? tmpBG_A : tmpBG_B);
-        tmpPass.dispatchWorkgroups(Math.ceil(width/8), Math.ceil(height/8));
+        tmpPass.dispatchWorkgroups(Math.ceil(width/16), Math.ceil(height/16));
         tmpPass.end();
         historyFrame = 1 - historyFrame;
       }
@@ -1588,7 +1600,7 @@ async function init() {
           const dp = encoder.beginComputePass();
           dp.setPipeline(dnAtrousPipeline);
           dp.setBindGroup(0, bg);
-          dp.dispatchWorkgroups(Math.ceil(width/8), Math.ceil(height/8));
+          dp.dispatchWorkgroups(Math.ceil(width/16), Math.ceil(height/16));
           dp.end();
         }
       }
@@ -1611,7 +1623,7 @@ async function init() {
       const compPass = encoder.beginComputePass();
       compPass.setPipeline(dnCompPipeline);
       compPass.setBindGroup(0, denoiseMode !== 'off' ? dnBG_comp : dnBG_comp_noisy);
-      compPass.dispatchWorkgroups(Math.ceil(width/8), Math.ceil(height/8));
+      compPass.dispatchWorkgroups(Math.ceil(width/16), Math.ceil(height/16));
       compPass.end();
 
       if (fsrMode !== 'dlaa') {
@@ -1619,14 +1631,14 @@ async function init() {
         const easuPass = encoder.beginComputePass();
         easuPass.setPipeline(easuPipeline);
         easuPass.setBindGroup(0, easuBG);
-        easuPass.dispatchWorkgroups(Math.ceil(displayWidth/8), Math.ceil(displayHeight/8));
+        easuPass.dispatchWorkgroups(Math.ceil(displayWidth/16), Math.ceil(displayHeight/16));
         easuPass.end();
 
         // Pass 3: FSR RCAS — Contrast-adaptive sharpening
         const rcasPass = encoder.beginComputePass();
         rcasPass.setPipeline(rcasPipeline);
         rcasPass.setBindGroup(0, rcasBG);
-        rcasPass.dispatchWorkgroups(Math.ceil(displayWidth/8), Math.ceil(displayHeight/8));
+        rcasPass.dispatchWorkgroups(Math.ceil(displayWidth/16), Math.ceil(displayHeight/16));
         rcasPass.end();
       }
 

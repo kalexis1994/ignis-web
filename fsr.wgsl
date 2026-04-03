@@ -42,7 +42,7 @@ fn edge_weight(center: vec3f, sample: vec3f) -> f32 {
 // EASU: Edge Adaptive Spatial Upscaling
 // Lanczos 2-lobe with edge-directed weighting
 // ============================================================
-@compute @workgroup_size(8, 8)
+@compute @workgroup_size(16, 16)
 fn easu(@builtin(global_invocation_id) gid: vec3u) {
   let out_px = vec2i(gid.xy);
   let out_size = vec2i(params.output_size);
@@ -98,7 +98,7 @@ fn easu(@builtin(global_invocation_id) gid: vec3u) {
 //   peakHi = (1 - max_neighbors) / (4 * min_neighbors) → prevents output > 1
 // Lobe = -min(peakLo, peakHi) * sharpness, clamped to [-3/16, 0]
 // ============================================================
-@compute @workgroup_size(8, 8)
+@compute @workgroup_size(16, 16)
 fn rcas(@builtin(global_invocation_id) gid: vec3u) {
   let px = vec2i(gid.xy);
   let size = vec2i(params.output_size);
