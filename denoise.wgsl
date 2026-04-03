@@ -387,6 +387,110 @@ fn preblur(@builtin(global_invocation_id) gid: vec3u) {
   textureStore(out_spec, px, vec4f(s_sum / f32(s_wsum), center_hit_dist));
 }
 
+// === TILED PRE-BLUR: shared memory version (18x18 tile, ±1 halo) ===
+// Reuses sm_nd/sm_diff/sm_spec from atrous_sm (400 entries > 324 needed)
+const PB_HALO: i32 = 1;
+const PB_PADDED: i32 = 18; // TILE + 2*PB_HALO
+const PB_TILES: u32 = 324u; // 18*18
+
+@compute @workgroup_size(16, 16)
+fn preblur_sm(@builtin(global_invocation_id) gid: vec3u,
+              @builtin(local_invocation_id) lid: vec3u,
+              @builtin(workgroup_id) wid: vec3u) {
+  let sz = vec2i(params.resolution);
+  let tile_origin = vec2i(wid.xy) * TILE - PB_HALO;
+
+  // Cooperative tile load: 324 texels / 256 threads ≈ 1.27 loads per thread
+  let flat_id = lid.y * 16u + lid.x;
+  for (var t = flat_id; t < PB_TILES; t += 256u) {
+    let ty = i32(t / 18u);
+    let tx = i32(t % 18u);
+    let coord = clamp(tile_origin + vec2i(tx, ty), vec2i(0), sz - 1);
+    sm_nd[t] = textureLoad(gbuf_nd, coord, 0);
+    sm_diff[t] = textureLoad(in_color, coord, 0);
+    sm_spec[t] = textureLoad(in_spec, coord, 0);
+  }
+  workgroupBarrier();
+
+  let px = vec2i(gid.xy);
+  if px.x >= sz.x || px.y >= sz.y { return; }
+
+  let lx = i32(lid.x);
+  let ly = i32(lid.y);
+  let ci = u32((ly + PB_HALO) * PB_PADDED + (lx + PB_HALO));
+
+  let cn = sm_nd[ci].xyz;
+  let cz = sm_nd[ci].w;
+  let cc_raw = sm_diff[ci].rgb;
+  let cs_raw = sm_spec[ci].rgb;
+
+  // Anti-firefly: 3σ percentile clamp from tile
+  var d_m1 = 0.0; var d_m2 = 0.0;
+  var s_m1 = 0.0; var s_m2 = 0.0;
+  for (var fy = -1; fy <= 1; fy++) {
+    for (var fx = -1; fx <= 1; fx++) {
+      let fi = u32((ly + PB_HALO + fy) * PB_PADDED + (lx + PB_HALO + fx));
+      let fl = luma(sm_diff[fi].rgb);
+      d_m1 += fl; d_m2 += fl * fl;
+      let fsl = luma(sm_spec[fi].rgb);
+      s_m1 += fsl; s_m2 += fsl * fsl;
+    }
+  }
+  let d_mean = d_m1 / 9.0;
+  let d_std = sqrt(max(d_m2 / 9.0 - d_mean * d_mean, 0.0));
+  let d_max_lum = d_mean + 3.0 * d_std + 0.1;
+  let s_mean = s_m1 / 9.0;
+  let s_std = sqrt(max(s_m2 / 9.0 - s_mean * s_mean, 0.0));
+  let s_max_lum = s_mean + 3.0 * s_std + 0.1;
+
+  let cl_raw = luma(cc_raw);
+  var cc = cc_raw;
+  if cl_raw > d_max_lum && cl_raw > 0.01 { cc = cc_raw * (d_max_lum / cl_raw); }
+  let csl_raw = luma(cs_raw);
+  var cs = cs_raw;
+  if csl_raw > s_max_lum && csl_raw > 0.01 { cs = cs_raw * (s_max_lum / csl_raw); }
+
+  let cl = luma(cc);
+  let csl = luma(cs);
+
+  // 3x3 bilateral from tile (f16 weights)
+  var d_sum = cc;  var d_wsum: f16 = 1.0h;
+  var s_sum = cs;  var s_wsum: f16 = 1.0h;
+
+  for (var dy = -1; dy <= 1; dy++) {
+    for (var dx = -1; dx <= 1; dx++) {
+      if dx == 0 && dy == 0 { continue; }
+      let si = u32((ly + PB_HALO + dy) * PB_PADDED + (lx + PB_HALO + dx));
+      let snd = sm_nd[si];
+      let sd = sm_diff[si].rgb;
+      let ss = sm_spec[si].rgb;
+
+      let sd_l = luma(sd);
+      var sd_c = sd;
+      if sd_l > d_max_lum && sd_l > 0.01 { sd_c = sd * (d_max_lum / sd_l); }
+      let ss_l = luma(ss);
+      var ss_c = ss;
+      if ss_l > s_max_lum && ss_l > 0.01 { ss_c = ss * (s_max_lum / ss_l); }
+
+      let wn = f16(pow(max(dot(cn, snd.xyz), 0.0), 32.0));
+      let wz = f16(exp(-abs(cz - snd.w) / max(cz * 0.05, 1e-2)));
+
+      let d_wl = f16(exp(-abs(cl - luma(sd_c)) / max(cl * 0.5 + 0.1, 0.01)));
+      let d_w = wn * wz * d_wl;
+      d_sum += sd_c * f32(d_w);
+      d_wsum += d_w;
+
+      let s_wl = f16(exp(-abs(csl - luma(ss_c)) / max(csl * 0.5 + 0.1, 0.01)));
+      let s_w = wn * wz * s_wl;
+      s_sum += ss_c * f32(s_w);
+      s_wsum += s_w;
+    }
+  }
+
+  textureStore(out_color, px, vec4f(d_sum / f32(d_wsum), 1.0));
+  textureStore(out_spec, px, vec4f(s_sum / f32(s_wsum), sm_spec[ci].a));
+}
+
 // ============================================================
 // COMPOSITE: remodulate + tonemap + color controls
 // Pipeline: HDR → Exposure → Tonemap → Saturation → Gamma → Contrast → Dither

@@ -680,6 +680,11 @@ async function init() {
     layout: device.createPipelineLayout({ bindGroupLayouts: [dnAtrousLayout] }),
     compute: { module: dnModule, entryPoint: 'preblur' },
   });
+  // Shared-memory tiled pre-blur (18x18 tile, ±1 halo): 43 textureLoad → ~4 per thread
+  const preblurSMPipeline = device.createComputePipeline({
+    layout: device.createPipelineLayout({ bindGroupLayouts: [dnAtrousLayout] }),
+    compute: { module: dnModule, entryPoint: 'preblur_sm' },
+  });
   // Pre-blur bind group: reads noisyTex+specNoisyTex → writes pingTex+specPingTex
   const preblurBG = device.createBindGroup({ layout: dnAtrousLayout, entries: [
     { binding: 0, resource: { buffer: dnParamBufs[0] } }, // step_size=1 (unused by preblur, but layout needs it)
@@ -1597,7 +1602,7 @@ async function init() {
         // Pre-blur: lightweight 3×3 bilateral → stabilizes temporal AABB + removes fireflies
         // noisy → pingTex, specNoisy → specPingTex (temporal reads from ping)
         const pbPass = encoder.beginComputePass();
-        pbPass.setPipeline(preblurPipeline);
+        pbPass.setPipeline(preblurSMPipeline);
         pbPass.setBindGroup(0, preblurBG);
         pbPass.dispatchWorkgroups(Math.ceil(width/16), Math.ceil(height/16));
         pbPass.end();
