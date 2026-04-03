@@ -44,6 +44,7 @@ struct Uniforms {
   light_count: u32,
   sun_enabled: u32,
   _pad10: vec2u,
+  light_view_proj: mat4x4f,
   lights: array<PunctualLight, 16>,
 };
 
@@ -79,6 +80,8 @@ struct HitInfo { t: f32, u: f32, v: f32, tri_idx: u32, hit: bool, };
 @group(0) @binding(4) var albedo_out: texture_storage_2d<rgba8unorm, write>;
 @group(0) @binding(5) var denoise_nd_out: texture_storage_2d<rgba16float, write>;
 @group(0) @binding(6) var specular_out: texture_storage_2d<rgba16float, write>;
+@group(0) @binding(7) var shadow_map: texture_depth_2d;
+@group(0) @binding(8) var shadow_sampler: sampler_comparison;
 // accumulation handled by temporal pass (no extra buffer needed)
 
 @group(1) @binding(0) var<storage, read> vertices: array<vec4f>;
@@ -823,20 +826,36 @@ fn sample_punctual_nee_split(pos: vec3f, origin: vec3f, V: vec3f, surface: Surfa
   return result;
 }
 
+// Shadow map lookup: project world pos into light space, compare depth
+fn sample_shadow_map(world_pos: vec3f) -> f32 {
+  let light_clip = uniforms.light_view_proj * vec4f(world_pos, 1.0);
+  let ndc = light_clip.xyz / light_clip.w;
+  // NDC to UV: x [-1,1] → [0,1], y [-1,1] → [1,0] (flip Y)
+  let uv = vec2f(ndc.x * 0.5 + 0.5, -ndc.y * 0.5 + 0.5);
+  // Out of shadow map bounds → not in shadow
+  if uv.x < 0.0 || uv.x > 1.0 || uv.y < 0.0 || uv.y > 1.0 { return 1.0; }
+  // Bias to prevent shadow acne
+  let depth = ndc.z - 0.002;
+  // PCF 2x2 for softer shadows
+  let texel = 1.0 / 2048.0;
+  var shadow = 0.0;
+  shadow += textureSampleCompareLevel(shadow_map, shadow_sampler,uv + vec2f(-texel, -texel), depth);
+  shadow += textureSampleCompareLevel(shadow_map, shadow_sampler,uv + vec2f( texel, -texel), depth);
+  shadow += textureSampleCompareLevel(shadow_map, shadow_sampler,uv + vec2f(-texel,  texel), depth);
+  shadow += textureSampleCompareLevel(shadow_map, shadow_sampler,uv + vec2f( texel,  texel), depth);
+  return shadow * 0.25;
+}
+
 fn sample_sun_nee_split(pos: vec3f, normal: vec3f, V: vec3f, td: vec4u, mat: Material, uv0: vec2f, uv1: vec2f, uv2: vec2f, uv3: vec2f, baseColor: vec3f, roughness: f32, metallic: f32, transmission: f32) -> BRDFSplit {
   let origin = pos + normal * BIAS;
   let surface = build_surface_eval(td, mat, normal, baseColor, roughness, metallic, transmission, uv0, uv1, uv2, uv3);
   var result_split = BRDFSplit(vec3f(0.0), vec3f(0.0));
 
-  // Sun NEE
+  // Sun NEE — shadow map replaces BVH shadow rays
   if uniforms.sun_enabled != 0u {
-    var shadow_val = 0.0;
-    let L1 = sample_cone(g_sun_dir, COS_SUN_ANGLE);
-    let L2 = sample_cone(g_sun_dir, COS_SUN_ANGLE);
-    if !trace_shadow(origin, L1, 50.0) { shadow_val += 0.5; }
-    if !trace_shadow(origin, L2, 50.0) { shadow_val += 0.5; }
+    let shadow_val = sample_shadow_map(pos);
     if shadow_val > 0.0 {
-      let L = normalize(L1 + L2);
+      let L = g_sun_dir;
       if dot(normal, L) > 0.0 {
         let brdf = eval_surface_split(surface, V, L);
         let light = SUN_COLOR * SUN_MULT * SUN_SOLID_ANGLE * shadow_val;
@@ -912,13 +931,9 @@ fn sample_scene_nee_basic(pos: vec3f, normal: vec3f, V: vec3f, surface: SurfaceE
   var result_split = BRDFSplit(vec3f(0.0), vec3f(0.0));
 
   if uniforms.sun_enabled != 0u {
-    var shadow_val = 0.0;
-    let L1 = sample_cone(g_sun_dir, COS_SUN_ANGLE);
-    let L2 = sample_cone(g_sun_dir, COS_SUN_ANGLE);
-    if !trace_shadow(origin, L1, 50.0) { shadow_val += 0.5; }
-    if !trace_shadow(origin, L2, 50.0) { shadow_val += 0.5; }
+    let shadow_val = sample_shadow_map(pos);
     if shadow_val > 0.0 {
-      let L = normalize(L1 + L2);
+      let L = g_sun_dir;
       if dot(normal, L) > 0.0 {
         let brdf = eval_surface_split(surface, V, L);
         let light = SUN_COLOR * SUN_MULT * SUN_SOLID_ANGLE * shadow_val;

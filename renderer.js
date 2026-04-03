@@ -202,13 +202,14 @@ async function init() {
 
   // --- Load shaders ---
   const v = Date.now(); // cache bust
-  let [ptCode, dispCode, fsrCode, dnCode, tmpCode, gbCode] = await Promise.all([
+  let [ptCode, dispCode, fsrCode, dnCode, tmpCode, gbCode, smCode] = await Promise.all([
     fetch(`pathtracer.wgsl?v=${v}`).then(r => r.text()),
     fetch(`display.wgsl?v=${v}`).then(r => r.text()),
     fetch(`fsr.wgsl?v=${v}`).then(r => r.text()),
     fetch(`denoise.wgsl?v=${v}`).then(r => r.text()),
     fetch(`temporal.wgsl?v=${v}`).then(r => r.text()),
     fetch(`gbuffer.wgsl?v=${v}`).then(r => r.text()),
+    fetch(`shadow-map.wgsl?v=${v}`).then(r => r.text()),
   ]);
 
   if (hasSubgroups) rlog('Subgroups available (reserved for denoiser)');
@@ -237,9 +238,10 @@ async function init() {
   const dnModule = device.createShaderModule({ code: dnCode, ...smOpts });
   const tmpModule = device.createShaderModule({ code: tmpCode, ...smOpts });
   const gbModule = device.createShaderModule({ code: gbCode, ...smOpts });
+  const shadowModule = device.createShaderModule({ code: smCode, ...smOpts });
 
   // Check shader compilation
-  for (const [name, mod] of [['pathtracer',ptModule],['display',dispModule],['fsr',fsrModule],['denoise',dnModule],['temporal',tmpModule],['gbuffer',gbModule]]) {
+  for (const [name, mod] of [['pathtracer',ptModule],['display',dispModule],['fsr',fsrModule],['denoise',dnModule],['temporal',tmpModule],['gbuffer',gbModule],['shadow-map',shadowModule]]) {
     const ci = await mod.getCompilationInfo();
     for (const m of ci.messages) {
       if (m.type === 'error') {
@@ -320,6 +322,43 @@ async function init() {
     primitive: { topology: 'triangle-list', cullMode: 'none' }, // double-sided
   });
   rlog(`Raster pipeline: ${triCount} tris, ${stats.vertices} verts`);
+
+  // --- Shadow map ---
+  const SHADOW_RES = 2048;
+  const shadowDepthTex = device.createTexture({
+    size: [SHADOW_RES, SHADOW_RES],
+    format: 'depth32float',
+    usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.TEXTURE_BINDING,
+  });
+  const shadowSampler = device.createSampler({ compare: 'less', magFilter: 'linear', minFilter: 'linear' });
+  const shadowUniformBuf = device.createBuffer({ size: 64, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST }); // mat4x4f
+  // Shadow map uses same BGL structure as gbuffer (uniform + materials + texArray + sampler)
+  const shadowBGL = device.createBindGroupLayout({ entries: [
+    { binding: 0, visibility: GPUShaderStage.VERTEX | GPUShaderStage.FRAGMENT, buffer: { type: 'uniform' } },
+    { binding: 1, visibility: GPUShaderStage.FRAGMENT, buffer: { type: 'read-only-storage' } },
+    { binding: 2, visibility: GPUShaderStage.FRAGMENT, texture: { sampleType: 'float', viewDimension: '2d-array' } },
+    { binding: 3, visibility: GPUShaderStage.FRAGMENT, sampler: { type: 'filtering' } },
+  ]});
+  const shadowPipeline = device.createRenderPipeline({
+    layout: device.createPipelineLayout({ bindGroupLayouts: [shadowBGL] }),
+    vertex: {
+      module: shadowModule, entryPoint: 'vs',
+      buffers: [
+        { arrayStride: 16, attributes: [{ shaderLocation: 0, offset: 0, format: 'float32x4' }] },
+        { arrayStride: 16, attributes: [{ shaderLocation: 1, offset: 0, format: 'float32x4' }] },
+        { arrayStride: 4,  attributes: [{ shaderLocation: 2, offset: 0, format: 'float32' }] },
+        { arrayStride: 24, attributes: [
+          { shaderLocation: 3, offset: 0,  format: 'float32x2' },
+          { shaderLocation: 4, offset: 8,  format: 'float32x2' },
+          { shaderLocation: 5, offset: 16, format: 'float32x2' },
+        ]},
+      ],
+    },
+    fragment: { module: shadowModule, entryPoint: 'fs', targets: [] }, // depth-only
+    depthStencil: { format: 'depth32float', depthWriteEnabled: true, depthCompare: 'less' },
+    primitive: { topology: 'triangle-list', cullMode: 'none' },
+  });
+  // shadowBG created after texture array is loaded (below)
   // Diffuse signal textures
   const hdrTex   = device.createTexture({ size:[width,height], format:'rgba16float', usage:F16 });   // temporal accumulated diffuse
   const pingTex  = device.createTexture({ size:[width,height], format:'rgba16float', usage:F16 });   // à-trous ping diffuse
@@ -423,6 +462,12 @@ async function init() {
     { binding: 2, resource: texArray.createView({ dimension: '2d-array' }) },
     { binding: 3, resource: gbufSampler },
   ]});
+  const shadowBG = device.createBindGroup({ layout: shadowBGL, entries: [
+    { binding: 0, resource: { buffer: shadowUniformBuf } },
+    { binding: 1, resource: { buffer: matBufForGbuf } },
+    { binding: 2, resource: texArray.createView({ dimension: '2d-array' }) },
+    { binding: 3, resource: gbufSampler },
+  ]});
 
   // --- Scene GPU buffers ---
   info.textContent = 'Uploading to GPU...';
@@ -444,6 +489,8 @@ async function init() {
       { binding: 4, visibility: GPUShaderStage.COMPUTE, storageTexture: { access: 'write-only', format: 'rgba8unorm' } },
       { binding: 5, visibility: GPUShaderStage.COMPUTE, storageTexture: { access: 'write-only', format: 'rgba16float' } },
       { binding: 6, visibility: GPUShaderStage.COMPUTE, storageTexture: { access: 'write-only', format: 'rgba16float' } },
+      { binding: 7, visibility: GPUShaderStage.COMPUTE, texture: { sampleType: 'depth' } },
+      { binding: 8, visibility: GPUShaderStage.COMPUTE, sampler: { type: 'comparison' } },
     ],
   });
   const bg0 = device.createBindGroup({
@@ -456,6 +503,8 @@ async function init() {
       { binding: 4, resource: albedoTex.createView() },
       { binding: 5, resource: denoiseNdTex.createView() },
       { binding: 6, resource: specNoisyTex.createView() },
+      { binding: 7, resource: shadowDepthTex.createView() },
+      { binding: 8, resource: shadowSampler },
     ],
   });
 
@@ -556,6 +605,14 @@ async function init() {
     { binding: 0, resource: texArray.createView({ dimension: '2d-array' }) },
     { binding: 1, resource: texSampler },
   ]});
+
+  // Scene bounds from BVH root node (AABB)
+  const bvhF = scene.gpuBVHNodes;
+  const sceneMin = [bvhF[0], bvhF[1], bvhF[2]];
+  const sceneMax = [bvhF[4], bvhF[5], bvhF[6]];
+  const sceneCenter = [(sceneMin[0]+sceneMax[0])*0.5, (sceneMin[1]+sceneMax[1])*0.5, (sceneMin[2]+sceneMax[2])*0.5];
+  const sceneRadius = Math.sqrt((sceneMax[0]-sceneMin[0])**2 + (sceneMax[1]-sceneMin[1])**2 + (sceneMax[2]-sceneMin[2])**2) * 0.5;
+  rlog(`Scene bounds: center=[${sceneCenter.map(v=>v.toFixed(1))}] radius=${sceneRadius.toFixed(1)}`);
 
   rlog(`ReSTIR GI ${restirEnabled ? 'enabled' : 'disabled (limit<10)'} (${(restirBufSize * 2 / 1048576).toFixed(1)} MB)`);
 
@@ -1574,6 +1631,46 @@ async function init() {
     return { forward:fw, right:rt, up };
   }
 
+  function buildLightViewProj(sunDir, sceneCenter, sceneRadius) {
+    // Orthographic projection from sun's direction covering the scene
+    const lx = sunDir[0], ly = sunDir[1], lz = sunDir[2];
+    // Light position: far back along sun direction
+    const lp = [sceneCenter[0] - lx * sceneRadius * 2, sceneCenter[1] - ly * sceneRadius * 2, sceneCenter[2] - lz * sceneRadius * 2];
+    // Build look-at: forward = sunDir, compute right and up
+    const fw = [lx, ly, lz];
+    // Pick a stable up vector that's not parallel to sun
+    const worldUp = Math.abs(ly) < 0.99 ? [0, 1, 0] : [1, 0, 0];
+    const rt = [fw[1]*worldUp[2]-fw[2]*worldUp[1], fw[2]*worldUp[0]-fw[0]*worldUp[2], fw[0]*worldUp[1]-fw[1]*worldUp[0]];
+    const rl = Math.sqrt(rt[0]*rt[0]+rt[1]*rt[1]+rt[2]*rt[2]);
+    rt[0] /= rl; rt[1] /= rl; rt[2] /= rl;
+    const up = [rt[1]*fw[2]-rt[2]*fw[1], rt[2]*fw[0]-rt[0]*fw[2], rt[0]*fw[1]-rt[1]*fw[0]];
+    // View matrix
+    const view = new Float32Array([
+      rt[0], up[0], -fw[0], 0,
+      rt[1], up[1], -fw[1], 0,
+      rt[2], up[2], -fw[2], 0,
+      -(rt[0]*lp[0]+rt[1]*lp[1]+rt[2]*lp[2]),
+      -(up[0]*lp[0]+up[1]*lp[1]+up[2]*lp[2]),
+      (fw[0]*lp[0]+fw[1]*lp[1]+fw[2]*lp[2]),
+      1,
+    ]);
+    // Orthographic projection: [-r, r] x [-r, r] x [0, 4r]
+    const r = sceneRadius;
+    const near = 0.0, far = sceneRadius * 4;
+    const proj = new Float32Array(16);
+    proj[0] = 1 / r;
+    proj[5] = -1 / r;  // flip Y for WebGPU
+    proj[10] = -1 / (far - near);
+    proj[14] = -near / (far - near);
+    proj[15] = 1;
+    // viewProj = proj * view
+    const vp = new Float32Array(16);
+    for (let c = 0; c < 4; c++)
+      for (let r2 = 0; r2 < 4; r2++)
+        vp[c*4+r2] = proj[r2]*view[c*4] + proj[4+r2]*view[c*4+1] + proj[8+r2]*view[c*4+2] + proj[12+r2]*view[c*4+3];
+    return vp;
+  }
+
   function buildViewProj(cam, fw, rt, up, w, h) {
     // View matrix (column-major, WebGPU convention)
     const p = cam.pos;
@@ -1675,6 +1772,30 @@ async function init() {
       device.queue.submit([encoder.finish()]);
     }
 
+    // --- Shadow map rasterization ---
+    const sun = getSunDir();
+    const lightViewProj = buildLightViewProj(sun, sceneCenter, sceneRadius);
+    device.queue.writeBuffer(shadowUniformBuf, 0, lightViewProj);
+    {
+      const encoder = device.createCommandEncoder();
+      const rp = encoder.beginRenderPass({
+        colorAttachments: [],
+        depthStencilAttachment: {
+          view: shadowDepthTex.createView(), depthLoadOp: 'clear', depthStoreOp: 'store', depthClearValue: 1.0,
+        },
+      });
+      rp.setPipeline(shadowPipeline);
+      rp.setBindGroup(0, shadowBG);
+      rp.setVertexBuffer(0, posVB);
+      rp.setVertexBuffer(1, nrmVB);
+      rp.setVertexBuffer(2, matIdVB);
+      rp.setVertexBuffer(3, uvExtraVB);
+      rp.setIndexBuffer(indexBuf, 'uint32');
+      rp.drawIndexed(triCount * 3);
+      rp.end();
+      device.queue.submit([encoder.finish()]);
+    }
+
     // Write PT uniforms
     const ud = new ArrayBuffer(uniformBufferSize);
     const f32 = new Float32Array(ud);
@@ -1685,7 +1806,6 @@ async function init() {
     f32[8] = forward[0]; f32[9] = forward[1]; f32[10] = forward[2]; f32[11] = 0;
     f32[12] = right[0]; f32[13] = right[1]; f32[14] = right[2]; f32[15] = 0;
     f32[16] = up[0]; f32[17] = up[1]; f32[18] = up[2]; f32[19] = fovFactor;
-    const sun = getSunDir();
     f32[20] = sun[0]; f32[21] = sun[1]; f32[22] = sun[2];
     u32[23] = stats.emissiveTris;
     u32[24] = maxBounces;
@@ -1701,9 +1821,11 @@ async function init() {
     u32[45] = punctualLights.length === 0 ? 1 : 0;
     u32[46] = 0;
     u32[47] = 0;
+    // light_view_proj matrix (mat4x4f at float offset 48)
+    f32.set(lightViewProj, 48);
     for (let i = 0; i < MAX_PUNCTUAL_LIGHTS; i++) {
       const light = punctualLights[i];
-      const base = 48 + i * 16;
+      const base = 64 + i * 16;
       if (!light) {
         for (let j = 0; j < 16; j++) f32[base + j] = 0;
         continue;
