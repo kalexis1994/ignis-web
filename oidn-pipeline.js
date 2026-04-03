@@ -129,11 +129,15 @@ export async function createOIDNPipeline(device, weightsUrl, width, height, hasF
 
   const STORAGE = GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC;
 
+  // Read channel counts from weight shapes (auto-adapts to any model size)
+  function wch(name) { return wt.tensors.get(name + '.weight').shape[0]; }
+  const sk1_ch = wch('enc_conv1'), sk2_ch = wch('enc_conv2'), sk3_ch = wch('enc_conv3');
+
   // Skip buffers (persist encoder → decoder) — saved AFTER pooling (at decoder resolution)
-  const skipInput = device.createBuffer({ size: bufSize(9, 0), usage: STORAGE });   // original 9ch input (L0)
-  const skip1 = device.createBuffer({ size: bufSize(32, 1), usage: STORAGE });      // pooled enc_conv1 (L1)
-  const skip2 = device.createBuffer({ size: bufSize(48, 2), usage: STORAGE });      // pooled enc_conv2 (L2)
-  const skip3 = device.createBuffer({ size: bufSize(64, 3), usage: STORAGE });      // pooled enc_conv3 (L3)
+  const skipInput = device.createBuffer({ size: bufSize(9, 0), usage: STORAGE });
+  const skip1 = device.createBuffer({ size: bufSize(sk1_ch, 1), usage: STORAGE });
+  const skip2 = device.createBuffer({ size: bufSize(sk2_ch, 2), usage: STORAGE });
+  const skip3 = device.createBuffer({ size: bufSize(sk3_ch, 3), usage: STORAGE });
 
   // Working buffers (ping-pong, sized for largest need)
   const maxBufSize = Math.max(
@@ -260,7 +264,7 @@ export async function createOIDNPipeline(device, weightsUrl, width, height, hasF
     ]});
     dispatches.push({
       pipeline: convPipeline, bindGroup: bg,
-      dispatch: [Math.ceil(w / 16), Math.ceil(h / 16), Math.ceil(c_out / 8)],
+      dispatch: [Math.ceil(w / 8), Math.ceil(h / 8), Math.ceil(c_out / 8)],
       label: layerName,
     });
   }
@@ -297,33 +301,44 @@ export async function createOIDNPipeline(device, weightsUrl, width, height, hasF
     });
   }
 
-  // --- ENCODER (default model) ---
-  addConv('enc_conv0', 9, 32, true, skipInput, workA, 0);
-  addConv('enc_conv1', 32, 32, true, workA, workB, 0);
-  addPool(workB, skip1, 32, 0);
-  addConv('enc_conv2', 32, 48, true, skip1, workA, 1);
-  addPool(workA, skip2, 48, 1);
-  addConv('enc_conv3', 48, 64, true, skip2, workB, 2);
-  addPool(workB, skip3, 64, 2);
-  addConv('enc_conv4', 64, 80, true, skip3, workA, 3);
-  addPool(workA, workB, 80, 3);
-  addConv('enc_conv5a', 80, 96, true, workB, workA, 4);
-  addConv('enc_conv5b', 96, 96, true, workA, workB, 4);
+  // --- Auto-configure from weight shapes (works for both default and small models) ---
+  function ch(name) { return wt.tensors.get(name + '.weight').shape[0]; } // output channels
+  function ci(name) { return wt.tensors.get(name + '.weight').shape[1]; } // input channels
 
-  // --- DECODER (default model) ---
-  addUpsample(workB, workA, 96, 4);
-  addConv('dec_conv4a', 160, 112, true, workA, workB, 3, 96, skip3);
-  addConv('dec_conv4b', 112, 112, true, workB, workA, 3);
-  addUpsample(workA, workB, 112, 3);
-  addConv('dec_conv3a', 160, 96, true, workB, workA, 2, 112, skip2);
-  addConv('dec_conv3b', 96, 96, true, workA, workB, 2);
-  addUpsample(workB, workA, 96, 2);
-  addConv('dec_conv2a', 128, 64, true, workA, workB, 1, 96, skip1);
-  addConv('dec_conv2b', 64, 64, true, workB, workA, 1);
-  addUpsample(workA, workB, 64, 1);
-  addConv('dec_conv1a', 73, 64, true, workB, workA, 0, 64, skipInput);
-  addConv('dec_conv1b', 64, 32, true, workA, workB, 0);
-  addConv('dec_conv0', 32, 3, false, workB, outputBuf, 0);
+  const c_enc1 = ch('enc_conv1'), c_enc2 = ch('enc_conv2'), c_enc3 = ch('enc_conv3');
+  const c_enc5b = ch('enc_conv5b');
+
+  // ENCODER
+  addConv('enc_conv0', ci('enc_conv0'), ch('enc_conv0'), true, skipInput, workA, 0);
+  addConv('enc_conv1', ci('enc_conv1'), c_enc1, true, workA, workB, 0);
+  addPool(workB, skip1, c_enc1, 0);
+  addConv('enc_conv2', ci('enc_conv2'), c_enc2, true, skip1, workA, 1);
+  addPool(workA, skip2, c_enc2, 1);
+  addConv('enc_conv3', ci('enc_conv3'), c_enc3, true, skip2, workB, 2);
+  addPool(workB, skip3, c_enc3, 2);
+  addConv('enc_conv4', ci('enc_conv4'), ch('enc_conv4'), true, skip3, workA, 3);
+  addPool(workA, workB, ch('enc_conv4'), 3);
+  addConv('enc_conv5a', ci('enc_conv5a'), ch('enc_conv5a'), true, workB, workA, 4);
+  addConv('enc_conv5b', ci('enc_conv5b'), c_enc5b, true, workA, workB, 4);
+
+  // DECODER
+  addUpsample(workB, workA, c_enc5b, 4);
+  const d4a_ci = ci('dec_conv4a'), d4a_up = d4a_ci - c_enc3; // split = upsampled channels
+  addConv('dec_conv4a', d4a_ci, ch('dec_conv4a'), true, workA, workB, 3, d4a_up, skip3);
+  addConv('dec_conv4b', ci('dec_conv4b'), ch('dec_conv4b'), true, workB, workA, 3);
+  addUpsample(workA, workB, ch('dec_conv4b'), 3);
+  const d3a_ci = ci('dec_conv3a'), d3a_up = d3a_ci - c_enc2;
+  addConv('dec_conv3a', d3a_ci, ch('dec_conv3a'), true, workB, workA, 2, d3a_up, skip2);
+  addConv('dec_conv3b', ci('dec_conv3b'), ch('dec_conv3b'), true, workA, workB, 2);
+  addUpsample(workB, workA, ch('dec_conv3b'), 2);
+  const d2a_ci = ci('dec_conv2a'), d2a_up = d2a_ci - c_enc1;
+  addConv('dec_conv2a', d2a_ci, ch('dec_conv2a'), true, workA, workB, 1, d2a_up, skip1);
+  addConv('dec_conv2b', ci('dec_conv2b'), ch('dec_conv2b'), true, workB, workA, 1);
+  addUpsample(workA, workB, ch('dec_conv2b'), 1);
+  const d1a_ci = ci('dec_conv1a'), d1a_up = d1a_ci - 9; // 9 = input channels
+  addConv('dec_conv1a', d1a_ci, ch('dec_conv1a'), true, workB, workA, 0, d1a_up, skipInput);
+  addConv('dec_conv1b', ci('dec_conv1b'), ch('dec_conv1b'), true, workA, workB, 0);
+  addConv('dec_conv0', ci('dec_conv0'), 3, false, workB, outputBuf, 0);
 
   log(`OIDN pipeline: ${dispatches.length} dispatches, ${levels.map(l => l.w + 'x' + l.h).join(' → ')}`);
 
@@ -339,23 +354,24 @@ export async function createOIDNPipeline(device, weightsUrl, width, height, hasF
      * Call createIOBindGroups first to set up texture bindings.
      */
     encode(encoder, inputBG, outputBG) {
-      // Input assembly: textures → skipInput buffer
+      // Input assembly in its own pass (texture → buffer transition)
       const ioPass = encoder.beginComputePass();
       ioPass.setPipeline(inputPipeline);
       ioPass.setBindGroup(0, inputBG);
       ioPass.dispatchWorkgroups(Math.ceil(padW / 16), Math.ceil(padH / 16));
       ioPass.end();
 
-      // UNet forward pass (all layers)
+      // ALL UNet layers in a SINGLE compute pass (pipeline/bindgroup switching)
+      // WebGPU inserts implicit UAV barriers between dispatches on same resources
+      const unetPass = encoder.beginComputePass();
       for (const d of dispatches) {
-        const pass = encoder.beginComputePass();
-        pass.setPipeline(d.pipeline);
-        pass.setBindGroup(0, d.bindGroup);
-        pass.dispatchWorkgroups(d.dispatch[0], d.dispatch[1], d.dispatch[2]);
-        pass.end();
+        unetPass.setPipeline(d.pipeline);
+        unetPass.setBindGroup(0, d.bindGroup);
+        unetPass.dispatchWorkgroups(d.dispatch[0], d.dispatch[1], d.dispatch[2]);
       }
+      unetPass.end();
 
-      // Output extraction: outputBuf → texture
+      // Output extraction in its own pass (buffer → texture transition)
       const outPass = encoder.beginComputePass();
       outPass.setPipeline(outputPipeline);
       outPass.setBindGroup(0, outputBG);

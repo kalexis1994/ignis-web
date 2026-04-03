@@ -829,9 +829,10 @@ async function init() {
 
   // --- OIDN Neural Denoiser (optional) ---
   let oidn = null;
-  if (denoiseMode === 'oidn') {
+  if (denoiseMode.startsWith('oidn')) {
     try {
-      oidn = await createOIDNPipeline(device, 'oidn/rt_ldr_alb_nrm.tza', width, height, hasF16, rlog);
+      const oidnWeights = denoiseMode === 'oidn-fast' ? 'oidn/rt_ldr_alb_nrm_small.tza' : 'oidn/rt_ldr_alb_nrm.tza';
+      oidn = await createOIDNPipeline(device, oidnWeights, width, height, hasF16, rlog);
 
       // Input assembly bind group: textures → 9ch NCHW buffer
       // We feed the combined beauty pass: albedo * diffuse + specular
@@ -1659,7 +1660,7 @@ async function init() {
         sharcPass.end();
       }
 
-      if (denoiseMode === 'oidn' && oidn) {
+      if (denoiseMode.startsWith('oidn') && oidn) {
         // Neural denoiser: replaces preblur + temporal + à-trous
         oidn.encode(encoder, oidn.inputBG, oidn.outputBG);
         // OIDN writes denoised color to pingTex via output_extraction
@@ -1704,7 +1705,7 @@ async function init() {
       const cpf = new Float32Array(cp);
       const cpu = new Uint32Array(cp);
       cpf[0] = width; cpf[1] = height;
-      cpf[2] = (denoiseMode === 'oidn' && oidn) ? -1.0 : 0.0; // negative = OIDN mode (skip remodulation)
+      cpf[2] = (denoiseMode.startsWith('oidn') && oidn) ? -1.0 : 0.0; // negative = OIDN mode (skip remodulation)
       cpf[3] = 0;
       cpu[4] = settings.tonemapMode; cpf[5] = settings.exposure;
       cpf[6] = settings.saturation; cpf[7] = settings.contrast;
@@ -1717,7 +1718,7 @@ async function init() {
 
       const compPass = encoder.beginComputePass();
       compPass.setPipeline(dnCompPipeline);
-      const compBG = (denoiseMode === 'oidn' && oidn) ? dnBG_comp_oidn
+      const compBG = (denoiseMode.startsWith('oidn') && oidn) ? dnBG_comp_oidn
                    : denoiseMode !== 'off' ? dnBG_comp : dnBG_comp_noisy;
       compPass.setBindGroup(0, compBG);
       compPass.dispatchWorkgroups(Math.ceil(width/16), Math.ceil(height/16));
