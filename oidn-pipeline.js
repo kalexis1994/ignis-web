@@ -264,7 +264,7 @@ export async function createOIDNPipeline(device, weightsUrl, width, height, hasF
     ]});
     dispatches.push({
       pipeline: convPipeline, bindGroup: bg,
-      dispatch: [Math.ceil(w / 8), Math.ceil(h / 8), Math.ceil(c_out / 8)],
+      dispatch: [Math.ceil(c_out / 32), Math.ceil(w * h / 32), 1],  // im2col matmul 4x4: BM=32 × BN=32
       label: layerName,
     });
   }
@@ -280,7 +280,7 @@ export async function createOIDNPipeline(device, weightsUrl, width, height, hasF
     ]});
     dispatches.push({
       pipeline: poolPipeline, bindGroup: bg,
-      dispatch: [Math.ceil(outW / 8), Math.ceil(outH / 8), 1],  // NHWC: all channels per thread
+      dispatch: [Math.ceil(outW / 16), Math.ceil(outH / 16), channels],
       label: `maxpool_L${level}→${level + 1}`,
     });
   }
@@ -296,7 +296,7 @@ export async function createOIDNPipeline(device, weightsUrl, width, height, hasF
     ]});
     dispatches.push({
       pipeline: upsamplePipeline, bindGroup: bg,
-      dispatch: [Math.ceil(outW / 8), Math.ceil(outH / 8), 1],  // NHWC: all channels per thread
+      dispatch: [Math.ceil(outW / 16), Math.ceil(outH / 16), channels],
       label: `upsample_L${fromLevel}→${fromLevel - 1}`,
     });
   }
@@ -358,7 +358,7 @@ export async function createOIDNPipeline(device, weightsUrl, width, height, hasF
       const ioPass = encoder.beginComputePass();
       ioPass.setPipeline(inputPipeline);
       ioPass.setBindGroup(0, inputBG);
-      ioPass.dispatchWorkgroups(Math.ceil(padW / 8), Math.ceil(padH / 8));
+      ioPass.dispatchWorkgroups(Math.ceil(padW / 16), Math.ceil(padH / 16));
       ioPass.end();
 
       // ALL UNet layers in a SINGLE compute pass (pipeline/bindgroup switching)
@@ -375,7 +375,7 @@ export async function createOIDNPipeline(device, weightsUrl, width, height, hasF
       const outPass = encoder.beginComputePass();
       outPass.setPipeline(outputPipeline);
       outPass.setBindGroup(0, outputBG);
-      outPass.dispatchWorkgroups(Math.ceil(padW / 8), Math.ceil(padH / 8));
+      outPass.dispatchWorkgroups(Math.ceil(padW / 16), Math.ceil(padH / 16));
       outPass.end();
     },
   };

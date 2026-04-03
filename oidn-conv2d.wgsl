@@ -1,5 +1,6 @@
-// OIDN Conv2D 3x3 — NHWC layout, 8x8 workgroup, 8 output channels
-// NHWC: all channels per pixel contiguous → coalesced vec4 reads, cache-friendly
+// OIDN Conv2D 3x3 — im2col matmul with 4×4 register tiling
+// Each thread computes 4×4 = 16 output elements → 16x better arithmetic intensity
+// Output[M,N] = Weight[M,K] × Im2col[K,N], M=c_out, K=c_in*9, N=H*W
 
 enable f16;
 
@@ -14,12 +15,16 @@ struct ConvParams {
 @group(0) @binding(3) var<storage, read_write> buf_out: array<f16>;
 @group(0) @binding(4) var<storage, read> buf_b: array<f16>;
 
-const TILE: u32 = 8u;
-const PAD: u32 = 10u;
-const CH_TILE: u32 = 8u;
+const BM: u32 = 32u;  // tile M (output channels per workgroup)
+const BN: u32 = 32u;  // tile N (spatial positions per workgroup)
+const BK: u32 = 32u;  // tile K (inner dimension per iteration)
+const TM: u32 = 4u;   // elements per thread in M
+const TN: u32 = 4u;   // elements per thread in N
+// Workgroup: (BN/TN) × (BM/TM) = 8 × 8 = 64 threads
 
-// Shared memory: 10x10 spatial × CH_TILE channels = 800 f16 (1600 bytes)
-var<workgroup> sm: array<f16, 800>;
+var<workgroup> w_sm: array<f16, 1024>;  // BM * BK = 32*32
+var<workgroup> i_sm: array<f16, 1024>;  // BK * BN = 32*32
+// Total shared memory: 4096 bytes
 
 @compute @workgroup_size(8, 8)
 fn conv2d_3x3(
@@ -28,98 +33,104 @@ fn conv2d_3x3(
 ) {
   let W = params.width;
   let H = params.height;
+  let HW = H * W;
   let c_in = params.c_in;
   let c_out = params.c_out;
-  let ox = wid.x * TILE + lid.x;
-  let oy = wid.y * TILE + lid.y;
-  let oob = ox >= W || oy >= H;
-  let oc_base = wid.z * 8u;
-
-  var a0:f32=0.;var a1:f32=0.;var a2:f32=0.;var a3:f32=0.;
-  var a4:f32=0.;var a5:f32=0.;var a6:f32=0.;var a7:f32=0.;
-  if !oob {
-    let bo = params.bias_off + oc_base;
-    if oc_base     <c_out{a0=f32(weights[bo]);}     if oc_base+1u<c_out{a1=f32(weights[bo+1u]);}
-    if oc_base+2u<c_out{a2=f32(weights[bo+2u]);}   if oc_base+3u<c_out{a3=f32(weights[bo+3u]);}
-    if oc_base+4u<c_out{a4=f32(weights[bo+4u]);}   if oc_base+5u<c_out{a5=f32(weights[bo+5u]);}
-    if oc_base+6u<c_out{a6=f32(weights[bo+6u]);}   if oc_base+7u<c_out{a7=f32(weights[bo+7u]);}
-  }
-
-  let tile_x = i32(wid.x * TILE) - 1i;
-  let tile_y = i32(wid.y * TILE) - 1i;
-  let flat_id = lid.y * TILE + lid.x; // 0..63
+  let K = c_in * 9u;
   let split = select(c_in, params.split_ch, params.split_ch > 0u);
-  let c_a = split;           // channels per pixel in buf_a
-  let c_b = c_in - split;    // channels per pixel in buf_b
-  let lx = lid.x + 1u;
-  let ly = lid.y + 1u;
 
-  for (var ch_base = 0u; ch_base < c_in; ch_base += CH_TILE) {
-    let ch_count = min(CH_TILE, c_in - ch_base);
-    let total_sm = PAD * PAD * ch_count;
+  let m_base = wid.x * BM;  // output channel base
+  let n_base = wid.y * BN;  // spatial position base
 
-    // Cooperative load: NHWC buffers → shared memory
-    // sm layout: sm[spatial * CH_TILE + ch_local] (channels innermost)
-    for (var t = flat_id; t < total_sm; t += 64u) {
-      let spatial = t / CH_TILE;
-      let ch_local = t - spatial * CH_TILE;
-      if ch_local >= ch_count { sm[t] = 0.0h; continue; }
-      let sy = spatial / PAD;
-      let sx = spatial - sy * PAD;
-      let px = u32(clamp(tile_x + i32(sx), 0, i32(W) - 1));
-      let py = u32(clamp(tile_y + i32(sy), 0, i32(H) - 1));
-      let ic = ch_base + ch_local;
-      let pixel = py * W + px;
-      var val: f16 = 0.0h;
-      // NHWC: buf_a[(y*W+x)*C_a + ic], buf_b[(y*W+x)*C_b + (ic-split)]
-      if ic < split {
-        val = buf_a[pixel * c_a + ic];
-      } else if ic < c_in {
-        val = buf_b[pixel * c_b + (ic - split)];
-      }
-      sm[t] = val;
+  // Thread position: lid.x = N thread (0..7), lid.y = M thread (0..7)
+  // Each thread computes TM × TN = 4×4 = 16 output elements
+  let tm_base = lid.y * TM;  // M offset within tile (0,4,8,...,28)
+  let tn_base = lid.x * TN;  // N offset within tile (0,4,8,...,28)
+
+  // 16 accumulators (4M × 4N)
+  var c00:f32=0.;var c01:f32=0.;var c02:f32=0.;var c03:f32=0.;
+  var c10:f32=0.;var c11:f32=0.;var c12:f32=0.;var c13:f32=0.;
+  var c20:f32=0.;var c21:f32=0.;var c22:f32=0.;var c23:f32=0.;
+  var c30:f32=0.;var c31:f32=0.;var c32:f32=0.;var c33:f32=0.;
+
+  let flat = lid.y * 8u + lid.x;  // 0..63
+
+  for (var k_base = 0u; k_base < K; k_base += BK) {
+    // --- Load weight tile w_sm[BM][BK] = 512 values, 64 threads → 8 per thread ---
+    for (var i = flat; i < 1024u; i += 64u) {
+      let row = i / BK;  // M offset (0..31)
+      let col = i % BK;  // K offset (0..15)
+      let gm = m_base + row;
+      let gk = k_base + col;
+      w_sm[i] = select(0.0h, weights[params.weight_off + gm * K + gk], gm < c_out && gk < K);
     }
+
+    // --- Load input tile i_sm[BK][BN] = 512 values via implicit im2col ---
+    for (var i = flat; i < 1024u; i += 64u) {
+      let row = i / BN;  // K offset (0..15)
+      let col = i % BN;  // N offset (0..31)
+      let gk = k_base + row;
+      let gn = n_base + col;
+      var val: f16 = 0.0h;
+      if gk < K && gn < HW {
+        let gy = gn / W;
+        let gx = gn - gy * W;
+        let ic = gk / 9u;
+        let rem = gk - ic * 9u;
+        let ky = rem / 3u;
+        let kx = rem - ky * 3u;
+        let sy = clamp(i32(gy) + i32(ky) - 1, 0, i32(H) - 1);
+        let sx = clamp(i32(gx) + i32(kx) - 1, 0, i32(W) - 1);
+        let src = u32(sy) * W + u32(sx);
+        if ic < split { val = buf_a[ic * HW + src]; }
+        else { val = buf_b[(ic - split) * HW + src]; }
+      }
+      i_sm[i] = val;
+    }
+
     workgroupBarrier();
 
-    if !oob {
-      for (var ch_local = 0u; ch_local < ch_count; ch_local++) {
-        let ic = ch_base + ch_local;
-        // Read 9 neighbors from shared memory (NHWC: stride = CH_TILE between channels)
-        let v00=f32(sm[((ly-1u)*PAD+(lx-1u))*CH_TILE+ch_local]);
-        let v01=f32(sm[((ly-1u)*PAD+ lx    )*CH_TILE+ch_local]);
-        let v02=f32(sm[((ly-1u)*PAD+(lx+1u))*CH_TILE+ch_local]);
-        let v10=f32(sm[( ly    *PAD+(lx-1u))*CH_TILE+ch_local]);
-        let v11=f32(sm[( ly    *PAD+ lx    )*CH_TILE+ch_local]);
-        let v12=f32(sm[( ly    *PAD+(lx+1u))*CH_TILE+ch_local]);
-        let v20=f32(sm[((ly+1u)*PAD+(lx-1u))*CH_TILE+ch_local]);
-        let v21=f32(sm[((ly+1u)*PAD+ lx    )*CH_TILE+ch_local]);
-        let v22=f32(sm[((ly+1u)*PAD+(lx+1u))*CH_TILE+ch_local]);
-
-        if oc_base     <c_out{let w=params.weight_off+(oc_base     *c_in+ic)*9u;a0+=v00*f32(weights[w])+v01*f32(weights[w+1u])+v02*f32(weights[w+2u])+v10*f32(weights[w+3u])+v11*f32(weights[w+4u])+v12*f32(weights[w+5u])+v20*f32(weights[w+6u])+v21*f32(weights[w+7u])+v22*f32(weights[w+8u]);}
-        if oc_base+1u<c_out{let w=params.weight_off+((oc_base+1u)*c_in+ic)*9u;a1+=v00*f32(weights[w])+v01*f32(weights[w+1u])+v02*f32(weights[w+2u])+v10*f32(weights[w+3u])+v11*f32(weights[w+4u])+v12*f32(weights[w+5u])+v20*f32(weights[w+6u])+v21*f32(weights[w+7u])+v22*f32(weights[w+8u]);}
-        if oc_base+2u<c_out{let w=params.weight_off+((oc_base+2u)*c_in+ic)*9u;a2+=v00*f32(weights[w])+v01*f32(weights[w+1u])+v02*f32(weights[w+2u])+v10*f32(weights[w+3u])+v11*f32(weights[w+4u])+v12*f32(weights[w+5u])+v20*f32(weights[w+6u])+v21*f32(weights[w+7u])+v22*f32(weights[w+8u]);}
-        if oc_base+3u<c_out{let w=params.weight_off+((oc_base+3u)*c_in+ic)*9u;a3+=v00*f32(weights[w])+v01*f32(weights[w+1u])+v02*f32(weights[w+2u])+v10*f32(weights[w+3u])+v11*f32(weights[w+4u])+v12*f32(weights[w+5u])+v20*f32(weights[w+6u])+v21*f32(weights[w+7u])+v22*f32(weights[w+8u]);}
-        if oc_base+4u<c_out{let w=params.weight_off+((oc_base+4u)*c_in+ic)*9u;a4+=v00*f32(weights[w])+v01*f32(weights[w+1u])+v02*f32(weights[w+2u])+v10*f32(weights[w+3u])+v11*f32(weights[w+4u])+v12*f32(weights[w+5u])+v20*f32(weights[w+6u])+v21*f32(weights[w+7u])+v22*f32(weights[w+8u]);}
-        if oc_base+5u<c_out{let w=params.weight_off+((oc_base+5u)*c_in+ic)*9u;a5+=v00*f32(weights[w])+v01*f32(weights[w+1u])+v02*f32(weights[w+2u])+v10*f32(weights[w+3u])+v11*f32(weights[w+4u])+v12*f32(weights[w+5u])+v20*f32(weights[w+6u])+v21*f32(weights[w+7u])+v22*f32(weights[w+8u]);}
-        if oc_base+6u<c_out{let w=params.weight_off+((oc_base+6u)*c_in+ic)*9u;a6+=v00*f32(weights[w])+v01*f32(weights[w+1u])+v02*f32(weights[w+2u])+v10*f32(weights[w+3u])+v11*f32(weights[w+4u])+v12*f32(weights[w+5u])+v20*f32(weights[w+6u])+v21*f32(weights[w+7u])+v22*f32(weights[w+8u]);}
-        if oc_base+7u<c_out{let w=params.weight_off+((oc_base+7u)*c_in+ic)*9u;a7+=v00*f32(weights[w])+v01*f32(weights[w+1u])+v02*f32(weights[w+2u])+v10*f32(weights[w+3u])+v11*f32(weights[w+4u])+v12*f32(weights[w+5u])+v20*f32(weights[w+6u])+v21*f32(weights[w+7u])+v22*f32(weights[w+8u]);}
-      }
+    // --- 4×4 register-tiled matmul from shared memory ---
+    for (var k = 0u; k < BK; k++) {
+      // Load 4 weight values (M dimension)
+      let w0 = f32(w_sm[(tm_base    ) * BK + k]);
+      let w1 = f32(w_sm[(tm_base + 1u) * BK + k]);
+      let w2 = f32(w_sm[(tm_base + 2u) * BK + k]);
+      let w3 = f32(w_sm[(tm_base + 3u) * BK + k]);
+      // Load 4 input values (N dimension)
+      let i0 = f32(i_sm[k * BN + tn_base    ]);
+      let i1 = f32(i_sm[k * BN + tn_base + 1u]);
+      let i2 = f32(i_sm[k * BN + tn_base + 2u]);
+      let i3 = f32(i_sm[k * BN + tn_base + 3u]);
+      // 4×4 outer product (16 FMAs)
+      c00+=w0*i0; c01+=w0*i1; c02+=w0*i2; c03+=w0*i3;
+      c10+=w1*i0; c11+=w1*i1; c12+=w1*i2; c13+=w1*i3;
+      c20+=w2*i0; c21+=w2*i1; c22+=w2*i2; c23+=w2*i3;
+      c30+=w3*i0; c31+=w3*i1; c32+=w3*i2; c33+=w3*i3;
     }
+
     workgroupBarrier();
   }
 
-  // Write output in NHWC: buf_out[(y*W+x)*c_out + oc]
-  if !oob {
-    let pixel = oy * W + ox;
-    let relu = params.apply_relu > 0u;
-    let base = pixel * c_out + oc_base;
-    if oc_base     <c_out{buf_out[base     ]=f16(select(a0,max(a0,0.),relu));}
-    if oc_base+1u<c_out{buf_out[base+1u]=f16(select(a1,max(a1,0.),relu));}
-    if oc_base+2u<c_out{buf_out[base+2u]=f16(select(a2,max(a2,0.),relu));}
-    if oc_base+3u<c_out{buf_out[base+3u]=f16(select(a3,max(a3,0.),relu));}
-    if oc_base+4u<c_out{buf_out[base+4u]=f16(select(a4,max(a4,0.),relu));}
-    if oc_base+5u<c_out{buf_out[base+5u]=f16(select(a5,max(a5,0.),relu));}
-    if oc_base+6u<c_out{buf_out[base+6u]=f16(select(a6,max(a6,0.),relu));}
-    if oc_base+7u<c_out{buf_out[base+7u]=f16(select(a7,max(a7,0.),relu));}
+  // --- Write 4×4 output block with bias + ReLU ---
+  let relu = params.apply_relu > 0u;
+  for (var dm = 0u; dm < TM; dm++) {
+    let gm = m_base + tm_base + dm;
+    if gm >= c_out { continue; }
+    let bias = f32(weights[params.bias_off + gm]);
+    for (var dn = 0u; dn < TN; dn++) {
+      let gn = n_base + tn_base + dn;
+      if gn >= HW { continue; }
+      var val: f32;
+      switch dm * 4u + dn {
+        case 0u: { val = c00; } case 1u: { val = c01; } case 2u: { val = c02; } case 3u: { val = c03; }
+        case 4u: { val = c10; } case 5u: { val = c11; } case 6u: { val = c12; } case 7u: { val = c13; }
+        case 8u: { val = c20; } case 9u: { val = c21; } case 10u: { val = c22; } case 11u: { val = c23; }
+        case 12u: { val = c30; } case 13u: { val = c31; } case 14u: { val = c32; } default: { val = c33; }
+      }
+      val += bias;
+      if relu { val = max(val, 0.0); }
+      buf_out[gm * HW + gn] = f16(val);
+    }
   }
 }
