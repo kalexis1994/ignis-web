@@ -92,6 +92,7 @@ struct HitInfo { t: f32, u: f32, v: f32, tri_idx: u32, hit: bool, };
 // Emissive tris: 1 vec4f each [tri_idx(bitcast u32), area, CDF, 0]
 @group(1) @binding(5) var<storage, read> emissive_tris: array<vec4f>;
 @group(1) @binding(6) var<storage, read> vert_uv_extra: array<f32>;
+@group(1) @binding(7) var<storage, read> env_cdf: array<f32>;
 // SHaRC radiance cache — packed into 2 buffers to fit 8 storage buffer limit
 // keys_accum: [0..cap) = hash keys (atomic), [cap..cap*5) = accum RGBS (atomic)
 // resolved: [0..cap*4) = resolved RGBS (read-only from PT)
@@ -834,8 +835,8 @@ fn sample_shadow_map(world_pos: vec3f) -> f32 {
   let uv = vec2f(ndc.x * 0.5 + 0.5, -ndc.y * 0.5 + 0.5);
   // Out of shadow map bounds → not in shadow
   if uv.x < 0.0 || uv.x > 1.0 || uv.y < 0.0 || uv.y > 1.0 { return 1.0; }
-  // Bias to prevent shadow acne
-  let depth = ndc.z - 0.002;
+  // Bias to prevent shadow acne (push slightly toward light)
+  let depth = ndc.z + 0.002;
   // PCF 2x2 for softer shadows
   let texel = 1.0 / 2048.0;
   var shadow = 0.0;
@@ -846,21 +847,67 @@ fn sample_shadow_map(world_pos: vec3f) -> f32 {
   return shadow * 0.25;
 }
 
-fn sample_sun_nee_split(pos: vec3f, normal: vec3f, V: vec3f, td: vec4u, mat: Material, uv0: vec2f, uv1: vec2f, uv2: vec2f, uv3: vec2f, baseColor: vec3f, roughness: f32, metallic: f32, transmission: f32) -> BRDFSplit {
-  let origin = pos + normal * BIAS;
-  let surface = build_surface_eval(td, mat, normal, baseColor, roughness, metallic, transmission, uv0, uv1, uv2, uv3);
-  var result_split = BRDFSplit(vec3f(0.0), vec3f(0.0));
+fn sun_nee_common(origin: vec3f, pos: vec3f, normal: vec3f, V: vec3f, surface: SurfaceEval, use_shadow_map: bool) -> BRDFSplit {
+  var result = BRDFSplit(vec3f(0.0), vec3f(0.0));
+  if uniforms.sun_enabled == 0u { return result; }
 
-  // Sun NEE — shadow map replaces BVH shadow rays
-  if uniforms.sun_enabled != 0u {
+  if use_shadow_map {
+    // Bounce 0: fast shadow map lookup
     let shadow_val = sample_shadow_map(pos);
     if shadow_val > 0.0 {
       let L = g_sun_dir;
       if dot(normal, L) > 0.0 {
         let brdf = eval_surface_split(surface, V, L);
         let light = SUN_COLOR * SUN_MULT * SUN_SOLID_ANGLE * shadow_val;
-        result_split.diffuse += brdf.diffuse * light;
-        result_split.specular += brdf.specular * light;
+        result.diffuse += brdf.diffuse * light;
+        result.specular += brdf.specular * light;
+      }
+    }
+  } else {
+    // Bounces 1+: BVH shadow rays
+    var shadow_val = 0.0;
+    let L1 = sample_cone(g_sun_dir, COS_SUN_ANGLE);
+    let L2 = sample_cone(g_sun_dir, COS_SUN_ANGLE);
+    if !trace_shadow(origin, L1, 50.0) { shadow_val += 0.5; }
+    if !trace_shadow(origin, L2, 50.0) { shadow_val += 0.5; }
+    if shadow_val > 0.0 {
+      let L = normalize(L1 + L2);
+      if dot(normal, L) > 0.0 {
+        let brdf = eval_surface_split(surface, V, L);
+        let light = SUN_COLOR * SUN_MULT * SUN_SOLID_ANGLE * shadow_val;
+        result.diffuse += brdf.diffuse * light;
+        result.specular += brdf.specular * light;
+      }
+    }
+  }
+  return result;
+}
+
+fn sample_sun_nee_split(pos: vec3f, normal: vec3f, V: vec3f, td: vec4u, mat: Material, uv0: vec2f, uv1: vec2f, uv2: vec2f, uv3: vec2f, baseColor: vec3f, roughness: f32, metallic: f32, transmission: f32) -> BRDFSplit {
+  let origin = pos + normal * BIAS;
+  let surface = build_surface_eval(td, mat, normal, baseColor, roughness, metallic, transmission, uv0, uv1, uv2, uv3);
+  var result_split = BRDFSplit(vec3f(0.0), vec3f(0.0));
+
+  // Sun NEE: BVH shadow rays (shadow map disabled pending fix)
+  let sun = sun_nee_common(origin, pos, normal, V, surface, false);
+  result_split.diffuse += sun.diffuse;
+  result_split.specular += sun.specular;
+
+  // Environment NEE: importance-sample sky via CDF, trace shadow ray, apply MIS
+  {
+    let env_r = rand2();
+    let env_sample_result = env_sample(env_r.x, env_r.y);
+    let env_L = env_sample_result.xyz;
+    let env_light_pdf = env_sample_result.w;
+    if env_light_pdf > 0.0 && dot(normal, env_L) > 0.0 {
+      if !trace_shadow(origin, env_L, 200.0) {
+        let env_rad = sky_color(env_L);
+        let brdf = eval_surface_split(surface, V, env_L);
+        let bsdf_pdf = max(dot(normal, env_L), 0.0) * INV_PI;
+        let mis_w = power_heuristic(env_light_pdf, bsdf_pdf);
+        let env_contrib = env_rad * mis_w / env_light_pdf;
+        result_split.diffuse += brdf.diffuse * env_contrib;
+        result_split.specular += brdf.specular * env_contrib;
       }
     }
   }
@@ -930,15 +977,26 @@ fn sample_scene_nee_basic(pos: vec3f, normal: vec3f, V: vec3f, surface: SurfaceE
   let origin = pos + normal * BIAS;
   var result_split = BRDFSplit(vec3f(0.0), vec3f(0.0));
 
-  if uniforms.sun_enabled != 0u {
-    let shadow_val = sample_shadow_map(pos);
-    if shadow_val > 0.0 {
-      let L = g_sun_dir;
-      if dot(normal, L) > 0.0 {
-        let brdf = eval_surface_split(surface, V, L);
-        let light = SUN_COLOR * SUN_MULT * SUN_SOLID_ANGLE * shadow_val;
-        result_split.diffuse += brdf.diffuse * light;
-        result_split.specular += brdf.specular * light;
+  // Sun NEE: BVH shadow rays for indirect bounces
+  let sun = sun_nee_common(origin, pos, normal, V, surface, false);
+  result_split.diffuse += sun.diffuse;
+  result_split.specular += sun.specular;
+
+  // Environment NEE with MIS
+  {
+    let env_r = rand2();
+    let env_sample_result = env_sample(env_r.x, env_r.y);
+    let env_L = env_sample_result.xyz;
+    let env_light_pdf = env_sample_result.w;
+    if env_light_pdf > 0.0 && dot(normal, env_L) > 0.0 {
+      if !trace_shadow(origin, env_L, 200.0) {
+        let env_rad = sky_color(env_L);
+        let brdf = eval_surface_split(surface, V, env_L);
+        let bsdf_pdf = max(dot(normal, env_L), 0.0) * INV_PI;
+        let mis_w = power_heuristic(env_light_pdf, bsdf_pdf);
+        let env_contrib = env_rad * mis_w / env_light_pdf;
+        result_split.diffuse += brdf.diffuse * env_contrib;
+        result_split.specular += brdf.specular * env_contrib;
       }
     }
   }
@@ -1166,6 +1224,90 @@ fn trace_shadow(origin: vec3f, dir: vec3f, max_t: f32) -> bool {
     }
   }
   return false;
+}
+
+// ============================================================
+// Environment CDF importance sampling (Cycles-style)
+// ============================================================
+const ENV_W: u32 = 128u;
+const ENV_H: u32 = 64u;
+// Buffer: [cond_cdf: W*H][lum: W*H][row_totals: H][marg_cdf: H][total: 1]
+
+fn env_uv_to_dir(u: f32, v: f32) -> vec3f {
+  let theta = v * PI;
+  let phi = (0.5 - u) * TWO_PI;
+  let sin_theta = sin(theta);
+  return vec3f(cos(phi) * sin_theta, cos(theta), -sin(phi) * sin_theta);
+}
+
+fn env_dir_to_uv(dir: vec3f) -> vec2f {
+  let phi = atan2(-dir.z, dir.x);
+  let u = 0.5 - phi / TWO_PI;
+  let v = acos(clamp(dir.y, -1.0, 1.0)) / PI;
+  return vec2f(u, v);
+}
+
+// Binary search: find index where cdf[index] >= target
+fn env_binary_search(offset: u32, count: u32, val: f32) -> u32 {
+  var lo = 0u;
+  var hi = count;
+  while lo < hi {
+    let mid = (lo + hi) / 2u;
+    if env_cdf[offset + mid] < val { lo = mid + 1u; } else { hi = mid; }
+  }
+  return min(lo, count - 1u);
+}
+
+// Sample direction from environment CDF, returns (direction, pdf)
+fn env_sample(r1: f32, r2: f32) -> vec4f {
+  let marg_off = ENV_W * ENV_H * 2u + ENV_H;
+  let total_off = ENV_W * ENV_H * 2u + ENV_H * 2u;
+
+  // Sample row (V) from marginal CDF
+  let j = env_binary_search(marg_off, ENV_H, r2);
+  let v = (f32(j) + 0.5) / f32(ENV_H);
+
+  // Sample column (U) from conditional CDF for row j
+  let cond_off = j * ENV_W;
+  let i = env_binary_search(cond_off, ENV_W, r1);
+  let u = (f32(i) + 0.5) / f32(ENV_W);
+
+  let dir = env_uv_to_dir(u, v);
+  let pdf = env_pdf_uv(i, j);
+  return vec4f(dir, pdf);
+}
+
+// PDF for a specific pixel (i, j) in the env map
+fn env_pdf_uv(i: u32, j: u32) -> f32 {
+  let lum_off = ENV_W * ENV_H;
+  let row_off = ENV_W * ENV_H * 2u;
+  let total_off = ENV_W * ENV_H * 2u + ENV_H * 2u;
+
+  let lum = env_cdf[lum_off + j * ENV_W + i];
+  let row_total = env_cdf[row_off + j];
+  let grand_total = env_cdf[total_off];
+
+  if grand_total <= 0.0 || row_total <= 0.0 { return 0.0; }
+
+  let v = (f32(j) + 0.5) / f32(ENV_H);
+  let sin_theta = max(sin(v * PI), 1e-6);
+
+  // pdf = (lum / row_total) * (row_total / grand_total) * (ENV_W * ENV_H) / (2π² sin θ)
+  return (lum / grand_total) * f32(ENV_W * ENV_H) / (TWO_PI * PI * sin_theta);
+}
+
+// PDF for an arbitrary direction
+fn env_pdf_dir(dir: vec3f) -> f32 {
+  let uv = env_dir_to_uv(dir);
+  let i = min(u32(uv.x * f32(ENV_W)), ENV_W - 1u);
+  let j = min(u32(uv.y * f32(ENV_H)), ENV_H - 1u);
+  return env_pdf_uv(i, j);
+}
+
+// Power heuristic MIS weight (Cycles-style)
+fn power_heuristic(a: f32, b: f32) -> f32 {
+  let a2 = a * a;
+  return a2 / (a2 + b * b + 1e-10);
 }
 
 // ============================================================
@@ -1619,6 +1761,7 @@ fn path_trace(primary_origin: vec3f, primary_dir: vec3f) -> PathResult {
   var medium_att_dist: array<f32, MAX_VOLUME_STACK>;
   var medium_att_color: array<vec3f, MAX_VOLUME_STACK>;
   var medium_depth = 0u;
+  var last_bsdf_pdf = 0.0; // tracked for env MIS on miss
 
   var bounce = 0u;
   loop {
@@ -1626,7 +1769,13 @@ fn path_trace(primary_origin: vec3f, primary_dir: vec3f) -> PathResult {
     let hit = trace_bvh(origin, dir);
     if !hit.hit {
       let sky_gi = select(1.0, GI_INTENSITY, bounce > 0u);
-      let sky = throughput * sky_color(dir) * sky_gi;
+      var sky = throughput * sky_color(dir) * sky_gi;
+      // MIS: weight BSDF-sampled background against env NEE
+      if bounce > 0u && last_bsdf_pdf > 0.0 {
+        let env_pdf = env_pdf_dir(dir);
+        let mis_w = power_heuristic(last_bsdf_pdf, env_pdf);
+        sky *= mis_w;
+      }
       if bounce == 0u || !is_diffuse_path { spec_rad += sky; }
       else { diff_rad += sky; }
       break;
@@ -1909,6 +2058,7 @@ fn path_trace(primary_origin: vec3f, primary_dir: vec3f) -> PathResult {
       throughput *= Fc * G1c / max(clearcoat_prob, 0.01);
       specular_bounce = true;
       if bounce == 0u { is_diffuse_path = false; }
+      last_bsdf_pdf = 0.0; // clearcoat: skip env MIS (narrow lobe)
     } else if metallic > 0.5 || base_specular_prob > 0.35 || roughness < 0.18 {
       // Metal / specular-dominant: GGX VNDF sampling → specular path
       let alpha = max(roughness * roughness, 0.001);
@@ -1923,6 +2073,11 @@ fn path_trace(primary_origin: vec3f, primary_dir: vec3f) -> PathResult {
       throughput *= F * G1_L;
       specular_bounce = roughness < 0.1;
       if bounce == 0u { is_diffuse_path = false; }
+      // GGX VNDF PDF ≈ D(H)*G1(V)/(4*NdotV) — for MIS vs env
+      let NdotH = max(dot(normal, H), 0.0);
+      let D_val = ggx_d(NdotH, alpha);
+      let G1_V = smith_g1(max(dot(normal, V), 0.001), alpha);
+      last_bsdf_pdf = D_val * G1_V / max(4.0 * max(dot(normal, V), 0.001), 1e-6);
     } else {
       // Dielectric: guided cosine hemisphere → diffuse path
       // Path guiding: read dominant light direction from SHaRC cache
@@ -1949,6 +2104,7 @@ fn path_trace(primary_origin: vec3f, primary_dir: vec3f) -> PathResult {
       }
       if bounce == 0u { is_diffuse_path = true; }
       specular_bounce = false;
+      last_bsdf_pdf = max(dot(dir, normal), 0.0) * INV_PI; // cosine hemisphere PDF
     }
 
     origin = hit_pos + normal * BIAS;

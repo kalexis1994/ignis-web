@@ -42,7 +42,7 @@ async function init() {
   const adapter = await navigator.gpu.requestAdapter({ powerPreference: 'high-performance' });
   if (!adapter) { showError('Failed to get GPU adapter.'); return; }
 
-  const requiredStorageBuffersPerStage = 11;
+  const requiredStorageBuffersPerStage = 12;
   if (adapter.limits.maxStorageBuffersPerShaderStage < requiredStorageBuffersPerStage) {
     showError(
       `This GPU/browser exposes maxStorageBuffersPerShaderStage=${adapter.limits.maxStorageBuffersPerShaderStage}, `
@@ -508,6 +508,11 @@ async function init() {
     ],
   });
 
+  // --- Environment CDF buffer (created early so bg1 can reference it) ---
+  const ENV_W = 128, ENV_H = 64;
+  const envCdfSize = ENV_W * ENV_H * 2 + ENV_H * 2 + 1;
+  const envCdfBuf = device.createBuffer({ size: envCdfSize * 4, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST });
+
   // --- Bind group 1: scene data ---
   const bg1Layout = device.createBindGroupLayout({
     entries: [
@@ -518,6 +523,7 @@ async function init() {
       { binding: 4, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } },
       { binding: 5, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } },
       { binding: 6, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } },
+      { binding: 7, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } },
     ],
   });
   const bg1 = device.createBindGroup({
@@ -530,6 +536,7 @@ async function init() {
       { binding: 4, resource: { buffer: matBuf } },
       { binding: 5, resource: { buffer: emsBuf } },
       { binding: 6, resource: { buffer: uvExtraBuf } },
+      { binding: 7, resource: { buffer: envCdfBuf } },
     ],
   });
 
@@ -1082,6 +1089,111 @@ async function init() {
     const az = settings.sunAzimuth * Math.PI / 180;
     return [Math.sin(az) * Math.cos(el), Math.sin(el), Math.cos(az) * Math.cos(el)];
   }
+
+  // --- Environment CDF for importance sampling (Cycles-style conditional-marginal) ---
+  // Buffer layout: [cond_cdf: ENV_W*ENV_H] [lum: ENV_W*ENV_H] [row_totals: ENV_H] [marg_cdf: ENV_H] [total: 1]
+  let lastEnvSunEl = -999, lastEnvSunAz = -999;
+
+  function skyColorJS(dir, sunDir) {
+    const SUN_COLOR = [8.0, 7.2, 5.5];
+    const scLen = Math.sqrt(SUN_COLOR[0]**2 + SUN_COLOR[1]**2 + SUN_COLOR[2]**2);
+    const sunTint = [SUN_COLOR[0]/scLen*1.5, SUN_COLOR[1]/scLen*1.5, SUN_COLOR[2]/scLen*1.5];
+    const ambColor = [0.5, 0.6, 0.8];
+    const sunAlt = sunDir[1];
+
+    if (dir[1] <= 0) {
+      const fr = [ambColor[0]*0.6+sunTint[0]*0.3+0.1, ambColor[1]*0.6+sunTint[1]*0.3+0.1, ambColor[2]*0.6+sunTint[2]*0.3+0.1];
+      const g = (fr[0]+fr[1]+fr[2])*0.33;
+      const fc = [fr[0]*0.7+g*0.3, fr[1]*0.7+g*0.3, fr[2]*0.7+g*0.3];
+      const si = Math.max(0.05, Math.min(sunAlt*3+0.3, 1));
+      const gt = Math.max(0, Math.min(-dir[1]*5, 1));
+      return [(fc[0]*si)*(1-gt)+ambColor[0]*0.15*gt, (fc[1]*si)*(1-gt)+ambColor[1]*0.15*gt, (fc[2]*si)*(1-gt)+ambColor[2]*0.15*gt];
+    }
+
+    const cosTheta = Math.max(dir[1], 0.001);
+    const cosGamma = dir[0]*sunDir[0]+dir[1]*sunDir[1]+dir[2]*sunDir[2];
+    const rayPhase = 0.75*(1+cosGamma*cosGamma);
+    let rc = [0.30, 0.42, 0.68];
+    const ss = Math.max(0, Math.min(1-sunAlt*2, 1));
+    rc = [rc[0]*(1-ss*0.6)+0.7*ss*0.6, rc[1]*(1-ss*0.6)+0.35*ss*0.6, rc[2]*(1-ss*0.6)+0.15*ss*0.6];
+    const za = Math.acos(cosTheta);
+    let od = 1/(cosTheta+0.15*Math.pow(93.885-za*180/Math.PI, -1.253));
+    od = Math.min(od, 40);
+    const expOd = Math.exp(-od*0.1);
+    const ray = [rc[0]*rayPhase*expOd, rc[1]*rayPhase*expOd, rc[2]*rayPhase*expOd];
+
+    const gg = 0.76;
+    const mieP = 1.5*((1-gg*gg)/(2+gg*gg))*(1+cosGamma*cosGamma)/Math.pow(1+gg*gg-2*gg*cosGamma, 1.5);
+    const mie = [sunTint[0]*mieP*0.02, sunTint[1]*mieP*0.02, sunTint[2]*mieP*0.02];
+
+    const si = Math.max(0.05, Math.min(sunAlt*3+0.3, 1));
+    let sky = [(ray[0]+mie[0])*si*ambColor[0]*2, (ray[1]+mie[1])*si*ambColor[1]*2, (ray[2]+mie[2])*si*ambColor[2]*2];
+
+    // Sun disk + corona (exclude from CDF to avoid fireflies — sun NEE handles it)
+    // sky += sunTint * pow(max(cosGamma, 0), 512) * 5.0;  // omitted
+    sky[0] += sunTint[0]*Math.pow(Math.max(cosGamma,0),16)*0.4;
+    sky[1] += sunTint[1]*Math.pow(Math.max(cosGamma,0),16)*0.4;
+    sky[2] += sunTint[2]*Math.pow(Math.max(cosGamma,0),16)*0.4;
+
+    // Horizon haze
+    const fr = [ambColor[0]*0.6+sunTint[0]*0.3+0.1, ambColor[1]*0.6+sunTint[1]*0.3+0.1, ambColor[2]*0.6+sunTint[2]*0.3+0.1];
+    const g = (fr[0]+fr[1]+fr[2])*0.33;
+    const fc = [fr[0]*0.7+g*0.3, fr[1]*0.7+g*0.3, fr[2]*0.7+g*0.3];
+    const ht = 1-Math.max(0,Math.min((dir[1]-0)/0.25,1));
+    sky = [sky[0]*(1-ht*0.8)+fc[0]*si*ht*0.8, sky[1]*(1-ht*0.8)+fc[1]*si*ht*0.8, sky[2]*(1-ht*0.8)+fc[2]*si*ht*0.8];
+
+    return [Math.max(sky[0],0), Math.max(sky[1],0), Math.max(sky[2],0)];
+  }
+
+  function buildEnvCDF(sunDir) {
+    const data = new Float32Array(envCdfSize);
+    const condOff = 0;                           // conditional CDF: ENV_W * ENV_H
+    const lumOff = ENV_W * ENV_H;                // luminance: ENV_W * ENV_H
+    const rowOff = ENV_W * ENV_H * 2;           // row totals: ENV_H
+    const margOff = ENV_W * ENV_H * 2 + ENV_H;  // marginal CDF: ENV_H
+    const totalOff = ENV_W * ENV_H * 2 + ENV_H * 2; // total: 1
+
+    // Evaluate sky luminance at each pixel
+    for (let j = 0; j < ENV_H; j++) {
+      const v = (j + 0.5) / ENV_H;
+      const theta = v * Math.PI;
+      const sinTheta = Math.sin(theta);
+
+      let rowSum = 0;
+      for (let i = 0; i < ENV_W; i++) {
+        const u = (i + 0.5) / ENV_W;
+        const phi = (0.5 - u) * 2 * Math.PI;
+        const dir = [Math.cos(phi)*sinTheta, Math.cos(theta), -Math.sin(phi)*sinTheta];
+        const sky = skyColorJS(dir, sunDir);
+        const lum = (0.2126*sky[0] + 0.7152*sky[1] + 0.0722*sky[2]) * sinTheta;
+        data[lumOff + j * ENV_W + i] = lum;
+        rowSum += lum;
+      }
+
+      // Build conditional CDF for this row (normalized 0-1)
+      data[rowOff + j] = rowSum;
+      let cumul = 0;
+      for (let i = 0; i < ENV_W; i++) {
+        cumul += data[lumOff + j * ENV_W + i];
+        data[condOff + j * ENV_W + i] = rowSum > 0 ? cumul / rowSum : (i + 1) / ENV_W;
+      }
+    }
+
+    // Build marginal CDF (normalized 0-1)
+    let grandTotal = 0;
+    for (let j = 0; j < ENV_H; j++) grandTotal += data[rowOff + j];
+    data[totalOff] = grandTotal;
+    let cumul = 0;
+    for (let j = 0; j < ENV_H; j++) {
+      cumul += data[rowOff + j];
+      data[margOff + j] = grandTotal > 0 ? cumul / grandTotal : (j + 1) / ENV_H;
+    }
+
+    device.queue.writeBuffer(envCdfBuf, 0, data);
+  }
+
+  // Build initial CDF
+  buildEnvCDF(getSunDir());
 
   // --- Input handling ---
   const keys = {};
@@ -1654,13 +1766,14 @@ async function init() {
       (fw[0]*lp[0]+fw[1]*lp[1]+fw[2]*lp[2]),
       1,
     ]);
-    // Orthographic projection: [-r, r] x [-r, r] x [0, 4r]
+    // Orthographic projection: [-r, r] x [-r, r] x [near, far] → NDC z [0, 1]
+    // View-space z is negative (convention: -fw in view matrix), so negate in projection
     const r = sceneRadius;
-    const near = 0.0, far = sceneRadius * 4;
+    const near = 0.01, far = sceneRadius * 4;
     const proj = new Float32Array(16);
     proj[0] = 1 / r;
     proj[5] = -1 / r;  // flip Y for WebGPU
-    proj[10] = -1 / (far - near);
+    proj[10] = -1 / (far - near);         // negate: view.z is negative for objects in front
     proj[14] = -near / (far - near);
     proj[15] = 1;
     // viewProj = proj * view
@@ -1772,8 +1885,15 @@ async function init() {
       device.queue.submit([encoder.finish()]);
     }
 
-    // --- Shadow map rasterization ---
+    // --- Rebuild env CDF when sun moves ---
     const sun = getSunDir();
+    if (settings.sunElevation !== lastEnvSunEl || settings.sunAzimuth !== lastEnvSunAz) {
+      buildEnvCDF(sun);
+      lastEnvSunEl = settings.sunElevation;
+      lastEnvSunAz = settings.sunAzimuth;
+    }
+
+    // --- Shadow map rasterization ---
     const lightViewProj = buildLightViewProj(sun, sceneCenter, sceneRadius);
     device.queue.writeBuffer(shadowUniformBuf, 0, lightViewProj);
     {
