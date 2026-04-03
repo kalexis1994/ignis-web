@@ -174,6 +174,24 @@ async function init() {
   canvas.height = displayHeight;
   context.configure({ device, format, alphaMode: 'opaque' });
 
+  // Letterboxing: fit canvas in window maintaining aspect ratio, black bars
+  const canvasAspect = displayWidth / displayHeight;
+  function fitCanvas() {
+    const winW = window.innerWidth, winH = window.innerHeight;
+    const winAspect = winW / winH;
+    if (winAspect > canvasAspect) {
+      // Window wider than canvas → fit height, black bars on sides
+      canvas.style.height = winH + 'px';
+      canvas.style.width = Math.round(winH * canvasAspect) + 'px';
+    } else {
+      // Window taller than canvas → fit width, black bars top/bottom
+      canvas.style.width = winW + 'px';
+      canvas.style.height = Math.round(winW / canvasAspect) + 'px';
+    }
+  }
+  fitCanvas();
+  window.addEventListener('resize', fitCanvas);
+
   // Internal resolution from FSR mode
   let fsrScale = FSR_MODES[fsrMode].scale;
   let width = Math.ceil(displayWidth * fsrScale / 8) * 8;

@@ -7,7 +7,11 @@
   <style>
     * { margin: 0; padding: 0; box-sizing: border-box; }
     body { background: #000; overflow: hidden; font-family: 'Courier New', monospace; touch-action: none; }
-    canvas#canvas { display: block; width: 100vw; height: 100vh; touch-action: none; }
+    canvas#canvas {
+      display: block; touch-action: none;
+      position: absolute; top: 50%; left: 50%;
+      transform: translate(-50%, -50%);
+    }
     #gizmo {
       position: fixed; top: 12px; right: 12px;
       width: 120px; height: 120px;
