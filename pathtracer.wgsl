@@ -115,7 +115,8 @@ const BIAS: f32 = 0.0002;     // shadow/bounce ray offset
 // MAX_BOUNCES now comes from uniforms.max_bounces
 
 const SUN_COLOR: vec3f = vec3f(8.0, 7.2, 5.5);
-const SKY_COLOR: vec3f = vec3f(3.0, 3.5, 5.5);
+const SKY_COLOR: vec3f = vec3f(1.5, 1.8, 2.5);
+const GI_INTENSITY: f32 = 3.0; // multiplier for all indirect lighting (like ignis-rt ptGIIntensity)
 const SUN_ANGLE: f32 = 0.03;
 const COS_SUN_ANGLE: f32 = 0.99955;
 const SUN_SOLID_ANGLE: f32 = 0.002827;
@@ -1140,7 +1141,7 @@ fn trace_shadow(origin: vec3f, dir: vec3f, max_t: f32) -> bool {
 // ============================================================
 fn sky_color(dir: vec3f) -> vec3f {
   let t = max(dir.y * 0.5 + 0.5, 0.0);
-  var sky = mix(vec3f(0.3, 0.3, 0.35), SKY_COLOR, t);
+  var sky = mix(vec3f(0.2, 0.2, 0.25), SKY_COLOR, t);
   if dot(dir, g_sun_dir) > COS_SUN_ANGLE { sky += SUN_COLOR * SUN_MULT; }
   return sky;
 }
@@ -1530,8 +1531,8 @@ fn path_trace(primary_origin: vec3f, primary_dir: vec3f) -> PathResult {
     if bounce >= uniforms.max_bounces { break; }
     let hit = trace_bvh(origin, dir);
     if !hit.hit {
-      let sky = throughput * sky_color(dir);
-      // Sky at bounce 0: no surface → specular (not multiplied by albedo in composite)
+      let sky_gi = select(1.0, GI_INTENSITY, bounce > 0u);
+      let sky = throughput * sky_color(dir) * sky_gi;
       if bounce == 0u || !is_diffuse_path { spec_rad += sky; }
       else { diff_rad += sky; }
       break;
@@ -1761,8 +1762,9 @@ fn path_trace(primary_origin: vec3f, primary_dir: vec3f) -> PathResult {
       result.direct = nee.diffuse * base_color + nee.specular;
     } else {
       let direct = sample_sun_nee(hit_pos, normal, V, td, mat, uv0, uv1, uv2, uv3, base_color, roughness, metallic, glass_transmission);
-      if is_diffuse_path { diff_rad += throughput * direct; }
-      else { spec_rad += throughput * direct; }
+      let gi_scale = select(1.0, GI_INTENSITY, bounce > 0u); // boost indirect bounces
+      if is_diffuse_path { diff_rad += throughput * direct * gi_scale; }
+      else { spec_rad += throughput * direct * gi_scale; }
       if bounce == 0u { result.direct = direct; }
       // SHaRC backpropagation with direction (for path guiding)
       if bounce > 0u && sharc_count < 4u {
@@ -1781,14 +1783,12 @@ fn path_trace(primary_origin: vec3f, primary_dir: vec3f) -> PathResult {
       let cached_gi = sharc_read_cached(hit_pos, normal);
       let has_cache = dot(cached_gi, vec3f(1.0)) > 0.001;
       if has_cache {
-        // cached_gi already includes local BRDF/albedo from the cached point.
-        // Do not darken it with glTF AO; AO is not a transport term.
-        let gi = throughput * cached_gi;
+        let gi = throughput * cached_gi * GI_INTENSITY;
         if is_diffuse_path { diff_rad += gi; } else { spec_rad += gi; }
         break;
       }
       let indirect_direct = sample_sun_nee(hit_pos, normal, V, td, mat, uv0, uv1, uv2, uv3, base_color, roughness, metallic, glass_transmission);
-      let ind = throughput * indirect_direct;
+      let ind = throughput * indirect_direct * GI_INTENSITY;
       if is_diffuse_path { diff_rad += ind; } else { spec_rad += ind; }
 
       // Last bounce: energy terminates. No fake sky — SHaRC + extra bounces provide real GI.
