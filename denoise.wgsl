@@ -502,6 +502,7 @@ fn preblur_sm(@builtin(global_invocation_id) gid: vec3u,
 @group(0) @binding(10) var prev_frame: texture_2d<f32>;
 @group(0) @binding(11) var prev_sampler: sampler;
 @group(0) @binding(12) var<storage, read> material_buf_comp: array<Material>;
+@group(0) @binding(13) var<storage, read_write> exposure_buf: array<atomic<u32>>; // [0]=logLumSum, [1]=pixelCount
 
 // --- Tonemap 0: AgX Punchy (Blender 4 / Troy Sobotka) ---
 fn tonemap_agx(color_in: vec3f) -> vec3f {
@@ -597,6 +598,14 @@ fn composite(@builtin(global_invocation_id) gid: vec3u) {
     hdr = denoised_diff; // OIDN: already combined beauty pass
   } else {
     hdr = max(albedo, vec3f(0.02)) * denoised_diff + denoised_spec;
+  }
+
+  // Auto-exposure: accumulate log2-luminance (fixed-point, like ignis-rt)
+  let lum = dot(hdr, vec3f(0.2126, 0.7152, 0.0722));
+  if lum > 0.001 {
+    let logLum = log2(lum) + 20.0; // offset to keep positive (range ~0-40 for typical scenes)
+    atomicAdd(&exposure_buf[0], u32(logLum * 16.0)); // fixed-point ×16
+    atomicAdd(&exposure_buf[1], 1u);
   }
 
   // 1. Exposure (pre-tonemap)

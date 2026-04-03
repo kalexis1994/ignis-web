@@ -710,8 +710,13 @@ async function init() {
       { binding: 10, visibility: GPUShaderStage.COMPUTE, texture: { sampleType: 'float' } },         // prev frame (reflection)
       { binding: 11, visibility: GPUShaderStage.COMPUTE, sampler: { type: 'filtering' } },
       { binding: 12, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } }, // materials
+      { binding: 13, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } },             // exposure accumulator
     ],
   });
+
+  // Auto-exposure buffer: [0]=logLumSum (atomic u32), [1]=pixelCount (atomic u32), [2]=currentExposure (f32)
+  const exposureBuf = device.createBuffer({ size: 16, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC | GPUBufferUsage.COPY_DST });
+  device.queue.writeBuffer(exposureBuf, 0, new Float32Array([0, 0, 1.0, 0])); // init exposure=1.0
   const dnCompPipeline = device.createComputePipeline({
     layout: device.createPipelineLayout({ bindGroupLayouts: [dnCompLayout] }),
     compute: { module: dnModule, entryPoint: 'composite' },
@@ -763,6 +768,7 @@ async function init() {
     { binding: 10, resource: prevFrameTex.createView() },
     { binding: 11, resource: compSampler },
     { binding: 12, resource: { buffer: matBuf } },
+    { binding: 13, resource: { buffer: exposureBuf } },
   ]});
   const dnBG_comp_noisy = device.createBindGroup({ layout: dnCompLayout, entries: [
     { binding: 0, resource: { buffer: dnCompParamBuf } },
@@ -775,6 +781,7 @@ async function init() {
     { binding: 10, resource: prevFrameTex.createView() },
     { binding: 11, resource: compSampler },
     { binding: 12, resource: { buffer: matBuf } },
+    { binding: 13, resource: { buffer: exposureBuf } },
   ]});
   // OIDN composite: reads blended denoised from history, alternates A/B
   const dnBG_comp_oidn_A = device.createBindGroup({ layout: dnCompLayout, entries: [
@@ -788,6 +795,7 @@ async function init() {
     { binding: 10, resource: prevFrameTex.createView() },
     { binding: 11, resource: compSampler },
     { binding: 12, resource: { buffer: matBuf } },
+    { binding: 13, resource: { buffer: exposureBuf } },
   ]});
 
   const dnBG_comp_oidn_B = device.createBindGroup({ layout: dnCompLayout, entries: [
@@ -801,6 +809,7 @@ async function init() {
     { binding: 10, resource: prevFrameTex.createView() },
     { binding: 11, resource: compSampler },
     { binding: 12, resource: { buffer: matBuf } },
+    { binding: 13, resource: { buffer: exposureBuf } },
   ]});
 
   // --- Display pipeline (reads FSR final output) ---
@@ -1495,7 +1504,7 @@ async function init() {
   }
 
   // --- Render state ---
-  let frameIndex = 0, cameraMoved = false, framesStill = 0;
+  let frameIndex = 0, cameraMoved = false, framesStill = 0, autoExposure = 1.0;
   let lastTime = performance.now(), fps = 0, fpsAccum = 0, fpsCount = 0;
 
   function getCameraVectors() {
@@ -1770,7 +1779,7 @@ async function init() {
       cpf[0] = width; cpf[1] = height;
       cpf[2] = (denoiseMode.startsWith('oidn') && oidn) ? -1.0 : 0.0; // negative = OIDN mode (skip remodulation)
       cpf[3] = 0;
-      cpu[4] = settings.tonemapMode; cpf[5] = settings.exposure;
+      cpu[4] = settings.tonemapMode; cpf[5] = settings.exposure * autoExposure;
       cpf[6] = settings.saturation; cpf[7] = settings.contrast;
       // Legacy camera fields remain populated to preserve uniform layout.
       cpf[8] = camera.pos[0]; cpf[9] = camera.pos[1]; cpf[10] = camera.pos[2]; cpf[11] = 0;
@@ -1814,7 +1823,32 @@ async function init() {
       rp.draw(3);
       rp.end();
 
-      device.queue.submit([encoder.finish()]);
+      // Auto-exposure: copy accumulator to staging for async readback
+      const exposureStaging = device.createBuffer({ size: 16, usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST });
+      const copyEncoder = device.createCommandEncoder();
+      copyEncoder.copyBufferToBuffer(exposureBuf, 0, exposureStaging, 0, 16);
+      device.queue.submit([encoder.finish(), copyEncoder.finish()]);
+
+      // Async readback: compute new exposure from accumulated luminance
+      exposureStaging.mapAsync(GPUMapMode.READ).then(() => {
+        const data = new Uint32Array(exposureStaging.getMappedRange());
+        const logLumSum = data[0];
+        const pixelCount = data[1];
+        exposureStaging.unmap();
+        exposureStaging.destroy();
+
+        if (pixelCount > 0) {
+          const avgLogLum = logLumSum / (16.0 * pixelCount) - 20.0;
+          const avgLum = Math.pow(2, avgLogLum);
+          const keyValue = 0.18;
+          const targetExposure = Math.min(Math.max(keyValue / Math.max(avgLum, 0.001), 0.1), 10.0);
+          // EMA smoothing
+          autoExposure = autoExposure + (targetExposure - autoExposure) * 0.05;
+        }
+        // Reset accumulators for next frame
+        device.queue.writeBuffer(exposureBuf, 0, new Uint32Array([0, 0]));
+      }).catch(() => { exposureStaging.destroy(); });
+
       if (frameIndex === 1) rlog('First frame OK');
     } catch(e) {
       rlog('FRAME_ERROR: ' + e.message);
