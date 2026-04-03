@@ -1745,7 +1745,8 @@ async function init() {
 
         // Temporal blend: mix current denoised (pingTex) with previous (history)
         // Alpha: high when moving (less history), low when still (more stable)
-        const blendAlpha = framesStill < 2 ? 1.0 : Math.max(0.15, 1.0 / (framesStill * 0.5 + 1));
+        // Moving: alpha=1.0 (no blend). Stopping: ramp down over ~20 frames to 0.1
+        const blendAlpha = framesStill < 3 ? 1.0 : Math.max(0.1, 1.0 / (framesStill * 0.3 + 1));
         device.queue.writeBuffer(oidn.blendParams, 0, new Uint32Array([
           width, height, 0, 0, Math.round(blendAlpha * 1000), 0, 0, 0
         ]));

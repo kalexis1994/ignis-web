@@ -172,14 +172,31 @@ fn temporal_blend(
   let history = textureLoad(history_tex, px, 0).rgb;
 
   // Alpha from params.channels (encoded as alpha * 1000)
-  let alpha = f32(params.channels) / 1000.0;
+  let base_alpha = f32(params.channels) / 1000.0;
 
-  // Clamp history to prevent ghosting: reject if too different from current
-  let diff = abs(current - history);
-  let max_diff = max(diff.r, max(diff.g, diff.b));
-  let reject = max_diff > 2.0; // reject history if color difference is too large
-  let effective_alpha = select(alpha, 1.0, reject);
+  // Neighborhood AABB clamp: use 3x3 min/max of current frame to reject stale history
+  // This prevents ghosting artifacts from misaligned history pixels
+  var mn = current;
+  var mx = current;
+  for (var dy = -1; dy <= 1; dy++) {
+    for (var dx = -1; dx <= 1; dx++) {
+      let sp = clamp(px + vec2i(dx, dy), vec2i(0), vec2i(i32(W) - 1, i32(H) - 1));
+      let s = textureLoad(current_tex, sp, 0).rgb;
+      mn = min(mn, s);
+      mx = max(mx, s);
+    }
+  }
 
-  let blended = mix(history, current, effective_alpha);
+  // Expand AABB slightly to allow noise variation
+  let aabb_size = mx - mn;
+  let margin = aabb_size * 0.25 + 0.01;
+  let clamped_history = clamp(history, mn - margin, mx + margin);
+
+  // How much was history clamped? More clamping → more weight to current
+  let clamp_dist = length(history - clamped_history);
+  let clamp_factor = min(clamp_dist * 5.0, 1.0); // 0=no clamp, 1=fully rejected
+  let alpha = max(base_alpha, clamp_factor);
+
+  let blended = mix(clamped_history, current, alpha);
   textureStore(blend_out, px, vec4f(blended, 1.0));
 }
