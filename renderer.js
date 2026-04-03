@@ -831,7 +831,7 @@ async function init() {
   let oidn = null;
   if (denoiseMode === 'oidn') {
     try {
-      oidn = await createOIDNPipeline(device, 'oidn/rt_ldr_alb_nrm_small.tza', width, height, hasF16, rlog);
+      oidn = await createOIDNPipeline(device, 'oidn/rt_ldr_alb_nrm.tza', width, height, hasF16, rlog);
 
       // Input assembly bind group: textures → 9ch NCHW buffer
       // We feed the combined beauty pass: albedo * diffuse + specular
