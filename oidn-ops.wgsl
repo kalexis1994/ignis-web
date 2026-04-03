@@ -74,9 +74,10 @@ fn upsample2x(
 // Reads: color(3ch) + albedo(3ch) + normal(3ch) with HDR transfer
 // Dispatch: (ceil(width/16), ceil(height/16), 1)
 // ============================================================
-@group(0) @binding(3) var color_tex: texture_2d<f32>;
-@group(0) @binding(4) var albedo_tex: texture_2d<f32>;
-@group(0) @binding(5) var normal_tex: texture_2d<f32>;
+@group(0) @binding(3) var diffuse_tex: texture_2d<f32>;   // noisy diffuse irradiance
+@group(0) @binding(4) var albedo_tex: texture_2d<f32>;    // albedo.rgb + roughness.a
+@group(0) @binding(5) var normal_tex: texture_2d<f32>;    // normal.xyz + depth.w
+@group(0) @binding(7) var specular_tex: texture_2d<f32>;  // noisy specular radiance
 
 @compute @workgroup_size(16, 16)
 fn input_assembly(
@@ -91,24 +92,26 @@ fn input_assembly(
   let idx = gid.y * W + gid.x;
 
   // Read textures
-  let color = textureLoad(color_tex, px, 0).rgb;
+  let diffuse = textureLoad(diffuse_tex, px, 0).rgb;
   let albedo = textureLoad(albedo_tex, px, 0).rgb;
   let nd = textureLoad(normal_tex, px, 0);
   let normal = nd.xyz;
+  let specular = textureLoad(specular_tex, px, 0).rgb;
 
-  // Combine: OIDN expects beauty pass = albedo * diffuse_irradiance + specular
-  // But our inputs are already separate. We pass: remodulated color, albedo, normal
+  // Combine beauty pass: OIDN expects albedo * diffuse_irradiance + specular
+  let beauty = max(albedo, vec3f(0.02)) * diffuse + specular;
+
   // HDR transfer function: Reinhard per-channel (maps [0,∞) → [0,1))
-  let tf = color / (1.0 + color);
+  let tf = beauty / (1.0 + beauty);
 
-  // Write 9 channels NCHW
+  // Write 9 channels NCHW: color(3) + albedo(3) + normal(3)
   buf_out[0u * HW + idx] = f16(tf.x);
   buf_out[1u * HW + idx] = f16(tf.y);
   buf_out[2u * HW + idx] = f16(tf.z);
   buf_out[3u * HW + idx] = f16(albedo.x);
   buf_out[4u * HW + idx] = f16(albedo.y);
   buf_out[5u * HW + idx] = f16(albedo.z);
-  buf_out[6u * HW + idx] = f16(normal.x * 0.5 + 0.5);  // [-1,1] → [0,1]
+  buf_out[6u * HW + idx] = f16(normal.x * 0.5 + 0.5);
   buf_out[7u * HW + idx] = f16(normal.y * 0.5 + 0.5);
   buf_out[8u * HW + idx] = f16(normal.z * 0.5 + 0.5);
 }
@@ -123,20 +126,27 @@ fn input_assembly(
 fn output_extraction(
   @builtin(global_invocation_id) gid: vec3u
 ) {
-  let W = params.in_width;   // reuse in_width/height for output dims
+  let W = params.in_width;
   let H = params.in_height;
   if gid.x >= W || gid.y >= H { return; }
 
   let HW = H * W;
   let idx = gid.y * W + gid.x;
 
-  // Read 3 output channels
+  // Read 3 output channels (denoised beauty pass in transfer space)
   let r = f32(buf_in[0u * HW + idx]);
   let g = f32(buf_in[1u * HW + idx]);
   let b = f32(buf_in[2u * HW + idx]);
 
   // Inverse HDR transfer: Reinhard inverse
-  let color = vec3f(r, g, b) / max(1.0 - vec3f(r, g, b), vec3f(1e-6));
+  let beauty = vec3f(r, g, b) / max(1.0 - vec3f(r, g, b), vec3f(1e-6));
 
-  textureStore(out_tex, vec2i(gid.xy), vec4f(color, 1.0));
+  // Demodulate: composite expects diffuse irradiance, it will remodulate with albedo.
+  // beauty = albedo * irradiance + specular, but we can't perfectly separate them.
+  // Approximation: divide by albedo to get irradiance-like signal.
+  // The composite will multiply by albedo again → reconstructs beauty approximately.
+  let albedo = max(textureLoad(albedo_tex, vec2i(gid.xy), 0).rgb, vec3f(0.02));
+  let irradiance = beauty / albedo;
+
+  textureStore(out_tex, vec2i(gid.xy), vec4f(irradiance, 1.0));
 }

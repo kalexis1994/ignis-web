@@ -842,14 +842,15 @@ async function init() {
         { binding: 0, resource: { buffer: ioParams } },
         { binding: 1, resource: { buffer: oidn.skipInput } },     // unused for input (read)
         { binding: 2, resource: { buffer: oidn.skipInput } },     // output: 9ch NCHW
-        { binding: 3, resource: noisyTex.createView() },          // color (noisy diffuse irradiance)
+        { binding: 3, resource: noisyTex.createView() },          // noisy diffuse irradiance
         { binding: 4, resource: albedoTex.createView() },         // albedo
         { binding: 5, resource: denoiseNdTex.createView() },      // normals
         { binding: 6, resource: pingTex.createView() },           // unused for input (write texture)
+        { binding: 7, resource: specNoisyTex.createView() },      // noisy specular radiance
       ]});
 
-      // Output extraction bind group: 3ch NCHW buffer → texture
-      // Write to pingTex (same as SVGF output, composite reads from it)
+      // Output extraction: 3ch denoised beauty → pingTex
+      // OIDN output is already combined color (albedo*diffuse+specular, denoised)
       const outParams = device.createBuffer({ size: 32, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
       device.queue.writeBuffer(outParams, 0, new Uint32Array([oidn.padW, oidn.padH, width, height, 3, 0, 0, 0]));
 
@@ -861,6 +862,7 @@ async function init() {
         { binding: 4, resource: albedoTex.createView() },         // unused placeholder
         { binding: 5, resource: denoiseNdTex.createView() },      // unused placeholder
         { binding: 6, resource: pingTex.createView() },           // OUTPUT: denoised HDR → pingTex
+        { binding: 7, resource: specNoisyTex.createView() },      // unused placeholder
       ]});
 
       rlog('OIDN neural denoiser initialized');

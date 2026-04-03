@@ -197,7 +197,7 @@ export async function createOIDNPipeline(device, weightsUrl, width, height, hasF
     compute: { module: opsModule, entryPoint: 'upsample2x' },
   });
 
-  // I/O layout: params + buf_out + (unused) + color_tex + albedo_tex + normal_tex
+  // I/O layout: params + buffers + diffuse_tex + albedo_tex + normal_tex + out_tex + specular_tex
   const ioBGL = device.createBindGroupLayout({ entries: [
     { binding: 0, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'uniform' } },
     { binding: 1, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } },
@@ -206,6 +206,7 @@ export async function createOIDNPipeline(device, weightsUrl, width, height, hasF
     { binding: 4, visibility: GPUShaderStage.COMPUTE, texture: { sampleType: 'float' } },
     { binding: 5, visibility: GPUShaderStage.COMPUTE, texture: { sampleType: 'float' } },
     { binding: 6, visibility: GPUShaderStage.COMPUTE, storageTexture: { access: 'write-only', format: 'rgba16float' } },
+    { binding: 7, visibility: GPUShaderStage.COMPUTE, texture: { sampleType: 'float' } },
   ]});
   const inputPipeline = device.createComputePipeline({
     layout: device.createPipelineLayout({ bindGroupLayouts: [ioBGL] }),
