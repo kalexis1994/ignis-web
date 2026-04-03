@@ -160,7 +160,7 @@ async function init() {
   if (!FSR_MODES[fsrMode]) fsrMode = 'balanced';
   const displayCap = cfg.displayCap || gpuProfile.displayCap || 1080;
   const texSize = cfg.texSize ?? gpuProfile.texSize ?? 512;
-  const denoiseMode = cfg.denoise || gpuProfile.denoise || 'full';
+  const denoiseMode = cfg.denoise || gpuProfile.denoise || 'oidn';
   const maxBounces = cfg.bounces || gpuProfile.maxBounces || 3;
   const sppPerFrame = cfg.spp || gpuProfile.spp || 1;
   const sharcEnabled = cfg.sharc !== undefined ? cfg.sharc : (gpuProfile.sharc !== false);
@@ -831,16 +831,19 @@ async function init() {
   let oidn = null;
   if (denoiseMode === 'oidn') {
     try {
-      oidn = await createOIDNPipeline(device, 'oidn/rt_hdr_alb_nrm.tza', width, height, hasF16, rlog);
+      oidn = await createOIDNPipeline(device, 'oidn/rt_ldr_alb_nrm.tza', width, height, hasF16, rlog);
 
       // Input assembly bind group: textures → 9ch NCHW buffer
       // We feed the combined beauty pass: albedo * diffuse + specular
       const ioParams = device.createBuffer({ size: 32, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
       device.queue.writeBuffer(ioParams, 0, new Uint32Array([width, height, oidn.padW, oidn.padH, 9, 0, 0, 0]));
 
+      // Dummy buffer for unused bind slots (avoids read+write conflict on same buffer)
+      const oidnDummy = device.createBuffer({ size: 16, usage: GPUBufferUsage.STORAGE });
+
       oidn.inputBG = device.createBindGroup({ layout: oidn.ioBGL, entries: [
         { binding: 0, resource: { buffer: ioParams } },
-        { binding: 1, resource: { buffer: oidn.skipInput } },     // unused for input (read)
+        { binding: 1, resource: { buffer: oidnDummy } },          // unused for input (read slot)
         { binding: 2, resource: { buffer: oidn.skipInput } },     // output: 9ch NCHW
         { binding: 3, resource: noisyTex.createView() },          // noisy diffuse irradiance
         { binding: 4, resource: albedoTex.createView() },         // albedo
@@ -850,16 +853,15 @@ async function init() {
       ]});
 
       // Output extraction: 3ch denoised beauty → pingTex
-      // OIDN output is already combined color (albedo*diffuse+specular, denoised)
       const outParams = device.createBuffer({ size: 32, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
       device.queue.writeBuffer(outParams, 0, new Uint32Array([oidn.padW, oidn.padH, width, height, 3, 0, 0, 0]));
 
       oidn.outputBG = device.createBindGroup({ layout: oidn.ioBGL, entries: [
         { binding: 0, resource: { buffer: outParams } },
-        { binding: 1, resource: { buffer: oidn.outputBuf } },     // input: 3ch denoised
-        { binding: 2, resource: { buffer: oidn.outputBuf } },     // unused for output (read_write)
+        { binding: 1, resource: { buffer: oidn.outputBuf } },     // UNet final output (3 channels)
+        { binding: 2, resource: { buffer: oidnDummy } },          // unused for output (write slot)
         { binding: 3, resource: noisyTex.createView() },          // unused placeholder
-        { binding: 4, resource: albedoTex.createView() },         // unused placeholder
+        { binding: 4, resource: albedoTex.createView() },         // albedo (for output_extraction)
         { binding: 5, resource: denoiseNdTex.createView() },      // unused placeholder
         { binding: 6, resource: pingTex.createView() },           // OUTPUT: denoised HDR → pingTex
         { binding: 7, resource: specNoisyTex.createView() },      // unused placeholder

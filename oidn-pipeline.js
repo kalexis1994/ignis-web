@@ -129,11 +129,11 @@ export async function createOIDNPipeline(device, weightsUrl, width, height, hasF
 
   const STORAGE = GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC;
 
-  // Skip buffers (persist encoder → decoder)
-  const skipInput = device.createBuffer({ size: bufSize(9, 0), usage: STORAGE });   // original 9ch input
-  const skip1 = device.createBuffer({ size: bufSize(32, 0), usage: STORAGE });      // enc_conv1 output
-  const skip2 = device.createBuffer({ size: bufSize(48, 1), usage: STORAGE });      // enc_conv2 output
-  const skip3 = device.createBuffer({ size: bufSize(64, 2), usage: STORAGE });      // enc_conv3 output
+  // Skip buffers (persist encoder → decoder) — saved AFTER pooling (at decoder resolution)
+  const skipInput = device.createBuffer({ size: bufSize(9, 0), usage: STORAGE });   // original 9ch input (L0)
+  const skip1 = device.createBuffer({ size: bufSize(32, 1), usage: STORAGE });      // pooled enc_conv1 (L1)
+  const skip2 = device.createBuffer({ size: bufSize(48, 2), usage: STORAGE });      // pooled enc_conv2 (L2)
+  const skip3 = device.createBuffer({ size: bufSize(64, 3), usage: STORAGE });      // pooled enc_conv3 (L3)
 
   // Working buffers (ping-pong, sized for largest need)
   const maxBufSize = Math.max(
@@ -300,60 +300,60 @@ export async function createOIDNPipeline(device, weightsUrl, width, height, hasF
   // --- ENCODER ---
   // enc_conv0: input(9ch) → workA(32ch) at level 0
   addConv('enc_conv0', 9, 32, true, skipInput, workA, 0);
-  // enc_conv1: workA(32ch) → skip1(32ch) at level 0
-  addConv('enc_conv1', 32, 32, true, workA, skip1, 0);
-  // pool: skip1(32ch at L0) → workA(32ch at L1)
-  addPool(skip1, workA, 32, 0);
-  // enc_conv2: workA(32ch) → skip2(48ch) at level 1
-  addConv('enc_conv2', 32, 48, true, workA, skip2, 1);
-  // pool: skip2(48ch at L1) → workA(48ch at L2)
-  addPool(skip2, workA, 48, 1);
-  // enc_conv3: workA(48ch) → skip3(64ch) at level 2
-  addConv('enc_conv3', 48, 64, true, workA, skip3, 2);
-  // pool: skip3(64ch at L2) → workA(64ch at L3)
-  addPool(skip3, workA, 64, 2);
-  // enc_conv4: workA(64ch) → workB(80ch) at level 3
-  addConv('enc_conv4', 64, 80, true, workA, workB, 3);
-  // pool: workB(80ch at L3) → workA(80ch at L4)
-  addPool(workB, workA, 80, 3);
-  // enc_conv5a: workA(80ch) → workB(96ch) at level 4 (bottleneck)
-  addConv('enc_conv5a', 80, 96, true, workA, workB, 4);
-  // enc_conv5b: workB(96ch) → workA(96ch) at level 4
-  addConv('enc_conv5b', 96, 96, true, workB, workA, 4);
+  // enc_conv1: workA(32ch) → workB(32ch) at L0
+  addConv('enc_conv1', 32, 32, true, workA, workB, 0);
+  // pool: workB(32ch L0) → skip1(32ch L1) — skip saved AFTER pool (matches decoder L1)
+  addPool(workB, skip1, 32, 0);
+  // enc_conv2: skip1(32ch L1) → workA(48ch L1)
+  addConv('enc_conv2', 32, 48, true, skip1, workA, 1);
+  // pool: workA(48ch L1) → skip2(48ch L2) — skip saved AFTER pool
+  addPool(workA, skip2, 48, 1);
+  // enc_conv3: skip2(48ch L2) → workB(64ch L2)
+  addConv('enc_conv3', 48, 64, true, skip2, workB, 2);
+  // pool: workB(64ch L2) → skip3(64ch L3) — skip saved AFTER pool
+  addPool(workB, skip3, 64, 2);
+  // enc_conv4: skip3(64ch L3) → workA(80ch L3)
+  addConv('enc_conv4', 64, 80, true, skip3, workA, 3);
+  // pool: workA(80ch L3) → workB(80ch L4)
+  addPool(workA, workB, 80, 3);
+  // enc_conv5a: workB(80ch L4) → workA(96ch L4) (bottleneck)
+  addConv('enc_conv5a', 80, 96, true, workB, workA, 4);
+  // enc_conv5b: workA(96ch L4) → workB(96ch L4)
+  addConv('enc_conv5b', 96, 96, true, workA, workB, 4);
 
   // --- DECODER ---
-  // upsample: workA(96ch at L4) → workB(96ch at L3)
-  addUpsample(workA, workB, 96, 4);
-  // dec_conv4a: concat(workB=96ch, skip3=64ch)=160 → workA(112ch) at L3
-  addConv('dec_conv4a', 160, 112, true, workB, workA, 3, 96, skip3);
-  // dec_conv4b: workA(112ch) → workB(112ch) at L3
-  addConv('dec_conv4b', 112, 112, true, workA, workB, 3);
-  // upsample: workB(112ch at L3) → workA(112ch at L2)
-  addUpsample(workB, workA, 112, 3);
-  // dec_conv3a: concat(workA=112ch, skip2=48ch)=160 → workB(96ch) at L2
-  addConv('dec_conv3a', 160, 96, true, workA, workB, 2, 112, skip2);
-  // dec_conv3b: workB(96ch) → workA(96ch) at L2
-  addConv('dec_conv3b', 96, 96, true, workB, workA, 2);
-  // upsample: workA(96ch at L2) → workB(96ch at L1)
-  addUpsample(workA, workB, 96, 2);
-  // dec_conv2a: concat(workB=96ch, skip1=32ch)=128 → workA(64ch) at L1
-  addConv('dec_conv2a', 128, 64, true, workB, workA, 1, 96, skip1);
-  // dec_conv2b: workA(64ch) → workB(64ch) at L1
-  addConv('dec_conv2b', 64, 64, true, workA, workB, 1);
-  // upsample: workB(64ch at L1) → workA(64ch at L0)
-  addUpsample(workB, workA, 64, 1);
-  // dec_conv1a: concat(workA=64ch, skipInput=9ch)=73 → workB(64ch) at L0
-  addConv('dec_conv1a', 73, 64, true, workA, workB, 0, 64, skipInput);
-  // dec_conv1b: workB(64ch) → workA(32ch) at L0
-  addConv('dec_conv1b', 64, 32, true, workB, workA, 0);
-  // dec_conv0: workA(32ch) → outputBuf(3ch) at L0 — linear (no relu)
-  addConv('dec_conv0', 32, 3, false, workA, outputBuf, 0);
+  // upsample: workB(96ch at L4) → workA(96ch at L3)
+  addUpsample(workB, workA, 96, 4);
+  // dec_conv4a: concat(workA=96ch, skip3=64ch)=160 → workB(112ch) at L3
+  addConv('dec_conv4a', 160, 112, true, workA, workB, 3, 96, skip3);
+  // dec_conv4b: workB(112ch) → workA(112ch) at L3
+  addConv('dec_conv4b', 112, 112, true, workB, workA, 3);
+  // upsample: workA(112ch at L3) → workB(112ch at L2)
+  addUpsample(workA, workB, 112, 3);
+  // dec_conv3a: concat(workB=112ch, skip2=48ch)=160 → workA(96ch) at L2
+  addConv('dec_conv3a', 160, 96, true, workB, workA, 2, 112, skip2);
+  // dec_conv3b: workA(96ch) → workB(96ch) at L2
+  addConv('dec_conv3b', 96, 96, true, workA, workB, 2);
+  // upsample: workB(96ch at L2) → workA(96ch at L1)
+  addUpsample(workB, workA, 96, 2);
+  // dec_conv2a: concat(workA=96ch, skip1=32ch)=128 → workB(64ch) at L1
+  addConv('dec_conv2a', 128, 64, true, workA, workB, 1, 96, skip1);
+  // dec_conv2b: workB(64ch) → workA(64ch) at L1
+  addConv('dec_conv2b', 64, 64, true, workB, workA, 1);
+  // upsample: workA(64ch at L1) → workB(64ch at L0)
+  addUpsample(workA, workB, 64, 1);
+  // dec_conv1a: concat(workB=64ch, skipInput=9ch)=73 → workA(64ch) at L0
+  addConv('dec_conv1a', 73, 64, true, workB, workA, 0, 64, skipInput);
+  // dec_conv1b: workA(64ch) → workB(32ch) at L0
+  addConv('dec_conv1b', 64, 32, true, workA, workB, 0);
+  // dec_conv0: workB(32ch) → outputBuf(3ch) at L0 — linear (no relu)
+  addConv('dec_conv0', 32, 3, false, workB, outputBuf, 0);
 
   log(`OIDN pipeline: ${dispatches.length} dispatches, ${levels.map(l => l.w + 'x' + l.h).join(' → ')}`);
 
   return {
     padW, padH, width, height, levels,
-    skipInput, outputBuf,
+    skipInput, outputBuf, workA, workB,
     dispatches,
     // Pipelines for I/O (need textures, created at integration time)
     inputPipeline, outputPipeline, ioBGL,
@@ -370,7 +370,7 @@ export async function createOIDNPipeline(device, weightsUrl, width, height, hasF
       ioPass.dispatchWorkgroups(Math.ceil(padW / 16), Math.ceil(padH / 16));
       ioPass.end();
 
-      // UNet forward pass
+      // UNet forward pass (all layers)
       for (const d of dispatches) {
         const pass = encoder.beginComputePass();
         pass.setPipeline(d.pipeline);

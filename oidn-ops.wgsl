@@ -101,8 +101,10 @@ fn input_assembly(
   // Combine beauty pass: OIDN expects albedo * diffuse_irradiance + specular
   let beauty = max(albedo, vec3f(0.02)) * diffuse + specular;
 
-  // HDR transfer function: Reinhard per-channel (maps [0,∞) → [0,1))
-  let tf = beauty / (1.0 + beauty);
+  // LDR model: expects sRGB gamma-encoded [0,1] (like a final render)
+  let exposed = beauty * 0.5;                        // rough exposure
+  let tonemapped = exposed / (exposed + 1.0);        // Reinhard tonemap → [0,1)
+  let tf = pow(max(tonemapped, vec3f(0.0)), vec3f(1.0 / 2.2)); // sRGB gamma
 
   // Write 9 channels NCHW: color(3) + albedo(3) + normal(3)
   buf_out[0u * HW + idx] = f16(tf.x);
@@ -138,9 +140,12 @@ fn output_extraction(
   let g = f32(buf_in[1u * HW + idx]);
   let b = f32(buf_in[2u * HW + idx]);
 
-  // Inverse HDR transfer: Reinhard inverse
-  let beauty = vec3f(r, g, b) / max(1.0 - vec3f(r, g, b), vec3f(1e-6));
+  // Inverse: sRGB gamma → linear → inverse Reinhard → HDR
+  let srgb = clamp(vec3f(r, g, b), vec3f(0.0), vec3f(1.0));
+  let linear = pow(srgb, vec3f(2.2));                    // inverse gamma
+  let beauty = linear / max(1.0 - linear, vec3f(0.001)); // inverse Reinhard
+  // beauty /= 0.5; // undo exposure — skip, let composite exposure handle it
 
-  // Write full denoised beauty pass directly — composite handles OIDN mode without remodulation
+  // Write full denoised beauty pass — composite handles OIDN mode without remodulation
   textureStore(out_tex, vec2i(gid.xy), vec4f(beauty, 1.0));
 }
