@@ -1,4 +1,5 @@
-// OIDN Conv2D 3x3 — 8x8 workgroup for high occupancy, 8 output channels unrolled
+// OIDN Conv2D 3x3 — NHWC layout, 8x8 workgroup, 8 output channels
+// NHWC: all channels per pixel contiguous → coalesced vec4 reads, cache-friendly
 
 enable f16;
 
@@ -14,10 +15,10 @@ struct ConvParams {
 @group(0) @binding(4) var<storage, read> buf_b: array<f16>;
 
 const TILE: u32 = 8u;
-const PAD: u32 = 10u;    // TILE + 2*HALO
-const CH_TILE: u32 = 8u; // smaller tile = less shared memory
+const PAD: u32 = 10u;
+const CH_TILE: u32 = 8u;
 
-// Shared memory: 10x10 * 8 channels = 800 f16 = 1600 bytes (tiny → high occupancy)
+// Shared memory: 10x10 spatial × CH_TILE channels = 800 f16 (1600 bytes)
 var<workgroup> sm: array<f16, 800>;
 
 @compute @workgroup_size(8, 8)
@@ -27,7 +28,6 @@ fn conv2d_3x3(
 ) {
   let W = params.width;
   let H = params.height;
-  let HW = H * W;
   let c_in = params.c_in;
   let c_out = params.c_out;
   let ox = wid.x * TILE + lid.x;
@@ -49,26 +49,34 @@ fn conv2d_3x3(
   let tile_y = i32(wid.y * TILE) - 1i;
   let flat_id = lid.y * TILE + lid.x; // 0..63
   let split = select(c_in, params.split_ch, params.split_ch > 0u);
+  let c_a = split;           // channels per pixel in buf_a
+  let c_b = c_in - split;    // channels per pixel in buf_b
   let lx = lid.x + 1u;
   let ly = lid.y + 1u;
-  let oc_count = min(8u, c_out - min(oc_base, c_out));
 
   for (var ch_base = 0u; ch_base < c_in; ch_base += CH_TILE) {
     let ch_count = min(CH_TILE, c_in - ch_base);
     let total_sm = PAD * PAD * ch_count;
 
-    // 64 threads loading up to 800 values = ~12.5 loads/thread
+    // Cooperative load: NHWC buffers → shared memory
+    // sm layout: sm[spatial * CH_TILE + ch_local] (channels innermost)
     for (var t = flat_id; t < total_sm; t += 64u) {
-      let ch_local = t / (PAD * PAD);
-      let spatial = t - ch_local * (PAD * PAD);
+      let spatial = t / CH_TILE;
+      let ch_local = t - spatial * CH_TILE;
+      if ch_local >= ch_count { sm[t] = 0.0h; continue; }
       let sy = spatial / PAD;
       let sx = spatial - sy * PAD;
       let px = u32(clamp(tile_x + i32(sx), 0, i32(W) - 1));
       let py = u32(clamp(tile_y + i32(sy), 0, i32(H) - 1));
       let ic = ch_base + ch_local;
+      let pixel = py * W + px;
       var val: f16 = 0.0h;
-      if ic < split { val = buf_a[ic * HW + py * W + px]; }
-      else if ic < c_in { val = buf_b[(ic - split) * HW + py * W + px]; }
+      // NHWC: buf_a[(y*W+x)*C_a + ic], buf_b[(y*W+x)*C_b + (ic-split)]
+      if ic < split {
+        val = buf_a[pixel * c_a + ic];
+      } else if ic < c_in {
+        val = buf_b[pixel * c_b + (ic - split)];
+      }
       sm[t] = val;
     }
     workgroupBarrier();
@@ -76,10 +84,16 @@ fn conv2d_3x3(
     if !oob {
       for (var ch_local = 0u; ch_local < ch_count; ch_local++) {
         let ic = ch_base + ch_local;
-        let s = ch_local * (PAD * PAD);
-        let v00=f32(sm[s+(ly-1u)*PAD+(lx-1u)]); let v01=f32(sm[s+(ly-1u)*PAD+lx]); let v02=f32(sm[s+(ly-1u)*PAD+(lx+1u)]);
-        let v10=f32(sm[s+ly*PAD+(lx-1u)]);      let v11=f32(sm[s+ly*PAD+lx]);      let v12=f32(sm[s+ly*PAD+(lx+1u)]);
-        let v20=f32(sm[s+(ly+1u)*PAD+(lx-1u)]); let v21=f32(sm[s+(ly+1u)*PAD+lx]); let v22=f32(sm[s+(ly+1u)*PAD+(lx+1u)]);
+        // Read 9 neighbors from shared memory (NHWC: stride = CH_TILE between channels)
+        let v00=f32(sm[((ly-1u)*PAD+(lx-1u))*CH_TILE+ch_local]);
+        let v01=f32(sm[((ly-1u)*PAD+ lx    )*CH_TILE+ch_local]);
+        let v02=f32(sm[((ly-1u)*PAD+(lx+1u))*CH_TILE+ch_local]);
+        let v10=f32(sm[( ly    *PAD+(lx-1u))*CH_TILE+ch_local]);
+        let v11=f32(sm[( ly    *PAD+ lx    )*CH_TILE+ch_local]);
+        let v12=f32(sm[( ly    *PAD+(lx+1u))*CH_TILE+ch_local]);
+        let v20=f32(sm[((ly+1u)*PAD+(lx-1u))*CH_TILE+ch_local]);
+        let v21=f32(sm[((ly+1u)*PAD+ lx    )*CH_TILE+ch_local]);
+        let v22=f32(sm[((ly+1u)*PAD+(lx+1u))*CH_TILE+ch_local]);
 
         if oc_base     <c_out{let w=params.weight_off+(oc_base     *c_in+ic)*9u;a0+=v00*f32(weights[w])+v01*f32(weights[w+1u])+v02*f32(weights[w+2u])+v10*f32(weights[w+3u])+v11*f32(weights[w+4u])+v12*f32(weights[w+5u])+v20*f32(weights[w+6u])+v21*f32(weights[w+7u])+v22*f32(weights[w+8u]);}
         if oc_base+1u<c_out{let w=params.weight_off+((oc_base+1u)*c_in+ic)*9u;a1+=v00*f32(weights[w])+v01*f32(weights[w+1u])+v02*f32(weights[w+2u])+v10*f32(weights[w+3u])+v11*f32(weights[w+4u])+v12*f32(weights[w+5u])+v20*f32(weights[w+6u])+v21*f32(weights[w+7u])+v22*f32(weights[w+8u]);}
@@ -94,16 +108,18 @@ fn conv2d_3x3(
     workgroupBarrier();
   }
 
+  // Write output in NHWC: buf_out[(y*W+x)*c_out + oc]
   if !oob {
-    let si = oy * W + ox;
+    let pixel = oy * W + ox;
     let relu = params.apply_relu > 0u;
-    if oc_base     <c_out{buf_out[ oc_base     *HW+si]=f16(select(a0,max(a0,0.),relu));}
-    if oc_base+1u<c_out{buf_out[(oc_base+1u)*HW+si]=f16(select(a1,max(a1,0.),relu));}
-    if oc_base+2u<c_out{buf_out[(oc_base+2u)*HW+si]=f16(select(a2,max(a2,0.),relu));}
-    if oc_base+3u<c_out{buf_out[(oc_base+3u)*HW+si]=f16(select(a3,max(a3,0.),relu));}
-    if oc_base+4u<c_out{buf_out[(oc_base+4u)*HW+si]=f16(select(a4,max(a4,0.),relu));}
-    if oc_base+5u<c_out{buf_out[(oc_base+5u)*HW+si]=f16(select(a5,max(a5,0.),relu));}
-    if oc_base+6u<c_out{buf_out[(oc_base+6u)*HW+si]=f16(select(a6,max(a6,0.),relu));}
-    if oc_base+7u<c_out{buf_out[(oc_base+7u)*HW+si]=f16(select(a7,max(a7,0.),relu));}
+    let base = pixel * c_out + oc_base;
+    if oc_base     <c_out{buf_out[base     ]=f16(select(a0,max(a0,0.),relu));}
+    if oc_base+1u<c_out{buf_out[base+1u]=f16(select(a1,max(a1,0.),relu));}
+    if oc_base+2u<c_out{buf_out[base+2u]=f16(select(a2,max(a2,0.),relu));}
+    if oc_base+3u<c_out{buf_out[base+3u]=f16(select(a3,max(a3,0.),relu));}
+    if oc_base+4u<c_out{buf_out[base+4u]=f16(select(a4,max(a4,0.),relu));}
+    if oc_base+5u<c_out{buf_out[base+5u]=f16(select(a5,max(a5,0.),relu));}
+    if oc_base+6u<c_out{buf_out[base+6u]=f16(select(a6,max(a6,0.),relu));}
+    if oc_base+7u<c_out{buf_out[base+7u]=f16(select(a7,max(a7,0.),relu));}
   }
 }
