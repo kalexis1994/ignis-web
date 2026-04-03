@@ -137,9 +137,10 @@ fn atrous(@builtin(global_invocation_id) gid: vec3u) {
   let spec_sigma_scale = mix(4.0 * 0.3, 4.0, roughness);
 
   // === FILTER (both signals + variance filtering in one pass) ===
-  var d_sum = vec3f(0.0); var d_wsum = 0.0;
-  var s_sum = vec3f(0.0); var s_wsum = 0.0;
-  var d_var_filtered = 0.0; var d_var_wsum = 0.0; // variance filtering
+  // f16 weight sums: reduces register pressure, 2x faster weight multiply on NVIDIA
+  var d_sum = vec3f(0.0); var d_wsum: f16 = 0.0h;
+  var s_sum = vec3f(0.0); var s_wsum: f16 = 0.0h;
+  var d_var_filtered = 0.0; var d_var_wsum: f16 = 0.0h;
 
   for (var dy = -2; dy <= 2; dy++) {
     for (var dx = -2; dx <= 2; dx++) {
@@ -151,38 +152,37 @@ fn atrous(@builtin(global_invocation_id) gid: vec3u) {
       let ss = textureLoad(in_spec, sp, 0).rgb;
 
       // Normal edge-stopping (SVGF, Schied 2017, eq.4, σ_n=128)
-      let wn = pow(max(dot(cn, snd.xyz), 0.0), 128.0);
+      let wn = f16(pow(max(dot(cn, snd.xyz), 0.0), 128.0));
       let dz = abs(cz - snd.w);
-      let wz = exp(-dz / (gz * f32(step) + 1e-3));
+      let wz = f16(exp(-dz / (gz * f32(step) + 1e-3)));
 
       // Diffuse luminance edge-stopping (hit distance modulated)
       let d_dl = abs(cl - luma(sd));
       let d_sigma = diff_sigma_scale * d_std * hit_factor + 0.01;
-      let d_wl = exp(-d_dl / max(d_sigma, 0.01));
-      let d_w = KW[ki] * wn * wz * d_wl;
-      d_sum += sd * d_w;
+      let d_wl = f16(exp(-d_dl / max(d_sigma, 0.01)));
+      let d_w = f16(KW[ki]) * wn * wz * d_wl;
+      d_sum += sd * f32(d_w);
       d_wsum += d_w;
 
       // Filter variance through à-trous kernel (SVGF §4.2)
-      // Uses geometry weights only (not luminance) to preserve variance at edges
-      let geom_w = KW[ki] * wn * wz;
-      d_var_filtered += s_diff.a * geom_w;
+      let geom_w = f16(KW[ki]) * wn * wz;
+      d_var_filtered += s_diff.a * f32(geom_w);
       d_var_wsum += geom_w;
 
       // Specular luminance edge-stopping (roughness + hit distance modulated)
       let s_dl = abs(csl - luma(ss));
       let s_sigma = spec_sigma_scale * s_std * hit_factor + 0.01;
-      let s_wl = exp(-s_dl / max(s_sigma, 0.01));
-      let s_w = KW[ki] * wn * wz * s_wl;
-      s_sum += ss * s_w;
+      let s_wl = f16(exp(-s_dl / max(s_sigma, 0.01)));
+      let s_w = f16(KW[ki]) * wn * wz * s_wl;
+      s_sum += ss * f32(s_w);
       s_wsum += s_w;
     }
   }
 
   // Output: color + filtered variance in alpha (propagated to next pass)
-  let out_var = d_var_filtered / max(d_var_wsum, 1e-6);
-  textureStore(out_color, px, vec4f(d_sum / max(d_wsum, 1e-6), out_var));
-  textureStore(out_spec, px, vec4f(s_sum / max(s_wsum, 1e-6), textureLoad(in_spec, px, 0).a));
+  let out_var = d_var_filtered / max(f32(d_var_wsum), 1e-6);
+  textureStore(out_color, px, vec4f(d_sum / max(f32(d_wsum), 1e-6), out_var));
+  textureStore(out_spec, px, vec4f(s_sum / max(f32(s_wsum), 1e-6), textureLoad(in_spec, px, 0).a));
 }
 
 // === PRE-BLUR: anti-firefly percentile clamp + lightweight 3x3 bilateral ===
@@ -229,9 +229,9 @@ fn preblur(@builtin(global_invocation_id) gid: vec3u) {
   let cl = luma(cc);
   let csl = luma(cs);
 
-  // === 3x3 bilateral filter ===
-  var d_sum = cc;  var d_wsum = 1.0;
-  var s_sum = cs;  var s_wsum = 1.0;
+  // === 3x3 bilateral filter (f16 weights) ===
+  var d_sum = cc;  var d_wsum: f16 = 1.0h;
+  var s_sum = cs;  var s_wsum: f16 = 1.0h;
 
   for (var dy = -1; dy <= 1; dy++) {
     for (var dx = -1; dx <= 1; dx++) {
@@ -248,22 +248,24 @@ fn preblur(@builtin(global_invocation_id) gid: vec3u) {
       var ss_c = ss;
       if ss_l > s_max_lum && ss_l > 0.01 { ss_c = ss * (s_max_lum / ss_l); }
 
-      let wn = pow(max(dot(cn, snd.xyz), 0.0), 32.0);
-      let wz = exp(-abs(cz - snd.w) / max(cz * 0.05, 1e-2));
+      let wn = f16(pow(max(dot(cn, snd.xyz), 0.0), 32.0));
+      let wz = f16(exp(-abs(cz - snd.w) / max(cz * 0.05, 1e-2)));
 
-      let d_wl = exp(-abs(cl - luma(sd_c)) / max(cl * 0.5 + 0.1, 0.01));
-      d_sum += sd_c * (wn * wz * d_wl);
-      d_wsum += wn * wz * d_wl;
+      let d_wl = f16(exp(-abs(cl - luma(sd_c)) / max(cl * 0.5 + 0.1, 0.01)));
+      let d_w = wn * wz * d_wl;
+      d_sum += sd_c * f32(d_w);
+      d_wsum += d_w;
 
-      let s_wl = exp(-abs(csl - luma(ss_c)) / max(csl * 0.5 + 0.1, 0.01));
-      s_sum += ss_c * (wn * wz * s_wl);
-      s_wsum += wn * wz * s_wl;
+      let s_wl = f16(exp(-abs(csl - luma(ss_c)) / max(csl * 0.5 + 0.1, 0.01)));
+      let s_w = wn * wz * s_wl;
+      s_sum += ss_c * f32(s_w);
+      s_wsum += s_w;
     }
   }
 
   let center_hit_dist = textureLoad(in_spec, px, 0).a;
-  textureStore(out_color, px, vec4f(d_sum / d_wsum, 1.0));
-  textureStore(out_spec, px, vec4f(s_sum / s_wsum, center_hit_dist));
+  textureStore(out_color, px, vec4f(d_sum / f32(d_wsum), 1.0));
+  textureStore(out_spec, px, vec4f(s_sum / f32(s_wsum), center_hit_dist));
 }
 
 // ============================================================
@@ -388,18 +390,18 @@ fn composite(@builtin(global_invocation_id) gid: vec3u) {
   let sat_luma = dot(ldr, vec3f(0.2126, 0.7152, 0.0722));
   ldr = clamp(mix(vec3f(sat_luma), ldr, params.saturation), vec3f(0.0), vec3f(1.0));
 
-  // 4. Gamma encode (sRGB 2.2)
-  var c = pow(max(ldr, vec3f(0.0)), vec3f(1.0 / 2.2));
+  // 4. Gamma encode (sRGB 2.2) → f16 for post-tonemap chain (output is 8-bit)
+  var c = vec3h(pow(max(ldr, vec3f(0.0)), vec3f(1.0 / 2.2)));
 
   // 5. Contrast (post-gamma Hermite smoothstep, ignis-rt)
   if params.contrast > 0.01 {
-    let curved = c * c * (3.0 - 2.0 * c);
-    c = mix(c, curved, params.contrast);
+    let curved = c * c * (3.0h - 2.0h * c);
+    c = mix(c, curved, f16(params.contrast));
   }
 
   // 6. Dither (triangular ±0.5/255, prevents banding)
-  let dither_hash = fract(sin(dot(vec2f(f32(px.x), f32(px.y)), vec2f(12.9898, 78.233))) * 43758.5453);
-  c += (dither_hash - 0.5) / 255.0;
+  let dither_hash = f16(fract(sin(dot(vec2f(f32(px.x), f32(px.y)), vec2f(12.9898, 78.233))) * 43758.5453));
+  c += (dither_hash - 0.5h) / 255.0h;
 
-  textureStore(composite_out, px, vec4f(c, 1.0));
+  textureStore(composite_out, px, vec4f(vec3f(c), 1.0));
 }

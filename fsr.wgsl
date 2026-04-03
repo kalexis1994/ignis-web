@@ -58,15 +58,14 @@ fn easu(@builtin(global_invocation_id) gid: vec3u) {
   let center_uv = (src_center + 0.5) / params.input_size;
   let center_col = textureSampleLevel(input_tex, tex_sampler, center_uv, 0.0).rgb;
 
-  // 4x4 Lanczos kernel with edge-adaptive weighting
+  // 4x4 Lanczos kernel with edge-adaptive weighting (f16 weights)
   var color = vec3f(0.0);
-  var tw = 0.0;
+  var tw: f16 = 0.0h;
 
   for (var y = -1; y <= 2; y++) {
     let wy = lanczos2(f32(y) - f.y);
     for (var x = -1; x <= 2; x++) {
       let wx = lanczos2(f32(x) - f.x);
-      let lanczos_w = wx * wy;
 
       let uv = (src_center + vec2f(f32(x), f32(y)) + 0.5) / params.input_size;
       let clamped_uv = clamp(uv, vec2f(0.001), vec2f(0.999));
@@ -74,14 +73,14 @@ fn easu(@builtin(global_invocation_id) gid: vec3u) {
 
       // Edge-aware: reduce contribution of samples that differ strongly from center
       let ew = edge_weight(center_col, s);
-      let w = lanczos_w * mix(1.0, ew, 0.5); // 50% edge adaptation
+      let w = f16(wx * wy * mix(1.0, ew, 0.5));
 
-      color += s * w;
+      color += s * f32(w);
       tw += w;
     }
   }
 
-  color = max(color / tw, vec3f(0.0));
+  color = max(color / f32(tw), vec3f(0.0));
   textureStore(output_tex, out_px, vec4f(color, 1.0));
 }
 

@@ -51,8 +51,10 @@ async function init() {
   }
 
   const hasSubgroups = adapter.features.has('subgroups');
+  const hasF16 = adapter.features.has('shader-f16');
   const requiredFeatures = [];
   if (hasSubgroups) requiredFeatures.push('subgroups');
+  if (hasF16) requiredFeatures.push('shader-f16');
 
   const device = await adapter.requestDevice({
     requiredFeatures,
@@ -189,10 +191,24 @@ async function init() {
     fetch(`gbuffer.wgsl?v=${v}`).then(r => r.text()),
   ]);
 
-  // Subgroups: detected and requested for use in denoiser/temporal shaders (Phase 6).
-  // NOT usable in pathtracer.wgsl — WGSL uniformity analysis rejects subgroup ops
-  // after any non-uniform return (even the bounds check at the top of main).
   if (hasSubgroups) rlog('Subgroups available (reserved for denoiser)');
+
+  // shader-f16: half-precision weights in denoiser/FSR (2x ALU throughput on NVIDIA Turing+)
+  if (hasF16) {
+    dnCode = 'enable f16;\n' + dnCode;
+    fsrCode = 'enable f16;\n' + fsrCode;
+    rlog('shader-f16 enabled for denoiser and FSR');
+  } else {
+    // Fallback: strip f16 types back to f32 so shaders compile without the extension
+    function stripF16(code) {
+      return code.replace(/\bvec(\d)h\b/g, 'vec$1f')
+                 .replace(/\bf16\(/g, 'f32(')
+                 .replace(/(\d+\.?\d*)h\b/g, '$1')
+                 .replace(/:\s*f16\b/g, ': f32');
+    }
+    dnCode = stripF16(dnCode);
+    fsrCode = stripF16(fsrCode);
+  }
 
   const smOpts = { strictMath: false };
   const ptModule = device.createShaderModule({ code: ptCode, ...smOpts });
