@@ -1014,43 +1014,56 @@ async function init() {
         { binding: 7, resource: specNoisyTex.createView() },      // unused placeholder
       ]});
 
-      // Temporal blend: stabilize OIDN output by blending with previous frame
+      // Temporal blend with reprojection: stabilize OIDN output
       const blendBGL = device.createBindGroupLayout({ entries: [
         { binding: 0, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'uniform' } },
         { binding: 1, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } },
         { binding: 2, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } },
+        { binding: 3, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'uniform' } },
+        { binding: 4, visibility: GPUShaderStage.COMPUTE, texture: { sampleType: 'float' } },
+        { binding: 5, visibility: GPUShaderStage.COMPUTE, sampler: { type: 'filtering' } },
         { binding: 8, visibility: GPUShaderStage.COMPUTE, texture: { sampleType: 'float' } },
         { binding: 9, visibility: GPUShaderStage.COMPUTE, texture: { sampleType: 'float' } },
         { binding: 10, visibility: GPUShaderStage.COMPUTE, storageTexture: { access: 'write-only', format: 'rgba16float' } },
       ]});
+      const blendOpsCode = await fetch(`oidn-ops.wgsl?v=${Date.now()}`).then(r=>r.text());
       const blendPipeline = device.createComputePipeline({
         layout: device.createPipelineLayout({ bindGroupLayouts: [blendBGL] }),
-        compute: { module: device.createShaderModule({ code: await fetch(`oidn-ops.wgsl?v=${Date.now()}`).then(r=>r.text()), strictMath: false }), entryPoint: 'temporal_blend' },
+        compute: { module: device.createShaderModule({ code: blendOpsCode, strictMath: false }), entryPoint: 'temporal_blend' },
       });
       const blendParams = device.createBuffer({ size: 32, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
+      // BlendCameraParams: 4 u32 + 8 vec4f + 1 f32 + 1 f32 + 2 f32 pad = 160 bytes
+      const blendCamBuf = device.createBuffer({ size: 160, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
       const dummyReadBuf = device.createBuffer({ size: 16, usage: GPUBufferUsage.STORAGE });
       const dummyWriteBuf = device.createBuffer({ size: 16, usage: GPUBufferUsage.STORAGE });
+      const blendSampler = device.createSampler({ magFilter: 'linear', minFilter: 'linear' });
 
       // Ping-pong: frame 0 reads historyA, writes historyB. Frame 1: reverse.
-      // pingTex = current OIDN output, history = previous blended
       oidn.blendBG_A = device.createBindGroup({ layout: blendBGL, entries: [
         { binding: 0, resource: { buffer: blendParams } },
         { binding: 1, resource: { buffer: dummyReadBuf } },
         { binding: 2, resource: { buffer: dummyWriteBuf } },
-        { binding: 8, resource: pingTex.createView() },       // current denoised
-        { binding: 9, resource: historyA.createView() },      // previous blended
-        { binding: 10, resource: historyB.createView() },     // output blended
+        { binding: 3, resource: { buffer: blendCamBuf } },
+        { binding: 4, resource: ndTex.createView() },          // depth from G-buffer
+        { binding: 5, resource: blendSampler },
+        { binding: 8, resource: pingTex.createView() },        // current denoised
+        { binding: 9, resource: historyA.createView() },       // previous blended
+        { binding: 10, resource: historyB.createView() },      // output
       ]});
       oidn.blendBG_B = device.createBindGroup({ layout: blendBGL, entries: [
         { binding: 0, resource: { buffer: blendParams } },
         { binding: 1, resource: { buffer: dummyReadBuf } },
         { binding: 2, resource: { buffer: dummyWriteBuf } },
+        { binding: 3, resource: { buffer: blendCamBuf } },
+        { binding: 4, resource: ndTex.createView() },
+        { binding: 5, resource: blendSampler },
         { binding: 8, resource: pingTex.createView() },
         { binding: 9, resource: historyB.createView() },
         { binding: 10, resource: historyA.createView() },
       ]});
       oidn.blendPipeline = blendPipeline;
       oidn.blendParams = blendParams;
+      oidn.blendCamBuf = blendCamBuf;
       oidn.blendFrame = 0;
 
       rlog('OIDN neural denoiser initialized');
@@ -2028,13 +2041,22 @@ async function init() {
         // Firefly rejection is done inline in input_assembly via luminance clamp
         oidn.encode(encoder, oidn.inputBG, oidn.outputBG);
 
-        // Temporal blend: mix current denoised (pingTex) with previous (history)
-        // Alpha: high when moving (less history), low when still (more stable)
-        // Moving: alpha=1.0 (no blend). Stopping: ramp down over ~20 frames to 0.1
-        const blendAlpha = framesStill < 3 ? 1.0 : Math.max(0.1, 1.0 / (framesStill * 0.3 + 1));
-        device.queue.writeBuffer(oidn.blendParams, 0, new Uint32Array([
-          width, height, 0, 0, Math.round(blendAlpha * 1000), 0, 0, 0
-        ]));
+        // Temporal blend with reprojection
+        const blendAlpha = framesStill < 3 ? 0.5 : Math.max(0.05, 1.0 / (framesStill * 0.5 + 1));
+        // Write BlendCameraParams: 4 u32 header + 8 vec4f camera data + fov/aspect
+        const bcam = new Float32Array(40); // 160 bytes = 40 floats
+        const bcamU = new Uint32Array(bcam.buffer);
+        bcamU[0] = width; bcamU[1] = height; bcamU[2] = Math.round(blendAlpha * 1000); bcamU[3] = 0;
+        bcam[4] = right[0]; bcam[5] = right[1]; bcam[6] = right[2]; bcam[7] = 0;
+        bcam[8] = up[0]; bcam[9] = up[1]; bcam[10] = up[2]; bcam[11] = 0;
+        bcam[12] = forward[0]; bcam[13] = forward[1]; bcam[14] = forward[2]; bcam[15] = 0;
+        bcam[16] = camera.pos[0]; bcam[17] = camera.pos[1]; bcam[18] = camera.pos[2]; bcam[19] = 0;
+        bcam[20] = prevCam.right[0]; bcam[21] = prevCam.right[1]; bcam[22] = prevCam.right[2]; bcam[23] = 0;
+        bcam[24] = prevCam.up[0]; bcam[25] = prevCam.up[1]; bcam[26] = prevCam.up[2]; bcam[27] = 0;
+        bcam[28] = prevCam.fwd[0]; bcam[29] = prevCam.fwd[1]; bcam[30] = prevCam.fwd[2]; bcam[31] = 0;
+        bcam[32] = prevCam.pos[0]; bcam[33] = prevCam.pos[1]; bcam[34] = prevCam.pos[2]; bcam[35] = 0;
+        bcam[36] = fovFactor; bcam[37] = aspect; bcam[38] = 0; bcam[39] = 0;
+        device.queue.writeBuffer(oidn.blendCamBuf, 0, bcam);
         const blendPass = encoder.beginComputePass();
         blendPass.setPipeline(oidn.blendPipeline);
         blendPass.setBindGroup(0, oidn.blendFrame === 0 ? oidn.blendBG_A : oidn.blendBG_B);

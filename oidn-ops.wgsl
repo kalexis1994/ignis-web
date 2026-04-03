@@ -170,32 +170,87 @@ fn output_extraction(
 }
 
 // ============================================================
-// Temporal blend: mix current denoised with previous for stability
-// Reads current from one texture, history from another, writes blended
+// Temporal blend with reprojection: reprojects history from previous
+// camera, then blends with current denoised output.
 // Dispatch: (ceil(width/16), ceil(height/16), 1)
-// Uses params.channels as blend alpha × 1000 (integer encoding)
 // ============================================================
+
+struct BlendCameraParams {
+  width: u32,
+  height: u32,
+  blend_alpha_x1000: u32,
+  _pad0: u32,
+  cam_right: vec4f,
+  cam_up: vec4f,
+  cam_fwd: vec4f,
+  cam_pos: vec4f,
+  prev_right: vec4f,
+  prev_up: vec4f,
+  prev_fwd: vec4f,
+  prev_pos: vec4f,
+  fov_factor: f32,
+  aspect: f32,
+  _pad1: vec2f,
+};
+
+@group(0) @binding(3) var<uniform> blend_cam: BlendCameraParams;
+@group(0) @binding(4) var depth_tex: texture_2d<f32>;
+@group(0) @binding(5) var blend_sampler: sampler;
 @group(0) @binding(8) var current_tex: texture_2d<f32>;
 @group(0) @binding(9) var history_tex: texture_2d<f32>;
 @group(0) @binding(10) var blend_out: texture_storage_2d<rgba16float, write>;
+
+fn reconstruct_world_pos(px: vec2f, depth: f32, cam: BlendCameraParams) -> vec3f {
+  let res = vec2f(f32(cam.width), f32(cam.height));
+  let uv = (px + 0.5) / res;
+  let ndc = uv * 2.0 - 1.0;
+  let rd = normalize(cam.cam_fwd.xyz + ndc.x * cam.aspect * cam.fov_factor * cam.cam_right.xyz + ndc.y * cam.fov_factor * cam.cam_up.xyz);
+  return cam.cam_pos.xyz + rd * depth;
+}
+
+fn project_prev_uv(world_pos: vec3f, cam: BlendCameraParams) -> vec2f {
+  let local = world_pos - cam.prev_pos.xyz;
+  let z = dot(local, cam.prev_fwd.xyz);
+  if z <= 0.0 { return vec2f(-1.0); }
+  let x = dot(local, cam.prev_right.xyz);
+  let y = dot(local, cam.prev_up.xyz);
+  let ndcx = x / (z * cam.aspect * cam.fov_factor);
+  let ndcy = y / (z * cam.fov_factor);
+  return vec2f(ndcx * 0.5 + 0.5, ndcy * 0.5 + 0.5);
+}
 
 @compute @workgroup_size(16, 16)
 fn temporal_blend(
   @builtin(global_invocation_id) gid: vec3u
 ) {
-  let W = params.in_width;
-  let H = params.in_height;
+  let W = blend_cam.width;
+  let H = blend_cam.height;
   if gid.x >= W || gid.y >= H { return; }
   let px = vec2i(gid.xy);
 
   let current = textureLoad(current_tex, px, 0).rgb;
-  let history = textureLoad(history_tex, px, 0).rgb;
+  let base_alpha = f32(blend_cam.blend_alpha_x1000) / 1000.0;
 
-  // Alpha from params.channels (encoded as alpha * 1000)
-  let base_alpha = f32(params.channels) / 1000.0;
+  // Reconstruct world position from depth + current camera
+  let depth = textureLoad(depth_tex, px, 0).w; // depth in gbuf_nd.w
+  var history = vec3f(0.0);
+  var valid_reproject = false;
 
-  // Neighborhood AABB clamp: use 3x3 min/max of current frame to reject stale history
-  // This prevents ghosting artifacts from misaligned history pixels
+  if depth > 0.0 && depth < 50000.0 {
+    let world_pos = reconstruct_world_pos(vec2f(gid.xy), depth, blend_cam);
+    let prev_uv = project_prev_uv(world_pos, blend_cam);
+    if prev_uv.x >= 0.0 && prev_uv.x <= 1.0 && prev_uv.y >= 0.0 && prev_uv.y <= 1.0 {
+      history = textureSampleLevel(history_tex, blend_sampler, prev_uv, 0.0).rgb;
+      valid_reproject = true;
+    }
+  }
+
+  if !valid_reproject {
+    // Fallback: no reprojection (sky pixels, disoccluded areas)
+    history = textureLoad(history_tex, px, 0).rgb;
+  }
+
+  // Neighborhood AABB clamp
   var mn = current;
   var mx = current;
   for (var dy = -1; dy <= 1; dy++) {
@@ -206,15 +261,12 @@ fn temporal_blend(
       mx = max(mx, s);
     }
   }
-
-  // Expand AABB slightly to allow noise variation
   let aabb_size = mx - mn;
   let margin = aabb_size * 0.25 + 0.01;
   let clamped_history = clamp(history, mn - margin, mx + margin);
 
-  // How much was history clamped? More clamping → more weight to current
   let clamp_dist = length(history - clamped_history);
-  let clamp_factor = min(clamp_dist * 5.0, 1.0); // 0=no clamp, 1=fully rejected
+  let clamp_factor = min(clamp_dist * 5.0, 1.0);
   let alpha = max(base_alpha, clamp_factor);
 
   let blended = mix(clamped_history, current, alpha);
