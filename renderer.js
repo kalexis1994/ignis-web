@@ -1,6 +1,7 @@
 // WebGPU Monte Carlo Path Tracer - Renderer (Sponza GLTF + BVH)
 
 import { loadScene } from './scene-loader.js';
+import { createOIDNPipeline } from './oidn-pipeline.js';
 
 // Remote logging — sends to Python server, viewable in client.log
 function rlog(...args) {
@@ -775,6 +776,19 @@ async function init() {
     { binding: 11, resource: compSampler },
     { binding: 12, resource: { buffer: matBuf } },
   ]});
+  // OIDN composite: reads denoised diffuse from pingTex, raw specular from specNoisyTex
+  const dnBG_comp_oidn = device.createBindGroup({ layout: dnCompLayout, entries: [
+    { binding: 0, resource: { buffer: dnCompParamBuf } },
+    { binding: 1, resource: pingTex.createView() },
+    { binding: 4, resource: specNoisyTex.createView() },
+    { binding: 6, resource: albedoTex.createView() },
+    { binding: 7, resource: ptOutputTex.createView() },
+    { binding: 8, resource: matIdTex.createView() },
+    { binding: 9, resource: ndTex.createView() },
+    { binding: 10, resource: prevFrameTex.createView() },
+    { binding: 11, resource: compSampler },
+    { binding: 12, resource: { buffer: matBuf } },
+  ]});
 
   // --- Display pipeline (reads FSR final output) ---
   const dispBGLayout = device.createBindGroupLayout({
@@ -812,6 +826,49 @@ async function init() {
       { binding: 1, resource: sampler },
     ],
   });
+
+  // --- OIDN Neural Denoiser (optional) ---
+  let oidn = null;
+  if (denoiseMode === 'oidn') {
+    try {
+      oidn = await createOIDNPipeline(device, 'oidn/rt_hdr_alb_nrm.tza', width, height, hasF16, rlog);
+
+      // Input assembly bind group: textures → 9ch NCHW buffer
+      // We feed the combined beauty pass: albedo * diffuse + specular
+      const ioParams = device.createBuffer({ size: 32, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
+      device.queue.writeBuffer(ioParams, 0, new Uint32Array([width, height, oidn.padW, oidn.padH, 9, 0, 0, 0]));
+
+      oidn.inputBG = device.createBindGroup({ layout: oidn.ioBGL, entries: [
+        { binding: 0, resource: { buffer: ioParams } },
+        { binding: 1, resource: { buffer: oidn.skipInput } },     // unused for input (read)
+        { binding: 2, resource: { buffer: oidn.skipInput } },     // output: 9ch NCHW
+        { binding: 3, resource: noisyTex.createView() },          // color (noisy diffuse irradiance)
+        { binding: 4, resource: albedoTex.createView() },         // albedo
+        { binding: 5, resource: denoiseNdTex.createView() },      // normals
+        { binding: 6, resource: pingTex.createView() },           // unused for input (write texture)
+      ]});
+
+      // Output extraction bind group: 3ch NCHW buffer → texture
+      // Write to pingTex (same as SVGF output, composite reads from it)
+      const outParams = device.createBuffer({ size: 32, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
+      device.queue.writeBuffer(outParams, 0, new Uint32Array([oidn.padW, oidn.padH, width, height, 3, 0, 0, 0]));
+
+      oidn.outputBG = device.createBindGroup({ layout: oidn.ioBGL, entries: [
+        { binding: 0, resource: { buffer: outParams } },
+        { binding: 1, resource: { buffer: oidn.outputBuf } },     // input: 3ch denoised
+        { binding: 2, resource: { buffer: oidn.outputBuf } },     // unused for output (read_write)
+        { binding: 3, resource: noisyTex.createView() },          // unused placeholder
+        { binding: 4, resource: albedoTex.createView() },         // unused placeholder
+        { binding: 5, resource: denoiseNdTex.createView() },      // unused placeholder
+        { binding: 6, resource: pingTex.createView() },           // OUTPUT: denoised HDR → pingTex
+      ]});
+
+      rlog('OIDN neural denoiser initialized');
+    } catch (e) {
+      rlog('OIDN init failed: ' + e.message + '. Falling back to SVGF.');
+      oidn = null;
+    }
+  }
 
   // --- Camera (positioned inside Sponza) ---
   const scCenter = stats.sceneMin.map((v, i) => (v + stats.sceneMax[i]) / 2);
@@ -1598,7 +1655,12 @@ async function init() {
         sharcPass.end();
       }
 
-      if (denoiseMode === 'full') {
+      if (denoiseMode === 'oidn' && oidn) {
+        // Neural denoiser: replaces preblur + temporal + à-trous
+        oidn.encode(encoder, oidn.inputBG, oidn.outputBG);
+        // OIDN writes denoised color to pingTex via output_extraction
+        // Composite reads from pingTex (diffuse) — specular uses noisy directly
+      } else if (denoiseMode === 'full') {
         // Pre-blur: lightweight 3×3 bilateral → stabilizes temporal AABB + removes fireflies
         // noisy → pingTex, specNoisy → specPingTex (temporal reads from ping)
         const pbPass = encoder.beginComputePass();
@@ -1616,7 +1678,7 @@ async function init() {
         historyFrame = 1 - historyFrame;
       }
 
-      if (denoiseMode !== 'off') {
+      if (denoiseMode !== 'off' && denoiseMode !== 'oidn') {
         // Update denoise params with framesStill for motion-adaptive filtering
         for (let di = 0; di < denoisePasses; di++) {
           device.queue.writeBuffer(dnParamBufs[di], 0, new Float32Array([width, height, dnSteps[di], framesStill]));
@@ -1649,7 +1711,9 @@ async function init() {
 
       const compPass = encoder.beginComputePass();
       compPass.setPipeline(dnCompPipeline);
-      compPass.setBindGroup(0, denoiseMode !== 'off' ? dnBG_comp : dnBG_comp_noisy);
+      const compBG = (denoiseMode === 'oidn' && oidn) ? dnBG_comp_oidn
+                   : denoiseMode !== 'off' ? dnBG_comp : dnBG_comp_noisy;
+      compPass.setBindGroup(0, compBG);
       compPass.dispatchWorkgroups(Math.ceil(width/16), Math.ceil(height/16));
       compPass.end();
 
