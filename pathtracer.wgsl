@@ -560,6 +560,14 @@ fn material_needs_attenuation(mat: Material) -> bool {
   return any(att < vec3f(0.9999));
 }
 
+// Approximate GGX single-scatter directional albedo E(mu, alpha).
+// Analytical fit (Lazarov 2013 / Filament) — avoids LUT.
+fn approx_ggx_albedo(NdotX: f32, alpha: f32) -> f32 {
+  let r = alpha * vec4f(-1.0, -0.0275, -0.572, 0.022) + vec4f(1.0, 0.0425, 1.04, -0.04);
+  let a004 = min(r.x * r.x, exp2(-9.28 * NdotX)) * r.x + r.y;
+  return clamp(-1.04 * a004 + r.z, 0.0, 1.0);
+}
+
 fn ggx_d(NdotH: f32, alpha: f32) -> f32 {
   let a2 = alpha * alpha;
   let d = NdotH * NdotH * (a2 - 1.0) + 1.0;
@@ -720,8 +728,17 @@ fn eval_surface_split(surface: SurfaceEval, V: vec3f, L: vec3f) -> BRDFSplit {
     Vterm = ggx_v_anisotropic(NdotL, NdotV, BdotV, TdotV, TdotL, BdotL, at, ab);
   }
 
-  let specular = F * D * Vterm * NdotL;
-  let diffuse_weight = (1.0 - surface.metallic) * (1.0 - surface.transmission) * (1.0 - max_component(F));
+  // Kulla-Conty multi-scatter energy compensation (ported from ignis-rt)
+  // Single-scatter GGX loses energy on rough surfaces; this recovers it.
+  let Eo = approx_ggx_albedo(NdotV, alpha);
+  let Ei = approx_ggx_albedo(NdotL, alpha);
+  let ms_scale = 1.0 + (1.0 - Eo) * (1.0 - Ei) / max(Eo + Ei - Eo * Ei, 0.01);
+
+  let specular = F * D * Vterm * NdotL * ms_scale;
+  // Energy-conserving kd using directional albedo (ported from ignis-rt)
+  let avg_f0 = (F0.x + F0.y + F0.z) / 3.0;
+  let spec_albedo = Eo * avg_f0;
+  let diffuse_weight = (1.0 - spec_albedo) * (1.0 - surface.metallic) * (1.0 - surface.transmission);
   var diffuse = vec3f(diffuse_weight * INV_PI) * NdotL;
   var spec_total = specular;
 
@@ -1139,11 +1156,57 @@ fn trace_shadow(origin: vec3f, dir: vec3f, max_t: f32) -> bool {
 // ============================================================
 // Sky + Sun NEE
 // ============================================================
+
+// Procedural Preetham/Rayleigh+Mie sky — ported from ignis-rt (sky.glsl)
 fn sky_color(dir: vec3f) -> vec3f {
-  let t = max(dir.y * 0.5 + 0.5, 0.0);
-  var sky = mix(vec3f(0.2, 0.2, 0.25), SKY_COLOR, t);
-  if dot(dir, g_sun_dir) > COS_SUN_ANGLE { sky += SUN_COLOR * SUN_MULT; }
-  return sky;
+  let sun_dir = g_sun_dir;
+  let sun_alt = sun_dir.y;
+  let sun_tint = normalize(SUN_COLOR) * 1.5;
+  let amb_color = vec3f(0.5, 0.6, 0.8); // default ambient sky tint (matches ignis-rt)
+
+  // Below horizon: ground reflection falloff
+  if dir.y <= 0.0 {
+    let fog_color_raw = amb_color * 0.6 + sun_tint * 0.3 + vec3f(0.1);
+    let fog_color = mix(fog_color_raw, vec3f(dot(fog_color_raw, vec3f(0.33))), 0.3);
+    let sun_int = clamp(sun_alt * 3.0 + 0.3, 0.05, 1.0);
+    let ground_t = clamp(-dir.y * 5.0, 0.0, 1.0);
+    return mix(fog_color * sun_int, amb_color * 0.15, ground_t);
+  }
+
+  let cos_theta = max(dir.y, 0.001);
+  let cos_gamma = dot(dir, sun_dir);
+
+  // --- Rayleigh scattering ---
+  let rayleigh_phase = 0.75 * (1.0 + cos_gamma * cos_gamma);
+  var rayleigh_color = vec3f(0.30, 0.42, 0.68);
+  let sunset_shift = clamp(1.0 - sun_alt * 2.0, 0.0, 1.0);
+  rayleigh_color = mix(rayleigh_color, vec3f(0.7, 0.35, 0.15), sunset_shift * 0.6);
+  let zenith_angle = acos(cos_theta);
+  var optical_depth = 1.0 / (cos_theta + 0.15 * pow(93.885 - degrees(zenith_angle), -1.253));
+  optical_depth = min(optical_depth, 40.0);
+  let rayleigh = rayleigh_color * rayleigh_phase * exp(-optical_depth * 0.1);
+
+  // --- Mie forward scattering (Henyey-Greenstein, g=0.76) ---
+  let g = 0.76;
+  let mie_phase = 1.5 * ((1.0 - g * g) / (2.0 + g * g))
+                * (1.0 + cos_gamma * cos_gamma) / pow(1.0 + g * g - 2.0 * g * cos_gamma, 1.5);
+  let mie = sun_tint * mie_phase * 0.02;
+
+  // Combined sky radiance — amb_color tints the sky dome (matches ignis-rt)
+  let sun_int = clamp(sun_alt * 3.0 + 0.3, 0.05, 1.0);
+  var sky = (rayleigh + mie) * sun_int * amb_color * 2.0;
+
+  // --- Sun disk (sharp pow-512 + corona, matches ignis-rt sky.glsl) ---
+  sky += sun_tint * pow(max(cos_gamma, 0.0), 512.0) * 5.0;
+  sky += sun_tint * pow(max(cos_gamma, 0.0), 16.0) * 0.4;
+
+  // --- Horizon haze ---
+  let fog_color_raw = amb_color * 0.6 + sun_tint * 0.3 + vec3f(0.1);
+  let fog_color = mix(fog_color_raw, vec3f(dot(fog_color_raw, vec3f(0.33))), 0.3);
+  let haze_t = 1.0 - smoothstep(0.0, 0.25, dir.y);
+  sky = mix(sky, fog_color * sun_int, haze_t * 0.8);
+
+  return max(sky, vec3f(0.0));
 }
 
 // ============================================================
@@ -1331,9 +1394,25 @@ fn max_component(v: vec3f) -> f32 {
   return max(v.x, max(v.y, v.z));
 }
 
+// Fresnel using real dielectric equations + F82-Tint (ported from ignis-rt)
 fn fresnel_schlick_vec(F0: vec3f, F90: vec3f, cos_theta: f32) -> vec3f {
-  let f = pow(1.0 - clamp(cos_theta, 0.0, 1.0), 5.0);
-  return F0 + (F90 - F0) * f;
+  // Recover eta from F0, compute real Fresnel, remap to [F0, 1] range
+  let avg_f0 = max((F0.x + F0.y + F0.z) / 3.0, 1e-6);
+  let sqrt_f0 = sqrt(clamp(avg_f0, 0.0, 0.999));
+  let eta = (1.0 + sqrt_f0) / max(1.0 - sqrt_f0, 1e-6);
+  let f0_real = pow((eta - 1.0) / (eta + 1.0), 2.0);
+  let f_real = fresnel_dielectric(cos_theta, eta);
+  let s = clamp((f_real - f0_real) / max(1.0 - f0_real, 1e-6), 0.0, 1.0);
+
+  // Interpolate between tinted F0 and white F90 using remapped real Fresnel
+  let F = mix(F0, vec3f(1.0), s);
+
+  // F82-Tint correction for metals (darkens reflections around ~82°)
+  let B = (vec3f(1.0) - F0) * (25.0 / 24.0);
+  let t = 1.0 - cos_theta;
+  let t2 = t * t;
+  let t6 = t2 * t2 * t2;
+  return max(F - B * cos_theta * t6, vec3f(0.0));
 }
 
 fn fresnel_schlick_scalar(f0: f32, f90: f32, cos_theta: f32) -> f32 {
@@ -1846,7 +1925,7 @@ fn path_trace(primary_origin: vec3f, primary_dir: vec3f) -> PathResult {
       // cosine hemisphere PDF relative to bent: cos(dir,bent)/π
       // actual BRDF uses cos(dir,normal)/π → correction = cos(dir,normal)/cos(dir,bent)
       let pdf_correction = max(dot(dir, normal), 0.001) / max(dot(dir, bent), 0.001);
-      let diffuse_scale = max((1.0 - metallic) * (1.0 - glass_transmission) * (1.0 - max_component(dielectric_f0)), 0.0);
+      let diffuse_scale = max((1.0 - metallic) * (1.0 - glass_transmission), 0.0);
       if bounce == 0u && !went_through_glass {
         // True primary diffuse surface: store demodulated irradiance for the denoiser.
         throughput *= vec3f(diffuse_scale * pdf_correction);
@@ -1862,7 +1941,7 @@ fn path_trace(primary_origin: vec3f, primary_dir: vec3f) -> PathResult {
     // Perceptual √ Russian roulette (ignis-rt / NRD guideline)
     // sqrt prevents dim paths from surviving with huge weight → fewer fireflies
     // Min 0.05 = max 20× boost (NRD recommendation)
-    if bounce > 0u {
+    if bounce >= 2u {
       let p = clamp(sqrt(max(throughput.x, max(throughput.y, throughput.z))), 0.05, 0.9);
       if rand() > p { break; }
       throughput /= p;
