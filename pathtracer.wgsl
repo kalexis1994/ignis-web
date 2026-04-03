@@ -115,7 +115,7 @@ const BIAS: f32 = 0.0002;     // shadow/bounce ray offset
 // MAX_BOUNCES now comes from uniforms.max_bounces
 
 const SUN_COLOR: vec3f = vec3f(8.0, 7.2, 5.5);
-const SKY_COLOR: vec3f = vec3f(0.8, 0.9, 1.2);
+const SKY_COLOR: vec3f = vec3f(3.0, 3.5, 5.5);
 const SUN_ANGLE: f32 = 0.03;
 const COS_SUN_ANGLE: f32 = 0.99955;
 const SUN_SOLID_ANGLE: f32 = 0.002827;

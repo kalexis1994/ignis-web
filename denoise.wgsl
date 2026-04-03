@@ -591,7 +591,13 @@ fn composite(@builtin(global_invocation_id) gid: vec3u) {
   let albedo = textureLoad(albedo_tex, px, 0).rgb;
 
   // Remodulate: albedo × diffuse_irradiance + specular_radiance
-  var hdr = max(albedo, vec3f(0.02)) * denoised_diff + denoised_spec;
+  // When step_size < 0 (OIDN mode), diffuse IS the full denoised beauty pass — skip remodulation
+  var hdr: vec3f;
+  if params.step_size < 0.0 {
+    hdr = denoised_diff; // OIDN: already combined beauty pass
+  } else {
+    hdr = max(albedo, vec3f(0.02)) * denoised_diff + denoised_spec;
+  }
 
   // 1. Exposure (pre-tonemap)
   hdr *= params.exposure;

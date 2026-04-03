@@ -141,12 +141,6 @@ fn output_extraction(
   // Inverse HDR transfer: Reinhard inverse
   let beauty = vec3f(r, g, b) / max(1.0 - vec3f(r, g, b), vec3f(1e-6));
 
-  // Demodulate: composite expects diffuse irradiance, it will remodulate with albedo.
-  // beauty = albedo * irradiance + specular, but we can't perfectly separate them.
-  // Approximation: divide by albedo to get irradiance-like signal.
-  // The composite will multiply by albedo again → reconstructs beauty approximately.
-  let albedo = max(textureLoad(albedo_tex, vec2i(gid.xy), 0).rgb, vec3f(0.02));
-  let irradiance = beauty / albedo;
-
-  textureStore(out_tex, vec2i(gid.xy), vec4f(irradiance, 1.0));
+  // Write full denoised beauty pass directly — composite handles OIDN mode without remodulation
+  textureStore(out_tex, vec2i(gid.xy), vec4f(beauty, 1.0));
 }

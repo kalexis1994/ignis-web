@@ -1701,7 +1701,9 @@ async function init() {
       const cp = new ArrayBuffer(96);
       const cpf = new Float32Array(cp);
       const cpu = new Uint32Array(cp);
-      cpf[0] = width; cpf[1] = height; cpf[2] = 0; cpf[3] = 0;
+      cpf[0] = width; cpf[1] = height;
+      cpf[2] = (denoiseMode === 'oidn' && oidn) ? -1.0 : 0.0; // negative = OIDN mode (skip remodulation)
+      cpf[3] = 0;
       cpu[4] = settings.tonemapMode; cpf[5] = settings.exposure;
       cpf[6] = settings.saturation; cpf[7] = settings.contrast;
       // Legacy camera fields remain populated to preserve uniform layout.
