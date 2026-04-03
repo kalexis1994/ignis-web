@@ -185,6 +185,125 @@ fn atrous(@builtin(global_invocation_id) gid: vec3u) {
   textureStore(out_spec, px, vec4f(s_sum / max(f32(s_wsum), 1e-6), textureLoad(in_spec, px, 0).a));
 }
 
+// === TILED ATROUS (step=1 only): shared memory reduces 99 textureLoad → ~5 per thread ===
+// 16x16 workgroup + ±2 halo = 20x20 tile cached in workgroup memory
+const TILE: i32 = 16;
+const HALO: i32 = 2;
+const PADDED: i32 = 20; // TILE + 2*HALO
+
+var<workgroup> sm_nd: array<vec4f, 400>;   // normal.xyz + depth
+var<workgroup> sm_diff: array<vec4f, 400>; // diffuse.rgb + variance.a
+var<workgroup> sm_spec: array<vec4f, 400>; // specular.rgb + hit_dist.a
+
+@compute @workgroup_size(16, 16)
+fn atrous_sm(@builtin(global_invocation_id) gid: vec3u,
+             @builtin(local_invocation_id) lid: vec3u,
+             @builtin(workgroup_id) wid: vec3u) {
+  let sz = vec2i(params.resolution);
+  let tile_origin = vec2i(wid.xy) * TILE - HALO;
+
+  // Cooperative tile load: 400 texels / 256 threads ≈ 1.6 loads per thread
+  let flat_id = lid.y * 16u + lid.x;
+  for (var t = flat_id; t < 400u; t += 256u) {
+    let ty = i32(t / 20u);
+    let tx = i32(t % 20u);
+    let coord = clamp(tile_origin + vec2i(tx, ty), vec2i(0), sz - 1);
+    sm_nd[t] = textureLoad(gbuf_nd, coord, 0);
+    sm_diff[t] = textureLoad(in_color, coord, 0);
+    sm_spec[t] = textureLoad(in_spec, coord, 0);
+  }
+  workgroupBarrier();
+
+  let px = vec2i(gid.xy);
+  if px.x >= sz.x || px.y >= sz.y { return; }
+
+  let lx = i32(lid.x);
+  let ly = i32(lid.y);
+  let ci = u32((ly + HALO) * PADDED + (lx + HALO));
+
+  let cnd = sm_nd[ci];
+  let cn = cnd.xyz;
+  let cz = cnd.w;
+  let diff_sample = sm_diff[ci];
+  let cc = diff_sample.rgb;
+  let cl = luma(cc);
+  let spec_sample = sm_spec[ci];
+  let cs = spec_sample.rgb;
+  let csl = luma(cs);
+  let hit_dist = spec_sample.a;
+  let roughness = textureLoad(albedo_tex, px, 0).a; // albedo: 1 read, not cached
+
+  let hit_factor = mix(0.5, 1.0, hit_dist);
+
+  // Depth gradient from tile
+  let zr_i = u32((ly + HALO) * PADDED + min(lx + HALO + 1, PADDED - 1));
+  let zu_i = u32(min(ly + HALO + 1, PADDED - 1) * PADDED + (lx + HALO));
+  let gz = max(max(abs(sm_nd[zr_i].w - cz), abs(sm_nd[zu_i].w - cz)), cz * 0.002);
+
+  // Variance: 3x3 from tile (step=1, always first pass)
+  var d_m1 = 0.0; var d_m2 = 0.0;
+  var s_m1 = 0.0; var s_m2 = 0.0;
+  for (var vy = -1; vy <= 1; vy++) {
+    for (var vx = -1; vx <= 1; vx++) {
+      let vi = u32((ly + HALO + vy) * PADDED + (lx + HALO + vx));
+      let vl = luma(sm_diff[vi].rgb);
+      d_m1 += vl; d_m2 += vl * vl;
+      let vsl = luma(sm_spec[vi].rgb);
+      s_m1 += vsl; s_m2 += vsl * vsl;
+    }
+  }
+  d_m1 /= 9.0; d_m2 /= 9.0;
+  let d_var = max(d_m2 - d_m1 * d_m1, 0.0);
+  let d_std = sqrt(d_var);
+  s_m1 /= 9.0; s_m2 /= 9.0;
+  let s_std = sqrt(max(s_m2 - s_m1 * s_m1, 0.0));
+
+  let diff_sigma_scale = 4.0;
+  let spec_sigma_scale = mix(4.0 * 0.3, 4.0, roughness);
+
+  // Filter: 5x5 from tile (step=1, offsets are ±1 pixels)
+  var d_sum = vec3f(0.0); var d_wsum: f16 = 0.0h;
+  var s_sum = vec3f(0.0); var s_wsum: f16 = 0.0h;
+  var d_var_filtered = 0.0; var d_var_wsum: f16 = 0.0h;
+
+  for (var dy = -2; dy <= 2; dy++) {
+    for (var dx = -2; dx <= 2; dx++) {
+      let ki = u32((dy + 2) * 5 + (dx + 2));
+      let si = u32((ly + HALO + dy) * PADDED + (lx + HALO + dx));
+      let snd = sm_nd[si];
+      let s_diff = sm_diff[si];
+      let sd = s_diff.rgb;
+      let ss = sm_spec[si].rgb;
+
+      let wn = f16(pow(max(dot(cn, snd.xyz), 0.0), 128.0));
+      let dz = abs(cz - snd.w);
+      let wz = f16(exp(-dz / (gz + 1e-3)));
+
+      let d_dl = abs(cl - luma(sd));
+      let d_sigma = diff_sigma_scale * d_std * hit_factor + 0.01;
+      let d_wl = f16(exp(-d_dl / max(d_sigma, 0.01)));
+      let d_w = f16(KW[ki]) * wn * wz * d_wl;
+      d_sum += sd * f32(d_w);
+      d_wsum += d_w;
+
+      let geom_w = f16(KW[ki]) * wn * wz;
+      d_var_filtered += s_diff.a * f32(geom_w);
+      d_var_wsum += geom_w;
+
+      let s_dl = abs(csl - luma(ss));
+      let s_sigma = spec_sigma_scale * s_std * hit_factor + 0.01;
+      let s_wl = f16(exp(-s_dl / max(s_sigma, 0.01)));
+      let s_w = f16(KW[ki]) * wn * wz * s_wl;
+      s_sum += ss * f32(s_w);
+      s_wsum += s_w;
+    }
+  }
+
+  let out_var = d_var_filtered / max(f32(d_var_wsum), 1e-6);
+  textureStore(out_color, px, vec4f(d_sum / max(f32(d_wsum), 1e-6), out_var));
+  textureStore(out_spec, px, vec4f(s_sum / max(f32(s_wsum), 1e-6), sm_spec[ci].a));
+}
+
 // === PRE-BLUR: anti-firefly percentile clamp + lightweight 3x3 bilateral ===
 // Stabilizes temporal AABB and eliminates bright speckles adaptively.
 @compute @workgroup_size(16, 16)

@@ -62,6 +62,7 @@ async function init() {
       maxStorageBufferBindingSize: adapter.limits.maxStorageBufferBindingSize,
       maxBufferSize: adapter.limits.maxBufferSize,
       maxStorageBuffersPerShaderStage: requiredStorageBuffersPerStage,
+      maxComputeWorkgroupStorageSize: Math.min(adapter.limits.maxComputeWorkgroupStorageSize, 32768),
     }
   });
   device.onuncapturederror = (e) => rlog('GPU_ERROR: ' + e.error.message);
@@ -668,6 +669,11 @@ async function init() {
   const dnAtrousPipeline = device.createComputePipeline({
     layout: device.createPipelineLayout({ bindGroupLayouts: [dnAtrousLayout] }),
     compute: { module: dnModule, entryPoint: 'atrous' },
+  });
+  // Shared-memory tiled atrous for step=1 (first pass): 99 textureLoad → ~5 per thread
+  const dnAtrousSMPipeline = device.createComputePipeline({
+    layout: device.createPipelineLayout({ bindGroupLayouts: [dnAtrousLayout] }),
+    compute: { module: dnModule, entryPoint: 'atrous_sm' },
   });
   // Pre-blur pipeline: same layout as à-trous, lightweight 3×3 bilateral
   const preblurPipeline = device.createComputePipeline({
@@ -1614,7 +1620,7 @@ async function init() {
         for (let di = 0; di < denoisePasses; di++) {
           const bg = (di === 0 && denoiseMode !== 'full') ? dnBG_noisy_first : dnBGs[di];
           const dp = encoder.beginComputePass();
-          dp.setPipeline(dnAtrousPipeline);
+          dp.setPipeline(di === 0 ? dnAtrousSMPipeline : dnAtrousPipeline);
           dp.setBindGroup(0, bg);
           dp.dispatchWorkgroups(Math.ceil(width/16), Math.ceil(height/16));
           dp.end();
