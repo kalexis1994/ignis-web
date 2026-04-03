@@ -131,17 +131,17 @@ fn accumulate_signal(
   let variance = max(m2 - m1 * m1, vec3f(0.0));
   let stddev = sqrt(variance);
 
-  // Adaptive AABB
-  let aabb_scale = mix(4.0, 8.0, motion);
-  let aabb_expand = max(stddev * aabb_scale, (mx - mn) * mix(0.25, 0.5, motion));
+  // Adaptive AABB: tight for disoccluded, wider for stable (accumulate more)
+  let aabb_scale = mix(3.0, 6.0, motion);
+  let aabb_expand = max(stddev * aabb_scale, (mx - mn) * mix(0.2, 0.4, motion));
   mn -= aabb_expand;
   mx += aabb_expand;
 
   let clipped = clip_aabb(mn, mx, history);
 
-  // Adaptive alpha
+  // Alpha: very low when stable (max accumulation), higher when noisy/new
   let var_lum = dot(stddev, vec3f(0.2126, 0.7152, 0.0722));
-  let motion_alpha = mix(0.08, base_alpha, motion);
+  let motion_alpha = mix(0.08, base_alpha, motion); // 0.08 for new, base_alpha for stable
   let alpha = max(motion_alpha * 0.1, motion_alpha / (1.0 + var_lum * 10.0));
 
   return mix(clipped, current, alpha);

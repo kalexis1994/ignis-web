@@ -151,8 +151,8 @@ fn atrous(@builtin(global_invocation_id) gid: vec3u) {
       let sd = s_diff.rgb;
       let ss = textureLoad(in_spec, sp, 0).rgb;
 
-      // Normal edge-stopping (SVGF, Schied 2017, eq.4, σ_n=128)
-      let wn = f16(pow(max(dot(cn, snd.xyz), 0.0), 128.0));
+      // Normal edge-stopping: 64 (relaxed from 128 to reduce aliased edges)
+      let wn = f16(pow(max(dot(cn, snd.xyz), 0.0), 64.0));
       let dz = abs(cz - snd.w);
       let wz = f16(exp(-dz / (gz * f32(step) + 1e-3)));
 
@@ -275,7 +275,7 @@ fn atrous_sm(@builtin(global_invocation_id) gid: vec3u,
       let sd = s_diff.rgb;
       let ss = sm_spec[si].rgb;
 
-      let wn = f16(pow(max(dot(cn, snd.xyz), 0.0), 128.0));
+      let wn = f16(pow(max(dot(cn, snd.xyz), 0.0), 64.0));
       let dz = abs(cz - snd.w);
       let wz = f16(exp(-dz / (gz + 1e-3)));
 
@@ -642,4 +642,27 @@ fn composite(@builtin(global_invocation_id) gid: vec3u) {
   c += (dither_hash - 0.5h) / 255.0h;
 
   textureStore(composite_out, px, vec4f(vec3f(c), 1.0));
+}
+
+// ============================================================
+// COPY TO HISTORY: merge denoised .rgb with temporal .a (history_len/cam_z)
+// Uses same layout as à-trous (bindings 0-6):
+//   in_color(1) = denoised diffuse, out_color(2) = history diffuse
+//   gbuf_nd(3) = temporal hdrTex (reused: .a = history_len)
+//   in_spec(4) = denoised specular, out_spec(5) = history specular
+//   albedo(6) = temporal specHdrTex (reused: .a = cam_z)
+// ============================================================
+@compute @workgroup_size(16, 16)
+fn copy_to_history(@builtin(global_invocation_id) gid: vec3u) {
+  let px = vec2i(gid.xy);
+  let sz = vec2i(params.resolution);
+  if px.x >= sz.x || px.y >= sz.y { return; }
+
+  let denoised_diff = textureLoad(in_color, px, 0).rgb;
+  let history_len = textureLoad(gbuf_nd, px, 0).a;
+  textureStore(out_color, px, vec4f(denoised_diff, history_len));
+
+  let denoised_spec = textureLoad(in_spec, px, 0).rgb;
+  let cam_z = textureLoad(albedo_tex, px, 0).a;
+  textureStore(out_spec, px, vec4f(denoised_spec, cam_z));
 }

@@ -1974,7 +1974,10 @@ fn main(@builtin(global_invocation_id) gid: vec3u) {
     R2_A1 * f32(pixel.x) + R2_A2 * f32(pixel.y),
     R2_A2 * f32(pixel.x) + R2_A1 * f32(pixel.y)
   ));
-  let temporal_offset = fract(vec2f(R2_A1 * frame_f, R2_A2 * frame_f));
+  // Per-pixel temporal phase: each pixel gets a unique temporal offset
+  // Prevents coherent panning of noise pattern across the image
+  let pixel_hash = f32((pixel.x * 12979u + pixel.y * 48271u) & 0xFFFFu) / 65535.0;
+  let temporal_offset = fract(vec2f(R2_A1 * (frame_f + pixel_hash), R2_A2 * (frame_f + pixel_hash)));
   g_r2_offset = fract(spatial_offset + temporal_offset);
   // Alpha dither: IGN spatial (Jimenez 2014) + per-pixel phased golden ratio temporal
   // IGN provides blue-noise-like spatial distribution

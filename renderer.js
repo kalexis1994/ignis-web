@@ -262,7 +262,7 @@ async function init() {
   });
 
   // --- Internal textures ---
-  const F16 = GPUTextureUsage.STORAGE_BINDING | GPUTextureUsage.TEXTURE_BINDING;
+  const F16 = GPUTextureUsage.STORAGE_BINDING | GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_SRC;
   const F16C = F16 | GPUTextureUsage.COPY_SRC | GPUTextureUsage.COPY_DST; // copyable
   const F16R = F16 | GPUTextureUsage.RENDER_ATTACHMENT; // rasterization target
   const noisyTex = device.createTexture({ size:[width,height], format:'rgba16float', usage:F16 }); // irradiance
@@ -664,7 +664,7 @@ async function init() {
 
   // --- Denoiser pipelines ---
   // 3 separate param buffers for the 3 à-trous steps (avoid writeBuffer during encoding)
-  const denoisePasses = gpuProfile.denoisePasses || 5;
+  const denoisePasses = gpuProfile.denoisePasses || 7;
   const dnSteps = [1, 2, 4, 8, 16]; // up to 5 passes
   const dnParamBufs = dnSteps.map((s, i) => {
     const buf = device.createBuffer({ size: 96, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
@@ -688,6 +688,11 @@ async function init() {
   const dnAtrousPipeline = device.createComputePipeline({
     layout: device.createPipelineLayout({ bindGroupLayouts: [dnAtrousLayout] }),
     compute: { module: dnModule, entryPoint: 'atrous' },
+  });
+  // Copy denoised RGB to history, preserving temporal alpha (history_len/cam_z)
+  const copyToHistoryPipeline = device.createComputePipeline({
+    layout: device.createPipelineLayout({ bindGroupLayouts: [dnAtrousLayout] }),
+    compute: { module: dnModule, entryPoint: 'copy_to_history' },
   });
   // Shared-memory tiled atrous for step=1 (first pass): 99 textureLoad → ~5 per thread
   const dnAtrousSMPipeline = device.createComputePipeline({
@@ -773,6 +778,31 @@ async function init() {
     { binding: 6, resource: albedoTex.createView() },
   ]});
   const dnFinalInPing = (denoisePasses % 2 === 1); // 3 passes → ping, 4 → pong, 5 → ping
+
+  // Copy-to-history bind groups: merge denoised .rgb + temporal .a → history
+  // BG_A: reads denoised final, writes to historyB (which temporal reads next as historyFrame=1)
+  // BG_B: writes to historyA
+  const denoisedDiff = dnFinalInPing ? pingTex : pongTex;
+  const denoisedSpec = dnFinalInPing ? specPingTex : specPongTex;
+  const copyToHistBG_A = device.createBindGroup({ layout: dnAtrousLayout, entries: [
+    { binding: 0, resource: { buffer: dnParamBufs[0] } },
+    { binding: 1, resource: denoisedDiff.createView() },        // denoised diffuse .rgb
+    { binding: 2, resource: historyB.createView() },            // write → historyB
+    { binding: 3, resource: hdrTex.createView() },              // temporal output .a = history_len
+    { binding: 4, resource: denoisedSpec.createView() },        // denoised specular .rgb
+    { binding: 5, resource: specHistoryB.createView() },        // write → specHistoryB
+    { binding: 6, resource: specHdrTex.createView() },          // temporal spec output .a = cam_z
+  ]});
+  const copyToHistBG_B = device.createBindGroup({ layout: dnAtrousLayout, entries: [
+    { binding: 0, resource: { buffer: dnParamBufs[0] } },
+    { binding: 1, resource: denoisedDiff.createView() },
+    { binding: 2, resource: historyA.createView() },            // write → historyA
+    { binding: 3, resource: hdrTex.createView() },
+    { binding: 4, resource: denoisedSpec.createView() },
+    { binding: 5, resource: specHistoryA.createView() },        // write → specHistoryA
+    { binding: 6, resource: specHdrTex.createView() },
+  ]});
+
   // Composite: denoised signals + glass composition
   const compSampler = device.createSampler({ magFilter: 'linear', minFilter: 'linear' });
   const dnBG_comp = device.createBindGroup({ layout: dnCompLayout, entries: [
@@ -1556,7 +1586,7 @@ async function init() {
       (fw[0]*p[0]+fw[1]*p[1]+fw[2]*p[2]),
       1,
     ]);
-    // Perspective projection
+    // Perspective projection (no jitter — requires reprojection compensation to work)
     const fov = cam.fov * Math.PI / 180;
     const asp = w / h;
     const near = 0.01, far = 200.0;
@@ -1801,6 +1831,14 @@ async function init() {
           dp.dispatchWorkgroups(Math.ceil(width/16), Math.ceil(height/16));
           dp.end();
         }
+
+        // Feed denoised RGB back to history, preserving temporal alpha (history_len/cam_z)
+        // Uses copy_to_history shader: merges denoised .rgb + temporal .a
+        const cthPass = encoder.beginComputePass();
+        cthPass.setPipeline(copyToHistoryPipeline);
+        cthPass.setBindGroup(0, historyFrame === 0 ? copyToHistBG_A : copyToHistBG_B);
+        cthPass.dispatchWorkgroups(Math.ceil(width/16), Math.ceil(height/16));
+        cthPass.end();
       }
 
       // Composite (tonemap → LDR)
