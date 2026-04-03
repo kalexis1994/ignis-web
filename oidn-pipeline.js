@@ -260,7 +260,7 @@ export async function createOIDNPipeline(device, weightsUrl, width, height, hasF
     ]});
     dispatches.push({
       pipeline: convPipeline, bindGroup: bg,
-      dispatch: [Math.ceil(w / 16), Math.ceil(h / 16), Math.ceil(c_out / 4)],
+      dispatch: [Math.ceil(w / 16), Math.ceil(h / 16), Math.ceil(c_out / 8)],
       label: layerName,
     });
   }
