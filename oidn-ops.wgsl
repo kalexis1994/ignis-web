@@ -148,3 +148,38 @@ fn output_extraction(
   // Write full denoised beauty pass — composite handles OIDN mode without remodulation
   textureStore(out_tex, vec2i(gid.xy), vec4f(beauty, 1.0));
 }
+
+// ============================================================
+// Temporal blend: mix current denoised with previous for stability
+// Reads current from one texture, history from another, writes blended
+// Dispatch: (ceil(width/16), ceil(height/16), 1)
+// Uses params.channels as blend alpha × 1000 (integer encoding)
+// ============================================================
+@group(0) @binding(8) var current_tex: texture_2d<f32>;
+@group(0) @binding(9) var history_tex: texture_2d<f32>;
+@group(0) @binding(10) var blend_out: texture_storage_2d<rgba16float, write>;
+
+@compute @workgroup_size(16, 16)
+fn temporal_blend(
+  @builtin(global_invocation_id) gid: vec3u
+) {
+  let W = params.in_width;
+  let H = params.in_height;
+  if gid.x >= W || gid.y >= H { return; }
+  let px = vec2i(gid.xy);
+
+  let current = textureLoad(current_tex, px, 0).rgb;
+  let history = textureLoad(history_tex, px, 0).rgb;
+
+  // Alpha from params.channels (encoded as alpha * 1000)
+  let alpha = f32(params.channels) / 1000.0;
+
+  // Clamp history to prevent ghosting: reject if too different from current
+  let diff = abs(current - history);
+  let max_diff = max(diff.r, max(diff.g, diff.b));
+  let reject = max_diff > 2.0; // reject history if color difference is too large
+  let effective_alpha = select(alpha, 1.0, reject);
+
+  let blended = mix(history, current, effective_alpha);
+  textureStore(blend_out, px, vec4f(blended, 1.0));
+}

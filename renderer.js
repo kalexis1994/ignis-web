@@ -776,10 +776,23 @@ async function init() {
     { binding: 11, resource: compSampler },
     { binding: 12, resource: { buffer: matBuf } },
   ]});
-  // OIDN composite: reads denoised diffuse from pingTex, raw specular from specNoisyTex
-  const dnBG_comp_oidn = device.createBindGroup({ layout: dnCompLayout, entries: [
+  // OIDN composite: reads blended denoised from history, alternates A/B
+  const dnBG_comp_oidn_A = device.createBindGroup({ layout: dnCompLayout, entries: [
     { binding: 0, resource: { buffer: dnCompParamBuf } },
-    { binding: 1, resource: pingTex.createView() },
+    { binding: 1, resource: historyB.createView() },  // blend wrote to B when reading A
+    { binding: 4, resource: specNoisyTex.createView() },
+    { binding: 6, resource: albedoTex.createView() },
+    { binding: 7, resource: ptOutputTex.createView() },
+    { binding: 8, resource: matIdTex.createView() },
+    { binding: 9, resource: ndTex.createView() },
+    { binding: 10, resource: prevFrameTex.createView() },
+    { binding: 11, resource: compSampler },
+    { binding: 12, resource: { buffer: matBuf } },
+  ]});
+
+  const dnBG_comp_oidn_B = device.createBindGroup({ layout: dnCompLayout, entries: [
+    { binding: 0, resource: { buffer: dnCompParamBuf } },
+    { binding: 1, resource: historyA.createView() },  // blend wrote to A when reading B
     { binding: 4, resource: specNoisyTex.createView() },
     { binding: 6, resource: albedoTex.createView() },
     { binding: 7, resource: ptOutputTex.createView() },
@@ -867,6 +880,45 @@ async function init() {
         { binding: 6, resource: pingTex.createView() },           // OUTPUT: denoised HDR → pingTex
         { binding: 7, resource: specNoisyTex.createView() },      // unused placeholder
       ]});
+
+      // Temporal blend: stabilize OIDN output by blending with previous frame
+      const blendBGL = device.createBindGroupLayout({ entries: [
+        { binding: 0, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'uniform' } },
+        { binding: 1, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } },
+        { binding: 2, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } },
+        { binding: 8, visibility: GPUShaderStage.COMPUTE, texture: { sampleType: 'float' } },
+        { binding: 9, visibility: GPUShaderStage.COMPUTE, texture: { sampleType: 'float' } },
+        { binding: 10, visibility: GPUShaderStage.COMPUTE, storageTexture: { access: 'write-only', format: 'rgba16float' } },
+      ]});
+      const blendPipeline = device.createComputePipeline({
+        layout: device.createPipelineLayout({ bindGroupLayouts: [blendBGL] }),
+        compute: { module: device.createShaderModule({ code: await fetch(`oidn-ops.wgsl?v=${Date.now()}`).then(r=>r.text()), strictMath: false }), entryPoint: 'temporal_blend' },
+      });
+      const blendParams = device.createBuffer({ size: 32, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
+      const dummyReadBuf = device.createBuffer({ size: 16, usage: GPUBufferUsage.STORAGE });
+      const dummyWriteBuf = device.createBuffer({ size: 16, usage: GPUBufferUsage.STORAGE });
+
+      // Ping-pong: frame 0 reads historyA, writes historyB. Frame 1: reverse.
+      // pingTex = current OIDN output, history = previous blended
+      oidn.blendBG_A = device.createBindGroup({ layout: blendBGL, entries: [
+        { binding: 0, resource: { buffer: blendParams } },
+        { binding: 1, resource: { buffer: dummyReadBuf } },
+        { binding: 2, resource: { buffer: dummyWriteBuf } },
+        { binding: 8, resource: pingTex.createView() },       // current denoised
+        { binding: 9, resource: historyA.createView() },      // previous blended
+        { binding: 10, resource: historyB.createView() },     // output blended
+      ]});
+      oidn.blendBG_B = device.createBindGroup({ layout: blendBGL, entries: [
+        { binding: 0, resource: { buffer: blendParams } },
+        { binding: 1, resource: { buffer: dummyReadBuf } },
+        { binding: 2, resource: { buffer: dummyWriteBuf } },
+        { binding: 8, resource: pingTex.createView() },
+        { binding: 9, resource: historyB.createView() },
+        { binding: 10, resource: historyA.createView() },
+      ]});
+      oidn.blendPipeline = blendPipeline;
+      oidn.blendParams = blendParams;
+      oidn.blendFrame = 0;
 
       rlog('OIDN neural denoiser initialized');
     } catch (e) {
@@ -1663,8 +1715,19 @@ async function init() {
       if (denoiseMode.startsWith('oidn') && oidn) {
         // Neural denoiser: replaces preblur + temporal + à-trous
         oidn.encode(encoder, oidn.inputBG, oidn.outputBG);
-        // OIDN writes denoised color to pingTex via output_extraction
-        // Composite reads from pingTex (diffuse) — specular uses noisy directly
+
+        // Temporal blend: mix current denoised (pingTex) with previous (history)
+        // Alpha: high when moving (less history), low when still (more stable)
+        const blendAlpha = framesStill < 2 ? 1.0 : Math.max(0.15, 1.0 / (framesStill * 0.5 + 1));
+        device.queue.writeBuffer(oidn.blendParams, 0, new Uint32Array([
+          width, height, 0, 0, Math.round(blendAlpha * 1000), 0, 0, 0
+        ]));
+        const blendPass = encoder.beginComputePass();
+        blendPass.setPipeline(oidn.blendPipeline);
+        blendPass.setBindGroup(0, oidn.blendFrame === 0 ? oidn.blendBG_A : oidn.blendBG_B);
+        blendPass.dispatchWorkgroups(Math.ceil(width / 16), Math.ceil(height / 16));
+        blendPass.end();
+        oidn.blendFrame = 1 - oidn.blendFrame;
       } else if (denoiseMode === 'full') {
         // Pre-blur: lightweight 3×3 bilateral → stabilizes temporal AABB + removes fireflies
         // noisy → pingTex, specNoisy → specPingTex (temporal reads from ping)
@@ -1718,7 +1781,8 @@ async function init() {
 
       const compPass = encoder.beginComputePass();
       compPass.setPipeline(dnCompPipeline);
-      const compBG = (denoiseMode.startsWith('oidn') && oidn) ? dnBG_comp_oidn
+      const compBG = (denoiseMode.startsWith('oidn') && oidn)
+                   ? (oidn.blendFrame === 0 ? dnBG_comp_oidn_A : dnBG_comp_oidn_B)
                    : denoiseMode !== 'off' ? dnBG_comp : dnBG_comp_noisy;
       compPass.setBindGroup(0, compBG);
       compPass.dispatchWorkgroups(Math.ceil(width/16), Math.ceil(height/16));
