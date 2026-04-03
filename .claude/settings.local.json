@@ -71,7 +71,10 @@
       "Bash(curl -sL \"https://raw.githubusercontent.com/RenderKit/oidn/master/core/tensor_layout.h\")",
       "Bash(curl -sL \"https://raw.githubusercontent.com/RenderKit/oidn/master/core/buffer.h\")",
       "Bash(curl -sL \"https://raw.githubusercontent.com/RenderKit/oidn/master/common/common.cpp\")",
-      "Bash(curl:*)"
+      "Bash(curl:*)",
+      "WebFetch(domain:deepwiki.com)",
+      "WebFetch(domain:rust-gpu.github.io)",
+      "WebFetch(domain:openreview.net)"
     ]
   }
 }

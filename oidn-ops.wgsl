@@ -102,8 +102,7 @@ fn input_assembly(
   let beauty = max(albedo, vec3f(0.02)) * diffuse + specular;
 
   // LDR model: expects sRGB gamma-encoded [0,1] (like a final render)
-  let exposed = beauty * 0.5;                        // rough exposure
-  let tonemapped = exposed / (exposed + 1.0);        // Reinhard tonemap → [0,1)
+  let tonemapped = beauty / (beauty + 1.0);          // Reinhard tonemap → [0,1)
   let tf = pow(max(tonemapped, vec3f(0.0)), vec3f(1.0 / 2.2)); // sRGB gamma
 
   // Write 9 channels NCHW: color(3) + albedo(3) + normal(3)
