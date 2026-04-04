@@ -882,8 +882,8 @@ fn sample_sun_nee_split(pos: vec3f, normal: vec3f, V: vec3f, td: vec4u, mat: Mat
   let surface = build_surface_eval(td, mat, normal, baseColor, roughness, metallic, transmission, uv0, uv1, uv2, uv3);
   var result_split = BRDFSplit(vec3f(0.0), vec3f(0.0));
 
-  // Sun NEE: BVH shadow rays (shadow map disabled pending fix)
-  let sun = sun_nee_common(origin, pos, normal, V, surface, false);
+  // Sun NEE: shadow map for primary hits (fast raster lookup, no BVH)
+  let sun = sun_nee_common(origin, pos, normal, V, surface, true);
   result_split.diffuse += sun.diffuse;
   result_split.specular += sun.specular;
 
