@@ -115,7 +115,27 @@ const TWO_PI: f32 = 6.28318530718;
 const INV_PI: f32 = 0.31830988618;
 const INF: f32 = 1e30;
 const T_MIN: f32 = 0.00001;    // minimum ray t (intersection test)
-const BIAS: f32 = 0.0002;     // shadow/bounce ray offset
+
+// Robust ray origin offset (Wächter & Binder 2019, used in Cycles/PBRT)
+// Manipulates float bits to push origin along geometric normal — scales with distance from origin
+fn ray_offset(P: vec3f, Ng: vec3f) -> vec3f {
+  let int_scale = 256.0;
+  let oi = vec3i(vec3f(int_scale) * Ng);
+  // Bit-level offset: add integer offset to float mantissa bits
+  let pi = vec3f(
+    bitcast<f32>(bitcast<i32>(P.x) + select(oi.x, -oi.x, P.x < 0.0)),
+    bitcast<f32>(bitcast<i32>(P.y) + select(oi.y, -oi.y, P.y < 0.0)),
+    bitcast<f32>(bitcast<i32>(P.z) + select(oi.z, -oi.z, P.z < 0.0)),
+  );
+  // For points near origin, use linear fallback
+  let origin_threshold = 1.0 / 32.0;
+  let float_scale = 1.0 / 65536.0;
+  return vec3f(
+    select(pi.x, P.x + float_scale * Ng.x, abs(P.x) < origin_threshold),
+    select(pi.y, P.y + float_scale * Ng.y, abs(P.y) < origin_threshold),
+    select(pi.z, P.z + float_scale * Ng.z, abs(P.z) < origin_threshold),
+  );
+}
 // MAX_BOUNCES now comes from uniforms.max_bounces
 
 const GI_INTENSITY: f32 = 1.5; // multiplier for indirect lighting (surface bounces + sky)
@@ -868,7 +888,7 @@ fn sun_nee_common(origin: vec3f, pos: vec3f, normal: vec3f, V: vec3f, surface: S
 }
 
 fn sample_sun_nee_split(pos: vec3f, normal: vec3f, V: vec3f, td: vec4u, mat: Material, uv0: vec2f, uv1: vec2f, uv2: vec2f, uv3: vec2f, baseColor: vec3f, roughness: f32, metallic: f32, transmission: f32) -> BRDFSplit {
-  let origin = pos + normal * BIAS;
+  let origin = ray_offset(pos, normal);
   let surface = build_surface_eval(td, mat, normal, baseColor, roughness, metallic, transmission, uv0, uv1, uv2, uv3);
   var result_split = BRDFSplit(vec3f(0.0), vec3f(0.0));
 
@@ -957,7 +977,7 @@ fn sample_sun_nee(pos: vec3f, normal: vec3f, V: vec3f, td: vec4u, mat: Material,
 }
 
 fn sample_scene_nee_basic(pos: vec3f, normal: vec3f, V: vec3f, surface: SurfaceEval) -> vec3f {
-  let origin = pos + normal * BIAS;
+  let origin = ray_offset(pos, normal);
   var result_split = BRDFSplit(vec3f(0.0), vec3f(0.0));
 
   // Sun NEE: BVH shadow rays for indirect bounces
@@ -1922,7 +1942,7 @@ fn path_trace(primary_origin: vec3f, primary_dir: vec3f) -> PathResult {
           dir = reflect(-V, H_thin);
           if dot(normal, dir) <= 0.0 { break; }
           throughput *= vec3f(1.0) / max(thin_reflect_prob, 0.01);
-          origin = hit_pos + geo_normal * BIAS;
+          origin = ray_offset(hit_pos, geo_normal);
           went_through_glass = true;
           specular_bounce = true;
           is_diffuse_path = false;
@@ -1950,11 +1970,11 @@ fn path_trace(primary_origin: vec3f, primary_dir: vec3f) -> PathResult {
 
           if !can_refract || rand() < fresnel_glass {
             dir = reflect(-V, H_glass);
-            origin = hit_pos + geo_normal * BIAS;
+            origin = ray_offset(hit_pos, geo_normal);
             throughput *= vec3f(1.0) / max(max(reflect_prob, glass_transmission * 0.01), 0.01);
           } else {
             dir = normalize(refracted);
-            origin = hit_pos - geo_normal * BIAS;
+            origin = ray_offset(hit_pos, -geo_normal);
             throughput *= transmission_tint / max(max(refract_prob, glass_transmission * 0.01), 0.01);
             if front_face {
               if medium_depth < MAX_VOLUME_STACK && material_needs_attenuation(mat) {
@@ -2140,7 +2160,7 @@ fn path_trace(primary_origin: vec3f, primary_dir: vec3f) -> PathResult {
       last_bsdf_pdf = max(dot(dir, normal), 0.0) * INV_PI; // cosine hemisphere PDF
     }
 
-    origin = hit_pos + normal * BIAS;
+    origin = ray_offset(hit_pos, normal);
 
     // Perceptual √ Russian roulette (ignis-rt / NRD guideline)
     // sqrt prevents dim paths from surviving with huge weight → fewer fireflies
@@ -2192,7 +2212,7 @@ fn path_trace_from_gbuffer(hit_pos: vec3f, normal_in: vec3f, view_dir: vec3f, ma
   if uniforms.max_bounces >= 2u {
     let bounce_dir = cosine_sample_hemisphere(normal);
     if dot(normal, bounce_dir) > 0.0 {
-      let bounce_hit = trace_bvh(hit_pos + normal * BIAS, bounce_dir);
+      let bounce_hit = trace_bvh(ray_offset(hit_pos, normal), bounce_dir);
       if !bounce_hit.hit {
         // Sky contribution
         radiance += base_color * (1.0 - metallic) * sky_color(bounce_dir);
@@ -2200,7 +2220,7 @@ fn path_trace_from_gbuffer(hit_pos: vec3f, normal_in: vec3f, view_dir: vec3f, ma
         // Indirect: check SHaRC first, fallback to NEE
         let btd = tri_data[bounce_hit.tri_idx];
         let bmat = material_buf[btd.w];
-        let bhit_pos = hit_pos + normal * BIAS + bounce_dir * bounce_hit.t;
+        let bhit_pos = ray_offset(hit_pos, normal) + bounce_dir * bounce_hit.t;
         let bbw = 1.0 - bounce_hit.u - bounce_hit.v;
         var bnormal = normalize(bbw*vert_normals[btd.x].xyz + bounce_hit.u*vert_normals[btd.y].xyz + bounce_hit.v*vert_normals[btd.z].xyz);
         if dot(bounce_dir, bnormal) > 0.0 { bnormal = -bnormal; }
