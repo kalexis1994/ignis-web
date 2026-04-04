@@ -1092,7 +1092,7 @@ async function init() {
     sunAzimuth: 53,
     sharpness: 0.6,
     temporalAlpha: 0.02,
-    tonemapMode: cfg.tonemap !== undefined ? cfg.tonemap : 5, // default: Standard
+    tonemapMode: cfg.tonemap !== undefined ? cfg.tonemap : 0, // default: AgX Punchy (preserves saturation)
     exposure: 1.0,
     saturation: 1.0,
     contrast: 0.0,

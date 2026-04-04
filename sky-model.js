@@ -576,11 +576,24 @@ export class CyclesSkyModel {
 
         const pixel = (y * this.textureWidth + x);
         const rgbIndex = pixel * 3;
-        this.skyTextureRgb[rgbIndex + 0] = rgb[0];
-        this.skyTextureRgb[rgbIndex + 1] = rgb[1];
-        this.skyTextureRgb[rgbIndex + 2] = rgb[2];
+        // Scale down physically-based sky radiance to renderer-friendly range
+        // Raw Nishita values peak at ~250 near sun — need ~0.04x to get max ~10
+        const skyScale = 0.04;
+        this.skyTextureRgb[rgbIndex + 0] = rgb[0] * skyScale;
+        this.skyTextureRgb[rgbIndex + 1] = rgb[1] * skyScale;
+        this.skyTextureRgb[rgbIndex + 2] = rgb[2] * skyScale;
       }
     }
+    // Debug: log sky texture value range
+    let maxR=0, maxG=0, maxB=0, avgR=0, avgG=0, avgB=0;
+    const n = this.textureWidth * this.textureHeight;
+    for (let i = 0; i < n; i++) {
+      const r = this.skyTextureRgb[i*3], g = this.skyTextureRgb[i*3+1], b = this.skyTextureRgb[i*3+2];
+      maxR = Math.max(maxR, r); maxG = Math.max(maxG, g); maxB = Math.max(maxB, b);
+      avgR += r; avgG += g; avgB += b;
+    }
+    console.log(`Sky texture: max=(${maxR.toFixed(2)}, ${maxG.toFixed(2)}, ${maxB.toFixed(2)}) avg=(${(avgR/n).toFixed(3)}, ${(avgG/n).toFixed(3)}, ${(avgB/n).toFixed(3)})`);
+    console.log(`Sun disc: bottom=(${this.sunBottomRgb[0]?.toFixed?.(1)}, ${this.sunBottomRgb[1]?.toFixed?.(1)}, ${this.sunBottomRgb[2]?.toFixed?.(1)})`);
   }
 
   _recomputeSunData(params, simplified) {
