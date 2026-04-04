@@ -209,6 +209,14 @@ fn sample_cone(axis: vec3f, cos_theta_max: f32) -> vec3f {
   return normalize(build_onb(axis) * local);
 }
 
+// PDF of uniform cone sampling: 1/(2π(1-cos_theta)) inside, 0 outside
+fn pdf_uniform_cone(dir: vec3f, axis: vec3f, cos_theta_max: f32) -> f32 {
+  if dot(dir, axis) >= cos_theta_max {
+    return 1.0 / (TWO_PI * (1.0 - cos_theta_max));
+  }
+  return 0.0;
+}
+
 fn random_in_unit_sphere() -> vec3f {
   let z = rand() * 2.0 - 1.0;
   let r = sqrt(max(0.0, 1.0 - z * z));
@@ -888,30 +896,55 @@ fn sun_nee_common(origin: vec3f, pos: vec3f, normal: vec3f, V: vec3f, surface: S
 }
 
 fn sample_sun_nee_split(pos: vec3f, normal: vec3f, geo_normal: vec3f, V: vec3f, td: vec4u, mat: Material, uv0: vec2f, uv1: vec2f, uv2: vec2f, uv3: vec2f, baseColor: vec3f, roughness: f32, metallic: f32, transmission: f32) -> BRDFSplit {
-  // Use GEOMETRIC normal for ray offset (Cycles approach — prevents light leaks at smooth edges)
   let origin = ray_offset(pos, geo_normal);
   let surface = build_surface_eval(td, mat, normal, baseColor, roughness, metallic, transmission, uv0, uv1, uv2, uv3);
   var result_split = BRDFSplit(vec3f(0.0), vec3f(0.0));
 
-  let sun = sun_nee_common(origin, pos, normal, V, surface, false);
-  result_split.diffuse += sun.diffuse;
-  result_split.specular += sun.specular;
-
-  // Environment NEE: importance-sample sky via CDF, trace shadow ray, apply MIS
+  // === Combined background NEE (Cycles-style): sun + env map in ONE shadow ray ===
   {
-    let env_r = rand2();
-    let env_sample_result = env_sample(env_r.x, env_r.y);
-    let env_L = env_sample_result.xyz;
-    let env_light_pdf = env_sample_result.w;
-    if env_light_pdf > 0.0 && dot(normal, env_L) > 0.0 {
-      if !trace_shadow(origin, env_L, 200.0) {
-        let env_rad = sky_color(env_L);
-        let brdf = eval_surface_split(surface, V, env_L);
-        let bsdf_pdf = max(dot(normal, env_L), 0.0) * INV_PI;
-        let mis_w = power_heuristic(env_light_pdf, bsdf_pdf);
-        let env_contrib = env_rad * mis_w / env_light_pdf;
-        result_split.diffuse += brdf.diffuse * env_contrib;
-        result_split.specular += brdf.specular * env_contrib;
+    let sun_weight = select(0.0, 0.5, uniforms.sun_enabled > 0u);
+    let env_weight = 0.5;
+    let total_weight = sun_weight + env_weight;
+
+    if total_weight > 0.0 {
+      let inv_total = 1.0 / total_weight;
+      let sun_prob = sun_weight * inv_total;
+      let r = rand();
+
+      var L: vec3f;
+      var chose_sun = false;
+
+      if r < sun_prob {
+        // Sample sun cone
+        L = sample_cone(g_sun_dir, env_sun_cos_half_angle());
+        chose_sun = true;
+      } else {
+        // Sample env map via importance sampling
+        let env_r = rand2();
+        let env_s = env_sample(env_r.x, env_r.y);
+        L = env_s.xyz;
+      }
+
+      if dot(normal, L) > 0.0 {
+        if !trace_shadow(origin, L, 200.0) {
+          // Radiance from entire background (sun disc + sky)
+          let radiance = sky_color(L);
+
+          // Combined PDF: weighted sum of all methods
+          let sun_pdf_val = pdf_uniform_cone(L, g_sun_dir, env_sun_cos_half_angle());
+          let env_pdf_val = env_pdf_dir(L);
+          let combined_pdf = sun_prob * sun_pdf_val + (1.0 - sun_prob) * max(env_pdf_val, 1e-8);
+
+          if combined_pdf > 1e-8 {
+            // MIS with BSDF
+            let bsdf_pdf = max(dot(normal, L), 0.0) * INV_PI;
+            let mis_w = power_heuristic(combined_pdf, bsdf_pdf);
+            let brdf = eval_surface_split(surface, V, L);
+            let contrib = radiance * mis_w / combined_pdf;
+            result_split.diffuse += brdf.diffuse * contrib;
+            result_split.specular += brdf.specular * contrib;
+          }
+        }
       }
     }
   }
@@ -981,26 +1014,36 @@ fn sample_scene_nee_basic(pos: vec3f, normal: vec3f, geo_normal: vec3f, V: vec3f
   let origin = ray_offset(pos, geo_normal);
   var result_split = BRDFSplit(vec3f(0.0), vec3f(0.0));
 
-  // Sun NEE: BVH shadow rays for indirect bounces
-  let sun = sun_nee_common(origin, pos, normal, V, surface, false);
-  result_split.diffuse += sun.diffuse;
-  result_split.specular += sun.specular;
-
-  // Environment NEE with MIS
+  // Combined background NEE (sun + env in one shadow ray)
   {
-    let env_r = rand2();
-    let env_sample_result = env_sample(env_r.x, env_r.y);
-    let env_L = env_sample_result.xyz;
-    let env_light_pdf = env_sample_result.w;
-    if env_light_pdf > 0.0 && dot(normal, env_L) > 0.0 {
-      if !trace_shadow(origin, env_L, 200.0) {
-        let env_rad = sky_color(env_L);
-        let brdf = eval_surface_split(surface, V, env_L);
-        let bsdf_pdf = max(dot(normal, env_L), 0.0) * INV_PI;
-        let mis_w = power_heuristic(env_light_pdf, bsdf_pdf);
-        let env_contrib = env_rad * mis_w / env_light_pdf;
-        result_split.diffuse += brdf.diffuse * env_contrib;
-        result_split.specular += brdf.specular * env_contrib;
+    let sun_weight = select(0.0, 0.5, uniforms.sun_enabled > 0u);
+    let env_weight = 0.5;
+    let total_weight = sun_weight + env_weight;
+    if total_weight > 0.0 {
+      let inv_total = 1.0 / total_weight;
+      let sun_prob = sun_weight * inv_total;
+      let r = rand();
+      var L: vec3f;
+      if r < sun_prob {
+        L = sample_cone(g_sun_dir, env_sun_cos_half_angle());
+      } else {
+        let env_r = rand2();
+        let env_s = env_sample(env_r.x, env_r.y);
+        L = env_s.xyz;
+      }
+      if dot(normal, L) > 0.0 && !trace_shadow(origin, L, 200.0) {
+        let radiance = sky_color(L);
+        let sun_pdf_val = pdf_uniform_cone(L, g_sun_dir, env_sun_cos_half_angle());
+        let env_pdf_val = env_pdf_dir(L);
+        let combined_pdf = sun_prob * sun_pdf_val + (1.0 - sun_prob) * max(env_pdf_val, 1e-8);
+        if combined_pdf > 1e-8 {
+          let bsdf_pdf = max(dot(normal, L), 0.0) * INV_PI;
+          let mis_w = power_heuristic(combined_pdf, bsdf_pdf);
+          let brdf = eval_surface_split(surface, V, L);
+          let contrib = radiance * mis_w / combined_pdf;
+          result_split.diffuse += brdf.diffuse * contrib;
+          result_split.specular += brdf.specular * contrib;
+        }
       }
     }
   }
