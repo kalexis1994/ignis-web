@@ -151,8 +151,8 @@ fn atrous(@builtin(global_invocation_id) gid: vec3u) {
       let sd = s_diff.rgb;
       let ss = textureLoad(in_spec, sp, 0).rgb;
 
-      // Normal edge-stopping: 64 (relaxed from 128 to reduce aliased edges)
-      let wn = f16(pow(max(dot(cn, snd.xyz), 0.0), 64.0));
+      // Normal edge-stopping (SVGF σ_n=128)
+      let wn = f16(pow(max(dot(cn, snd.xyz), 0.0), 128.0));
       let dz = abs(cz - snd.w);
       let wz = f16(exp(-dz / (gz * f32(step) + 1e-3)));
 
@@ -597,7 +597,7 @@ fn composite(@builtin(global_invocation_id) gid: vec3u) {
   if params.step_size < 0.0 {
     hdr = denoised_diff; // OIDN: already combined beauty pass
   } else {
-    hdr = max(albedo, vec3f(0.02)) * denoised_diff + denoised_spec;
+    hdr = albedo * denoised_diff + denoised_spec;
   }
 
   // Auto-exposure: accumulate log2-luminance (fixed-point, like ignis-rt)

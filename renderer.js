@@ -2,6 +2,7 @@
 
 import { loadScene } from './scene-loader.js';
 import { createOIDNPipeline } from './oidn-pipeline.js';
+import { CyclesSkyModel, CYCLES_SKY_DEFAULTS } from './sky-model.js';
 
 // Remote logging — sends to Python server, viewable in client.log
 function rlog(...args) {
@@ -509,8 +510,8 @@ async function init() {
   });
 
   // --- Environment CDF buffer (created early so bg1 can reference it) ---
-  const ENV_W = 128, ENV_H = 64;
-  const envCdfSize = ENV_W * ENV_H * 2 + ENV_H * 2 + 1;
+  const ENV_W = 512, ENV_H = 256;
+  const envCdfSize = ENV_W * ENV_H * 5 + ENV_H + 10;
   const envCdfBuf = device.createBuffer({ size: envCdfSize * 4, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST });
 
   // --- Bind group 1: scene data ---
@@ -728,7 +729,7 @@ async function init() {
 
   // --- Denoiser pipelines ---
   // 3 separate param buffers for the 3 à-trous steps (avoid writeBuffer during encoding)
-  const denoisePasses = gpuProfile.denoisePasses || 7;
+  const denoisePasses = gpuProfile.denoisePasses || 5;
   const dnSteps = [1, 2, 4, 8, 16]; // up to 5 passes
   const dnParamBufs = dnSteps.map((s, i) => {
     const buf = device.createBuffer({ size: 96, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
@@ -1103,110 +1104,28 @@ async function init() {
     return [Math.sin(az) * Math.cos(el), Math.sin(el), Math.cos(az) * Math.cos(el)];
   }
 
-  // --- Environment CDF for importance sampling (Cycles-style conditional-marginal) ---
-  // Buffer layout: [cond_cdf: ENV_W*ENV_H] [lum: ENV_W*ENV_H] [row_totals: ENV_H] [marg_cdf: ENV_H] [total: 1]
+  // --- Cycles-like sky environment ---
   let lastEnvSunEl = -999, lastEnvSunAz = -999;
+  const skyModel = new CyclesSkyModel(ENV_W, ENV_H, CYCLES_SKY_DEFAULTS);
 
-  function skyColorJS(dir, sunDir) {
-    const SUN_COLOR = [8.0, 7.2, 5.5];
-    const scLen = Math.sqrt(SUN_COLOR[0]**2 + SUN_COLOR[1]**2 + SUN_COLOR[2]**2);
-    const sunTint = [SUN_COLOR[0]/scLen*1.5, SUN_COLOR[1]/scLen*1.5, SUN_COLOR[2]/scLen*1.5];
-    const ambColor = [0.5, 0.6, 0.8];
-    const sunAlt = sunDir[1];
-
-    if (dir[1] <= 0) {
-      const fr = [ambColor[0]*0.6+sunTint[0]*0.3+0.1, ambColor[1]*0.6+sunTint[1]*0.3+0.1, ambColor[2]*0.6+sunTint[2]*0.3+0.1];
-      const g = (fr[0]+fr[1]+fr[2])*0.33;
-      const fc = [fr[0]*0.7+g*0.3, fr[1]*0.7+g*0.3, fr[2]*0.7+g*0.3];
-      const si = Math.max(0.05, Math.min(sunAlt*3+0.3, 1));
-      const gt = Math.max(0, Math.min(-dir[1]*5, 1));
-      return [(fc[0]*si)*(1-gt)+ambColor[0]*0.15*gt, (fc[1]*si)*(1-gt)+ambColor[1]*0.15*gt, (fc[2]*si)*(1-gt)+ambColor[2]*0.15*gt];
-    }
-
-    const cosTheta = Math.max(dir[1], 0.001);
-    const cosGamma = dir[0]*sunDir[0]+dir[1]*sunDir[1]+dir[2]*sunDir[2];
-    const rayPhase = 0.75*(1+cosGamma*cosGamma);
-    let rc = [0.30, 0.42, 0.68];
-    const ss = Math.max(0, Math.min(1-sunAlt*2, 1));
-    rc = [rc[0]*(1-ss*0.6)+0.7*ss*0.6, rc[1]*(1-ss*0.6)+0.35*ss*0.6, rc[2]*(1-ss*0.6)+0.15*ss*0.6];
-    const za = Math.acos(cosTheta);
-    let od = 1/(cosTheta+0.15*Math.pow(93.885-za*180/Math.PI, -1.253));
-    od = Math.min(od, 40);
-    const expOd = Math.exp(-od*0.1);
-    const ray = [rc[0]*rayPhase*expOd, rc[1]*rayPhase*expOd, rc[2]*rayPhase*expOd];
-
-    const gg = 0.76;
-    const mieP = 1.5*((1-gg*gg)/(2+gg*gg))*(1+cosGamma*cosGamma)/Math.pow(1+gg*gg-2*gg*cosGamma, 1.5);
-    const mie = [sunTint[0]*mieP*0.02, sunTint[1]*mieP*0.02, sunTint[2]*mieP*0.02];
-
-    const si = Math.max(0.05, Math.min(sunAlt*3+0.3, 1));
-    let sky = [(ray[0]+mie[0])*si*ambColor[0]*2, (ray[1]+mie[1])*si*ambColor[1]*2, (ray[2]+mie[2])*si*ambColor[2]*2];
-
-    // Sun disk + corona (exclude from CDF to avoid fireflies — sun NEE handles it)
-    // sky += sunTint * pow(max(cosGamma, 0), 512) * 5.0;  // omitted
-    sky[0] += sunTint[0]*Math.pow(Math.max(cosGamma,0),16)*0.4;
-    sky[1] += sunTint[1]*Math.pow(Math.max(cosGamma,0),16)*0.4;
-    sky[2] += sunTint[2]*Math.pow(Math.max(cosGamma,0),16)*0.4;
-
-    // Horizon haze
-    const fr = [ambColor[0]*0.6+sunTint[0]*0.3+0.1, ambColor[1]*0.6+sunTint[1]*0.3+0.1, ambColor[2]*0.6+sunTint[2]*0.3+0.1];
-    const g = (fr[0]+fr[1]+fr[2])*0.33;
-    const fc = [fr[0]*0.7+g*0.3, fr[1]*0.7+g*0.3, fr[2]*0.7+g*0.3];
-    const ht = 1-Math.max(0,Math.min((dir[1]-0)/0.25,1));
-    sky = [sky[0]*(1-ht*0.8)+fc[0]*si*ht*0.8, sky[1]*(1-ht*0.8)+fc[1]*si*ht*0.8, sky[2]*(1-ht*0.8)+fc[2]*si*ht*0.8];
-
-    return [Math.max(sky[0],0), Math.max(sky[1],0), Math.max(sky[2],0)];
+  function rebuildSkyEnvironment() {
+    const t0 = performance.now();
+    const skyState = skyModel.update({
+      sunElevation: settings.sunElevation * Math.PI / 180,
+      sunAzimuth: settings.sunAzimuth * Math.PI / 180,
+    });
+    device.queue.writeBuffer(envCdfBuf, 0, skyState.buffer);
+    lastEnvSunEl = settings.sunElevation;
+    lastEnvSunAz = settings.sunAzimuth;
+    const parts = [];
+    if (skyState.rebuiltAtmosphere) parts.push('atmosphere');
+    if (skyState.rebuiltTexture) parts.push('lut');
+    if (skyState.rebuiltSunData) parts.push('sun');
+    if (skyState.rebuiltPacked) parts.push('cdf');
+    rlog(`Cycles sky rebuilt (${parts.join(' + ') || 'cached'}) in ${(performance.now() - t0).toFixed(1)}ms`);
   }
 
-  function buildEnvCDF(sunDir) {
-    const data = new Float32Array(envCdfSize);
-    const condOff = 0;                           // conditional CDF: ENV_W * ENV_H
-    const lumOff = ENV_W * ENV_H;                // luminance: ENV_W * ENV_H
-    const rowOff = ENV_W * ENV_H * 2;           // row totals: ENV_H
-    const margOff = ENV_W * ENV_H * 2 + ENV_H;  // marginal CDF: ENV_H
-    const totalOff = ENV_W * ENV_H * 2 + ENV_H * 2; // total: 1
-
-    // Evaluate sky luminance at each pixel
-    for (let j = 0; j < ENV_H; j++) {
-      const v = (j + 0.5) / ENV_H;
-      const theta = v * Math.PI;
-      const sinTheta = Math.sin(theta);
-
-      let rowSum = 0;
-      for (let i = 0; i < ENV_W; i++) {
-        const u = (i + 0.5) / ENV_W;
-        const phi = (0.5 - u) * 2 * Math.PI;
-        const dir = [Math.cos(phi)*sinTheta, Math.cos(theta), -Math.sin(phi)*sinTheta];
-        const sky = skyColorJS(dir, sunDir);
-        const lum = (0.2126*sky[0] + 0.7152*sky[1] + 0.0722*sky[2]) * sinTheta;
-        data[lumOff + j * ENV_W + i] = lum;
-        rowSum += lum;
-      }
-
-      // Build conditional CDF for this row (normalized 0-1)
-      data[rowOff + j] = rowSum;
-      let cumul = 0;
-      for (let i = 0; i < ENV_W; i++) {
-        cumul += data[lumOff + j * ENV_W + i];
-        data[condOff + j * ENV_W + i] = rowSum > 0 ? cumul / rowSum : (i + 1) / ENV_W;
-      }
-    }
-
-    // Build marginal CDF (normalized 0-1)
-    let grandTotal = 0;
-    for (let j = 0; j < ENV_H; j++) grandTotal += data[rowOff + j];
-    data[totalOff] = grandTotal;
-    let cumul = 0;
-    for (let j = 0; j < ENV_H; j++) {
-      cumul += data[rowOff + j];
-      data[margOff + j] = grandTotal > 0 ? cumul / grandTotal : (j + 1) / ENV_H;
-    }
-
-    device.queue.writeBuffer(envCdfBuf, 0, data);
-  }
-
-  // Build initial CDF
-  buildEnvCDF(getSunDir());
+  rebuildSkyEnvironment();
 
   // --- Input handling ---
   const keys = {};
@@ -1749,6 +1668,10 @@ async function init() {
   let frameIndex = 0, cameraMoved = false, framesStill = 0, autoExposure = 1.0;
   let lastTime = performance.now(), fps = 0, fpsAccum = 0, fpsCount = 0;
 
+  // --- Per-pass GPU timing (CPU-side submit timing) ---
+  const passTimers = { gbuffer: 0, shadow: 0, pathtrace: 0, temporal: 0, denoise: 0, composite: 0, fsr: 0, oidn: 0, total: 0 };
+  let timerLogCounter = 0;
+
   function getCameraVectors() {
     const fw = [Math.cos(camera.pitch)*Math.sin(camera.yaw), Math.sin(camera.pitch), Math.cos(camera.pitch)*Math.cos(camera.yaw)];
     const rt = [-Math.cos(camera.yaw), 0, Math.sin(camera.yaw)];
@@ -1868,6 +1791,8 @@ async function init() {
     frameIndex++;
     restirFrame = 1 - restirFrame;
 
+    const t_frame_start = performance.now();
+
     // --- G-buffer rasterization (replaces primary ray BVH traversal) ---
     const viewProj = buildViewProj(camera, forward, right, up, width, height);
     const gbufUd = new Float32Array(20); // mat4x4 + vec3 + pad = 20 floats = 80 bytes
@@ -1897,13 +1822,13 @@ async function init() {
       rp.end();
       device.queue.submit([encoder.finish()]);
     }
+    const t_gbuffer = performance.now();
 
-    // --- Rebuild env CDF when sun moves ---
+    // --- Rebuild Cycles sky environment when the sun moves ---
     const sun = getSunDir();
     if (settings.sunElevation !== lastEnvSunEl || settings.sunAzimuth !== lastEnvSunAz) {
-      buildEnvCDF(sun);
-      lastEnvSunEl = settings.sunElevation;
-      lastEnvSunAz = settings.sunAzimuth;
+      rebuildSkyEnvironment();
+      cameraMoved = true;
     }
 
     // --- Shadow map rasterization ---
@@ -1928,6 +1853,7 @@ async function init() {
       rp.end();
       device.queue.submit([encoder.finish()]);
     }
+    const t_shadow = performance.now();
 
     // Write PT uniforms
     const ud = new ArrayBuffer(uniformBufferSize);
@@ -2065,7 +1991,6 @@ async function init() {
         oidn.blendFrame = 1 - oidn.blendFrame;
       } else if (denoiseMode === 'full') {
         // Pre-blur: lightweight 3×3 bilateral → stabilizes temporal AABB + removes fireflies
-        // noisy → pingTex, specNoisy → specPingTex (temporal reads from ping)
         const pbPass = encoder.beginComputePass();
         pbPass.setPipeline(preblurSMPipeline);
         pbPass.setBindGroup(0, preblurBG);
@@ -2096,13 +2021,8 @@ async function init() {
           dp.end();
         }
 
-        // Feed denoised RGB back to history, preserving temporal alpha (history_len/cam_z)
-        // Uses copy_to_history shader: merges denoised .rgb + temporal .a
-        const cthPass = encoder.beginComputePass();
-        cthPass.setPipeline(copyToHistoryPipeline);
-        cthPass.setBindGroup(0, historyFrame === 0 ? copyToHistBG_A : copyToHistBG_B);
-        cthPass.dispatchWorkgroups(Math.ceil(width/16), Math.ceil(height/16));
-        cthPass.end();
+        // NOTE: history keeps the temporal blend output (noisy but spatially sharp).
+        // Feeding spatially-filtered result to history causes progressive blur.
       }
 
       // Composite (tonemap → LDR)
@@ -2161,7 +2081,22 @@ async function init() {
       const exposureStaging = device.createBuffer({ size: 16, usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST });
       const copyEncoder = device.createCommandEncoder();
       copyEncoder.copyBufferToBuffer(exposureBuf, 0, exposureStaging, 0, 16);
+      const t_submit = performance.now();
       device.queue.submit([encoder.finish(), copyEncoder.finish()]);
+
+      // GPU timing: measure actual GPU work completion
+      device.queue.onSubmittedWorkDone().then(() => {
+        const t_gpu_done = performance.now();
+        passTimers.total = t_gpu_done - t_frame_start;
+        passTimers.gbuffer = t_gbuffer - t_frame_start;
+        passTimers.shadow = t_shadow - t_gbuffer;
+        passTimers.pathtrace = t_submit - t_shadow; // encoding time (approximation)
+        // Log every 120 frames
+        timerLogCounter++;
+        if (timerLogCounter % 120 === 0) {
+          rlog(`TIMING: total=${passTimers.total.toFixed(1)}ms gbuf=${passTimers.gbuffer.toFixed(1)}ms shadow=${passTimers.shadow.toFixed(1)}ms encode=${passTimers.pathtrace.toFixed(1)}ms gpu=${(t_gpu_done - t_submit).toFixed(1)}ms`);
+        }
+      });
 
       // Async readback: compute new exposure from accumulated luminance
       exposureStaging.mapAsync(GPUMapMode.READ).then(() => {
@@ -2192,8 +2127,9 @@ async function init() {
 
     const tracePercent = framesStill > 30 ? 12 : framesStill > 10 ? 25 : 50;
     info.innerHTML =
-      `<b>Ignis</b> | ${FSR_MODES[fsrMode].label}<br>` +
-      `${width}x${height}\u2192${displayWidth}x${displayHeight} FPS:${fps} Trace:${tracePercent}%<br>` +
+      `<b>Ignis</b> | ${FSR_MODES[fsrMode].label} | ${denoiseMode}<br>` +
+      `${width}x${height}\u2192${displayWidth}x${displayHeight} FPS:${fps}<br>` +
+      `<span style="font-size:11px">frame:${passTimers.total.toFixed(1)}ms gpu:${(passTimers.total - passTimers.gbuffer - passTimers.shadow).toFixed(1)}ms</span><br>` +
       `<span style="font-size:11px">ESC: options | TAB: debug</span>`;
 
     requestAnimationFrame(frame);

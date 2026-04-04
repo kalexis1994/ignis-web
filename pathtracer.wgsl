@@ -118,13 +118,7 @@ const T_MIN: f32 = 0.00001;    // minimum ray t (intersection test)
 const BIAS: f32 = 0.0002;     // shadow/bounce ray offset
 // MAX_BOUNCES now comes from uniforms.max_bounces
 
-const SUN_COLOR: vec3f = vec3f(8.0, 7.2, 5.5);
-const SKY_COLOR: vec3f = vec3f(1.5, 1.8, 2.5);
-const GI_INTENSITY: f32 = 3.0; // multiplier for all indirect lighting (like ignis-rt ptGIIntensity)
-const SUN_ANGLE: f32 = 0.03;
-const COS_SUN_ANGLE: f32 = 0.99955;
-const SUN_SOLID_ANGLE: f32 = 0.002827;
-const SUN_MULT: f32 = 100.0;
+const GI_INTENSITY: f32 = 1.5; // multiplier for indirect lighting (surface bounces + sky)
 const MAX_FIREFLY_LUM: f32 = 32.0;
 const MAT_FLAG_THIN_TRANSMISSION: u32 = 1u;
 const MAT_FLAG_DOUBLE_SIDED: u32 = 2u;
@@ -858,7 +852,7 @@ fn sun_nee_common(origin: vec3f, pos: vec3f, normal: vec3f, V: vec3f, surface: S
       let L = g_sun_dir;
       if dot(normal, L) > 0.0 {
         let brdf = eval_surface_split(surface, V, L);
-        let light = SUN_COLOR * SUN_MULT * SUN_SOLID_ANGLE * shadow_val;
+        let light = analytic_sun_radiance(L) * env_sun_solid_angle() * shadow_val;
         result.diffuse += brdf.diffuse * light;
         result.specular += brdf.specular * light;
       }
@@ -866,15 +860,15 @@ fn sun_nee_common(origin: vec3f, pos: vec3f, normal: vec3f, V: vec3f, surface: S
   } else {
     // Bounces 1+: BVH shadow rays
     var shadow_val = 0.0;
-    let L1 = sample_cone(g_sun_dir, COS_SUN_ANGLE);
-    let L2 = sample_cone(g_sun_dir, COS_SUN_ANGLE);
+    let L1 = sample_cone(g_sun_dir, env_sun_cos_half_angle());
+    let L2 = sample_cone(g_sun_dir, env_sun_cos_half_angle());
     if !trace_shadow(origin, L1, 50.0) { shadow_val += 0.5; }
     if !trace_shadow(origin, L2, 50.0) { shadow_val += 0.5; }
     if shadow_val > 0.0 {
       let L = normalize(L1 + L2);
       if dot(normal, L) > 0.0 {
         let brdf = eval_surface_split(surface, V, L);
-        let light = SUN_COLOR * SUN_MULT * SUN_SOLID_ANGLE * shadow_val;
+        let light = analytic_sun_radiance(L) * env_sun_solid_angle() * shadow_val;
         result.diffuse += brdf.diffuse * light;
         result.specular += brdf.specular * light;
       }
@@ -1229,9 +1223,21 @@ fn trace_shadow(origin: vec3f, dir: vec3f, max_t: f32) -> bool {
 // ============================================================
 // Environment CDF importance sampling (Cycles-style)
 // ============================================================
-const ENV_W: u32 = 128u;
-const ENV_H: u32 = 64u;
-// Buffer: [cond_cdf: W*H][lum: W*H][row_totals: H][marg_cdf: H][total: 1]
+const ENV_W: u32 = 512u;
+const ENV_H: u32 = 256u;
+const ENV_PIXEL_COUNT: u32 = ENV_W * ENV_H;
+const ENV_RGB_OFF: u32 = 0u;
+const ENV_COND_OFF: u32 = ENV_PIXEL_COUNT * 3u;
+const ENV_LUM_OFF: u32 = ENV_COND_OFF + ENV_PIXEL_COUNT;
+const ENV_MARG_OFF: u32 = ENV_LUM_OFF + ENV_PIXEL_COUNT;
+const ENV_TOTAL_OFF: u32 = ENV_MARG_OFF + ENV_H;
+const ENV_SUN_BOTTOM_OFF: u32 = ENV_TOTAL_OFF + 1u;
+const ENV_SUN_TOP_OFF: u32 = ENV_SUN_BOTTOM_OFF + 3u;
+const ENV_EARTH_ANGLE_OFF: u32 = ENV_SUN_TOP_OFF + 3u;
+const ENV_SUN_ANGULAR_DIAMETER_OFF: u32 = ENV_EARTH_ANGLE_OFF + 1u;
+const ENV_SUN_SOLID_ANGLE_OFF: u32 = ENV_SUN_ANGULAR_DIAMETER_OFF + 1u;
+// Buffer: [rgb: W*H*3][cond_cdf: W*H][importance: W*H][marg_cdf: H][total: 1]
+//         [sun_bottom_rgb: 3][sun_top_rgb: 3][earth_angle: 1][sun_angular_diameter: 1][sun_solid_angle: 1]
 
 fn env_uv_to_dir(u: f32, v: f32) -> vec3f {
   let theta = v * PI;
@@ -1247,6 +1253,99 @@ fn env_dir_to_uv(dir: vec3f) -> vec2f {
   return vec2f(u, v);
 }
 
+fn env_rgb_index(i: u32, j: u32) -> u32 {
+  return ENV_RGB_OFF + (j * ENV_W + i) * 3u;
+}
+
+fn env_rgb_fetch(i: u32, j: u32) -> vec3f {
+  let idx = env_rgb_index(i, j);
+  return vec3f(env_cdf[idx], env_cdf[idx + 1u], env_cdf[idx + 2u]);
+}
+
+fn env_sample_rgb_uv(uv: vec2f) -> vec3f {
+  let u = fract(uv.x);
+  let v = clamp(uv.y, 0.5 / f32(ENV_H), 1.0 - 0.5 / f32(ENV_H));
+
+  let x = u * f32(ENV_W) - 0.5;
+  let y = v * f32(ENV_H) - 0.5;
+  let x_floor = i32(floor(x));
+  let y_floor = i32(floor(y));
+  let x0 = u32((x_floor % i32(ENV_W) + i32(ENV_W)) % i32(ENV_W));
+  let x1 = (x0 + 1u) % ENV_W;
+  let y0 = u32(clamp(y_floor, 0, i32(ENV_H) - 1));
+  let y1 = min(y0 + 1u, ENV_H - 1u);
+  let fx = x - f32(x_floor);
+  let fy = y - f32(y_floor);
+
+  let c00 = env_rgb_fetch(x0, y0);
+  let c10 = env_rgb_fetch(x1, y0);
+  let c01 = env_rgb_fetch(x0, y1);
+  let c11 = env_rgb_fetch(x1, y1);
+  let c0 = c00 + (c10 - c00) * fx;
+  let c1 = c01 + (c11 - c01) * fx;
+  return c0 + (c1 - c0) * fy;
+}
+
+fn env_sun_bottom_radiance() -> vec3f {
+  return vec3f(
+    env_cdf[ENV_SUN_BOTTOM_OFF],
+    env_cdf[ENV_SUN_BOTTOM_OFF + 1u],
+    env_cdf[ENV_SUN_BOTTOM_OFF + 2u],
+  );
+}
+
+fn env_sun_top_radiance() -> vec3f {
+  return vec3f(
+    env_cdf[ENV_SUN_TOP_OFF],
+    env_cdf[ENV_SUN_TOP_OFF + 1u],
+    env_cdf[ENV_SUN_TOP_OFF + 2u],
+  );
+}
+
+fn env_earth_intersection_angle() -> f32 {
+  return env_cdf[ENV_EARTH_ANGLE_OFF];
+}
+
+fn env_sun_angular_diameter() -> f32 {
+  return env_cdf[ENV_SUN_ANGULAR_DIAMETER_OFF];
+}
+
+fn env_sun_solid_angle() -> f32 {
+  return env_cdf[ENV_SUN_SOLID_ANGLE_OFF];
+}
+
+fn env_sun_cos_half_angle() -> f32 {
+  return cos(env_sun_angular_diameter() * 0.5);
+}
+
+fn precise_angle(a: vec3f, b: vec3f) -> f32 {
+  return 2.0 * atan2(length(a - b), max(length(a + b), 1e-6));
+}
+
+fn analytic_sun_radiance(dir: vec3f) -> vec3f {
+  let angular_diameter = env_sun_angular_diameter();
+  if angular_diameter <= 0.0 {
+    return vec3f(0.0);
+  }
+
+  let dir_elevation = asin(clamp(dir.y, -1.0, 1.0));
+  if dir_elevation <= env_earth_intersection_angle() {
+    return vec3f(0.0);
+  }
+
+  let half_angular = angular_diameter * 0.5;
+  let sun_dir_angle = precise_angle(dir, g_sun_dir);
+  if sun_dir_angle >= half_angular {
+    return vec3f(0.0);
+  }
+
+  let sun_elevation = asin(clamp(g_sun_dir.y, -1.0, 1.0));
+  let y = clamp((dir_elevation - sun_elevation) / angular_diameter + 0.5, 0.0, 1.0);
+  let angle_fraction = sun_dir_angle / max(half_angular, 1e-6);
+  let limb_darkening = 1.0 - 0.6 * (1.0 - sqrt(max(0.0, 1.0 - angle_fraction * angle_fraction)));
+  return mix(env_sun_bottom_radiance(), env_sun_top_radiance(), y) * limb_darkening;
+}
+
 // Binary search: find index where cdf[index] >= target
 fn env_binary_search(offset: u32, count: u32, val: f32) -> u32 {
   var lo = 0u;
@@ -1260,16 +1359,12 @@ fn env_binary_search(offset: u32, count: u32, val: f32) -> u32 {
 
 // Sample direction from environment CDF, returns (direction, pdf)
 fn env_sample(r1: f32, r2: f32) -> vec4f {
-  let marg_off = ENV_W * ENV_H * 2u + ENV_H;
-  let total_off = ENV_W * ENV_H * 2u + ENV_H * 2u;
-
   // Sample row (V) from marginal CDF
-  let j = env_binary_search(marg_off, ENV_H, r2);
+  let j = env_binary_search(ENV_MARG_OFF, ENV_H, r2);
   let v = (f32(j) + 0.5) / f32(ENV_H);
 
   // Sample column (U) from conditional CDF for row j
-  let cond_off = j * ENV_W;
-  let i = env_binary_search(cond_off, ENV_W, r1);
+  let i = env_binary_search(ENV_COND_OFF + j * ENV_W, ENV_W, r1);
   let u = (f32(i) + 0.5) / f32(ENV_W);
 
   let dir = env_uv_to_dir(u, v);
@@ -1279,27 +1374,22 @@ fn env_sample(r1: f32, r2: f32) -> vec4f {
 
 // PDF for a specific pixel (i, j) in the env map
 fn env_pdf_uv(i: u32, j: u32) -> f32 {
-  let lum_off = ENV_W * ENV_H;
-  let row_off = ENV_W * ENV_H * 2u;
-  let total_off = ENV_W * ENV_H * 2u + ENV_H * 2u;
+  let lum = env_cdf[ENV_LUM_OFF + j * ENV_W + i];
+  let grand_total = env_cdf[ENV_TOTAL_OFF];
 
-  let lum = env_cdf[lum_off + j * ENV_W + i];
-  let row_total = env_cdf[row_off + j];
-  let grand_total = env_cdf[total_off];
-
-  if grand_total <= 0.0 || row_total <= 0.0 { return 0.0; }
+  if grand_total <= 0.0 || lum <= 0.0 { return 0.0; }
 
   let v = (f32(j) + 0.5) / f32(ENV_H);
   let sin_theta = max(sin(v * PI), 1e-6);
 
-  // pdf = (lum / row_total) * (row_total / grand_total) * (ENV_W * ENV_H) / (2π² sin θ)
+  // importance stores luminance * sin(theta), so undo the Jacobian here.
   return (lum / grand_total) * f32(ENV_W * ENV_H) / (TWO_PI * PI * sin_theta);
 }
 
 // PDF for an arbitrary direction
 fn env_pdf_dir(dir: vec3f) -> f32 {
   let uv = env_dir_to_uv(dir);
-  let i = min(u32(uv.x * f32(ENV_W)), ENV_W - 1u);
+  let i = min(u32(fract(uv.x) * f32(ENV_W)), ENV_W - 1u);
   let j = min(u32(uv.y * f32(ENV_H)), ENV_H - 1u);
   return env_pdf_uv(i, j);
 }
@@ -1314,56 +1404,8 @@ fn power_heuristic(a: f32, b: f32) -> f32 {
 // Sky + Sun NEE
 // ============================================================
 
-// Procedural Preetham/Rayleigh+Mie sky — ported from ignis-rt (sky.glsl)
 fn sky_color(dir: vec3f) -> vec3f {
-  let sun_dir = g_sun_dir;
-  let sun_alt = sun_dir.y;
-  let sun_tint = normalize(SUN_COLOR) * 1.5;
-  let amb_color = vec3f(0.5, 0.6, 0.8); // default ambient sky tint (matches ignis-rt)
-
-  // Below horizon: ground reflection falloff
-  if dir.y <= 0.0 {
-    let fog_color_raw = amb_color * 0.6 + sun_tint * 0.3 + vec3f(0.1);
-    let fog_color = mix(fog_color_raw, vec3f(dot(fog_color_raw, vec3f(0.33))), 0.3);
-    let sun_int = clamp(sun_alt * 3.0 + 0.3, 0.05, 1.0);
-    let ground_t = clamp(-dir.y * 5.0, 0.0, 1.0);
-    return mix(fog_color * sun_int, amb_color * 0.15, ground_t);
-  }
-
-  let cos_theta = max(dir.y, 0.001);
-  let cos_gamma = dot(dir, sun_dir);
-
-  // --- Rayleigh scattering ---
-  let rayleigh_phase = 0.75 * (1.0 + cos_gamma * cos_gamma);
-  var rayleigh_color = vec3f(0.30, 0.42, 0.68);
-  let sunset_shift = clamp(1.0 - sun_alt * 2.0, 0.0, 1.0);
-  rayleigh_color = mix(rayleigh_color, vec3f(0.7, 0.35, 0.15), sunset_shift * 0.6);
-  let zenith_angle = acos(cos_theta);
-  var optical_depth = 1.0 / (cos_theta + 0.15 * pow(93.885 - degrees(zenith_angle), -1.253));
-  optical_depth = min(optical_depth, 40.0);
-  let rayleigh = rayleigh_color * rayleigh_phase * exp(-optical_depth * 0.1);
-
-  // --- Mie forward scattering (Henyey-Greenstein, g=0.76) ---
-  let g = 0.76;
-  let mie_phase = 1.5 * ((1.0 - g * g) / (2.0 + g * g))
-                * (1.0 + cos_gamma * cos_gamma) / pow(1.0 + g * g - 2.0 * g * cos_gamma, 1.5);
-  let mie = sun_tint * mie_phase * 0.02;
-
-  // Combined sky radiance — amb_color tints the sky dome (matches ignis-rt)
-  let sun_int = clamp(sun_alt * 3.0 + 0.3, 0.05, 1.0);
-  var sky = (rayleigh + mie) * sun_int * amb_color * 2.0;
-
-  // --- Sun disk (sharp pow-512 + corona, matches ignis-rt sky.glsl) ---
-  sky += sun_tint * pow(max(cos_gamma, 0.0), 512.0) * 5.0;
-  sky += sun_tint * pow(max(cos_gamma, 0.0), 16.0) * 0.4;
-
-  // --- Horizon haze ---
-  let fog_color_raw = amb_color * 0.6 + sun_tint * 0.3 + vec3f(0.1);
-  let fog_color = mix(fog_color_raw, vec3f(dot(fog_color_raw, vec3f(0.33))), 0.3);
-  let haze_t = 1.0 - smoothstep(0.0, 0.25, dir.y);
-  sky = mix(sky, fog_color * sun_int, haze_t * 0.8);
-
-  return max(sky, vec3f(0.0));
+  return env_sample_rgb_uv(env_dir_to_uv(dir)) + analytic_sun_radiance(dir);
 }
 
 // ============================================================
@@ -1768,8 +1810,8 @@ fn path_trace(primary_origin: vec3f, primary_dir: vec3f) -> PathResult {
     if bounce >= uniforms.max_bounces { break; }
     let hit = trace_bvh(origin, dir);
     if !hit.hit {
-      let sky_gi = select(1.0, GI_INTENSITY, bounce > 0u);
-      var sky = throughput * sky_color(dir) * sky_gi;
+      // Sky miss: NO GI boost (sky is already a light source, not a bounce)
+      var sky = throughput * sky_color(dir);
       // MIS: weight BSDF-sampled background against env NEE
       if bounce > 0u && last_bsdf_pdf > 0.0 {
         let env_pdf = env_pdf_dir(dir);

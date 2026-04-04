@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
-"""HTTP server with /log endpoint and .env scene path support."""
-import http.server, sys, os
+"""HTTP dev server with /log endpoint, .env scene path, and clean Ctrl+C."""
+import http.server, sys, os, threading
 from datetime import datetime
 from pathlib import Path
 
@@ -43,19 +43,24 @@ class H(http.server.SimpleHTTPRequestHandler):
         self.send_header('Cache-Control', 'no-store')
         super().end_headers()
 
+    def log_message(self, format, *args):
+        pass  # suppress noisy access log
+
     def do_GET(self):
-        if self.path == '/scene/.entry' and SCENE_FILE_ALIAS:
-            data = SCENE_FILE_ALIAS.encode('utf-8')
-            self.send_response(200)
-            self.send_header('Content-Type', 'text/plain; charset=utf-8')
-            self.send_header('Content-Length', str(len(data)))
-            self.end_headers()
-            self.wfile.write(data)
-            return
-        super().do_GET()
+        try:
+            if self.path == '/scene/.entry' and SCENE_FILE_ALIAS:
+                data = SCENE_FILE_ALIAS.encode('utf-8')
+                self.send_response(200)
+                self.send_header('Content-Type', 'text/plain; charset=utf-8')
+                self.send_header('Content-Length', str(len(data)))
+                self.end_headers()
+                self.wfile.write(data)
+                return
+            super().do_GET()
+        except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError, OSError):
+            pass
 
     def translate_path(self, path):
-        # Redirect /scene/* requests to SCENE_PATH if configured
         if SCENE_ROOT and path.startswith('/scene/'):
             rel = path[len('/scene/'):]
             if SCENE_FILE and rel == SCENE_FILE_ALIAS:
@@ -64,16 +69,28 @@ class H(http.server.SimpleHTTPRequestHandler):
         return super().translate_path(path)
 
     def do_POST(self):
-        n = int(self.headers.get('Content-Length', 0))
-        body = self.rfile.read(n).decode()
-        line = f'[{datetime.now().strftime("%H:%M:%S")}] {body}'
-        print(line, flush=True)
-        with open('client.log', 'a', encoding='utf-8') as f:
-            f.write(line + '\n')
-        self.send_response(200)
-        self.end_headers()
-        self.wfile.write(b'ok')
+        try:
+            n = int(self.headers.get('Content-Length', 0))
+            body = self.rfile.read(n).decode('utf-8', errors='replace')
+            line = f'[{datetime.now().strftime("%H:%M:%S")}] {body}'
+            print(line, flush=True)
+            with open('client.log', 'a', encoding='utf-8') as f:
+                f.write(line + '\n')
+            self.send_response(200)
+            self.end_headers()
+            self.wfile.write(b'ok')
+        except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError, OSError):
+            pass
 
-with http.server.HTTPServer(('0.0.0.0', PORT), H) as s:
-    print(f'http://localhost:{PORT}')
-    s.serve_forever()
+# Use threaded server so Ctrl+C isn't blocked by active connections
+server = http.server.ThreadingHTTPServer(('0.0.0.0', PORT), H)
+server.daemon_threads = True  # threads die when main thread exits
+
+print(f'http://localhost:{PORT}  (Ctrl+C to stop)')
+
+try:
+    server.serve_forever()
+except KeyboardInterrupt:
+    print('\nStopping...')
+    server.shutdown()
+    print('Done.')
