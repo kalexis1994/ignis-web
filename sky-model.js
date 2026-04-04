@@ -1,5 +1,3 @@
-import * as nishita from './sky-nishita.js';
-
 const PI = Math.PI;
 const HALF_PI = PI * 0.5;
 const TWO_PI = PI * 2.0;
@@ -525,8 +523,6 @@ export class CyclesSkyModel {
     this.earthIntersectionAngle = 0.0;
     this.sunAngularDiameter = this.defaults.sunAngularDiameter;
     this.sunSolidAngle = CYCLES_SUN_SOLID_ANGLE;
-    this.atmosphereModel = null;
-    this._nishitaModule = nishita;
     this.stats = {
       rebuiltAtmosphere: false,
       rebuiltTexture: false,
@@ -548,53 +544,85 @@ export class CyclesSkyModel {
   }
 
   _recomputeSkyTexture(params, simplified) {
-    // Use faithful Cycles Nishita port (sky-nishita.js)
-    const { precomputeSkyTexture } = this._nishitaModule;
-    const xyzPixels = precomputeSkyTexture(
-      this.textureWidth, this.textureHeight,
-      simplified.sunElevation,
-      params.altitude,
-      params.airDensity, params.aerosolDensity, params.ozoneDensity
-    );
+    // Analytic sky matching the shader's sky_color() — fast, no Nishita raymarching
+    const sunEl = simplified.sunElevation;
+    const sunAz = simplified.sunRotation;
+    const sunDir = [
+      Math.cos(sunEl) * Math.sin(sunAz),
+      Math.sin(sunEl),
+      Math.cos(sunEl) * Math.cos(sunAz),
+    ];
+    const sunFactor = clamp(sunEl / 1.2, 0.0, 1.0);
+    const sunsetWarmth = 1.0 - sunFactor;
 
-    // Convert XYZ → linear sRGB for the env map texture
-    const rgb = [0, 0, 0];
-    const n = this.textureWidth * this.textureHeight;
-    let maxR=0, maxG=0, maxB=0, avgR=0, avgG=0, avgB=0;
-    for (let i = 0; i < n; i++) {
-      const X = xyzPixels[i * 4];
-      const Y = xyzPixels[i * 4 + 1];
-      const Z = xyzPixels[i * 4 + 2];
-      xyzToLinearSrgb(X, Y, Z, rgb);
-      this.skyTextureRgb[i * 3 + 0] = Math.max(0, rgb[0]);
-      this.skyTextureRgb[i * 3 + 1] = Math.max(0, rgb[1]);
-      this.skyTextureRgb[i * 3 + 2] = Math.max(0, rgb[2]);
-      maxR = Math.max(maxR, rgb[0]); maxG = Math.max(maxG, rgb[1]); maxB = Math.max(maxB, rgb[2]);
-      avgR += rgb[0]; avgG += rgb[1]; avgB += rgb[2];
+    const zenith = [0.3 * (0.8 + 0.4 * sunFactor), 0.5 * (0.8 + 0.4 * sunFactor), 1.2 * (0.8 + 0.4 * sunFactor)];
+    const horizon = [0.8 + sunsetWarmth * 0.5, 0.7 + sunsetWarmth * 0.2, 0.6 - sunsetWarmth * 0.2];
+    const mie_g = 0.76;
+
+    for (let y = 0; y < this.textureHeight; y++) {
+      for (let x = 0; x < this.textureWidth; x++) {
+        const u = (x + 0.5) / this.textureWidth;
+        const v = (y + 0.5) / this.textureHeight;
+        const theta = v * PI;
+        const phi = (0.5 - u) * TWO_PI;
+        const sinTheta = Math.sin(theta);
+        const dx = Math.cos(phi) * sinTheta;
+        const dy = Math.cos(theta);
+        const dz = -Math.sin(phi) * sinTheta;
+
+        const elevation = Math.asin(clamp(dy, -1.0, 1.0));
+        const pixel = (y * this.textureWidth + x) * 3;
+
+        if (elevation < -0.01) {
+          const fade = Math.max(0.0, 1.0 + elevation * 5.0);
+          this.skyTextureRgb[pixel] = 0.05 * fade;
+          this.skyTextureRgb[pixel + 1] = 0.05 * fade;
+          this.skyTextureRgb[pixel + 2] = 0.06 * fade;
+          continue;
+        }
+
+        const cosGamma = clamp(dx * sunDir[0] + dy * sunDir[1] + dz * sunDir[2], -1.0, 1.0);
+        const t = clamp(elevation / (PI * 0.5), 0.0, 1.0);
+        const tp = Math.pow(t, 0.4);
+
+        let r = mix(horizon[0], zenith[0], tp);
+        let g = mix(horizon[1], zenith[1], tp);
+        let b = mix(horizon[2], zenith[2], tp);
+
+        // Rayleigh
+        const rayleighFactor = Math.pow(Math.max(1.0 - cosGamma, 0.0), 0.5) * 0.3;
+        r += 0.1 * rayleighFactor;
+        g += 0.2 * rayleighFactor;
+        b += 0.5 * rayleighFactor;
+
+        // Mie glow
+        const mie = (1.0 - mie_g * mie_g) / Math.pow(1.0 + mie_g * mie_g - 2.0 * mie_g * cosGamma, 1.5);
+        r += 1.2 * sunFactor * mie * 0.15;
+        g += 1.0 * sunFactor * mie * 0.15;
+        b += 0.8 * sunFactor * mie * 0.15;
+
+        this.skyTextureRgb[pixel] = r * 2.5;
+        this.skyTextureRgb[pixel + 1] = g * 2.5;
+        this.skyTextureRgb[pixel + 2] = b * 2.5;
+      }
     }
-    console.log(`Nishita sky: max=(${maxR.toFixed(2)}, ${maxG.toFixed(2)}, ${maxB.toFixed(2)}) avg=(${(avgR/n).toFixed(3)}, ${(avgG/n).toFixed(3)}, ${(avgB/n).toFixed(3)})`);
   }
 
   _recomputeSunData(params, simplified) {
-    // Use faithful Cycles Nishita port for sun disc
-    const { precomputeSunDisc, earthIntersectionAngle: eia } = this._nishitaModule;
-    const sun = precomputeSunDisc(
-      simplified.sunElevation,
-      params.sunAngularDiameter,
-      params.altitude,
-      params.airDensity, params.aerosolDensity
-    );
-    // Convert XYZ → RGB
-    const brgb = [0,0,0], trgb = [0,0,0];
-    xyzToLinearSrgb(sun.bottomXYZ[0], sun.bottomXYZ[1], sun.bottomXYZ[2], brgb);
-    xyzToLinearSrgb(sun.topXYZ[0], sun.topXYZ[1], sun.topXYZ[2], trgb);
-    // Scale sun disc: raw values are per-steradian (~3M), need ~1000-5000 for renderer
-    const sunScale = params.sunIntensity * 0.0005;
-    for (let c = 0; c < 3; c++) {
-      this.sunBottomRgb[c] = Math.max(0, brgb[c]) * sunScale;
-      this.sunTopRgb[c] = Math.max(0, trgb[c]) * sunScale;
-    }
-    this.earthIntersectionAngle = -eia(params.altitude);
+    // Analytic sun disc: warm white, attenuated near horizon
+    const sunEl = simplified.sunElevation;
+    const sunFactor = clamp(sunEl / 1.2, 0.0, 1.0);
+    // Sun color: warm white at high elevation, reddish near horizon
+    const sunRadiance = 500.0 * params.sunIntensity;
+    this.sunBottomRgb[0] = sunRadiance * (0.9 + 0.1 * sunFactor);
+    this.sunBottomRgb[1] = sunRadiance * (0.7 + 0.2 * sunFactor);
+    this.sunBottomRgb[2] = sunRadiance * (0.4 + 0.3 * sunFactor);
+    this.sunTopRgb[0] = this.sunBottomRgb[0] * 1.05;
+    this.sunTopRgb[1] = this.sunBottomRgb[1] * 1.05;
+    this.sunTopRgb[2] = this.sunBottomRgb[2] * 1.05;
+    // Earth intersection angle (below this elevation, ground blocks sky)
+    const altKm = Math.max(params.altitude, 1.0) / 1000.0;
+    this.earthIntersectionAngle = -Math.acos(6360.0 / (6360.0 + altKm));
     this.sunAngularDiameter = params.sunAngularDiameter;
     this.sunSolidAngle = TWO_PI * (1.0 - Math.cos(params.sunAngularDiameter * 0.5));
     console.log(`Sun disc: bottom=(${this.sunBottomRgb[0].toFixed(1)}, ${this.sunBottomRgb[1].toFixed(1)}, ${this.sunBottomRgb[2].toFixed(1)}) top=(${this.sunTopRgb[0].toFixed(1)}, ${this.sunTopRgb[1].toFixed(1)}, ${this.sunTopRgb[2].toFixed(1)})`);
