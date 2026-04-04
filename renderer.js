@@ -1666,6 +1666,9 @@ async function init() {
 
   // --- Render state ---
   let frameIndex = 0, cameraMoved = false, framesStill = 0, autoExposure = 1.0;
+  // Reusable staging buffer for autoexposure readback (avoids creating one per frame)
+  let exposureStagingBusy = false;
+  const exposureStagingBuf = device.createBuffer({ size: 16, usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST });
   let lastTime = performance.now(), fps = 0, fpsAccum = 0, fpsCount = 0;
 
   // --- Per-pass GPU timing (CPU-side submit timing) ---
@@ -2077,34 +2080,20 @@ async function init() {
       rp.draw(3);
       rp.end();
 
-      // Auto-exposure: copy accumulator to staging for async readback
-      const exposureStaging = device.createBuffer({ size: 16, usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST });
-      const copyEncoder = device.createCommandEncoder();
-      copyEncoder.copyBufferToBuffer(exposureBuf, 0, exposureStaging, 0, 16);
+      // Auto-exposure: copy accumulator to staging for async readback (reuse buffer)
       const t_submit = performance.now();
-      device.queue.submit([encoder.finish(), copyEncoder.finish()]);
+      if (!exposureStagingBusy) {
+        const copyEncoder = device.createCommandEncoder();
+        copyEncoder.copyBufferToBuffer(exposureBuf, 0, exposureStagingBuf, 0, 16);
+        device.queue.submit([encoder.finish(), copyEncoder.finish()]);
+        exposureStagingBusy = true;
 
-      // GPU timing: measure actual GPU work completion
-      device.queue.onSubmittedWorkDone().then(() => {
-        const t_gpu_done = performance.now();
-        passTimers.total = t_gpu_done - t_frame_start;
-        passTimers.gbuffer = t_gbuffer - t_frame_start;
-        passTimers.shadow = t_shadow - t_gbuffer;
-        passTimers.pathtrace = t_submit - t_shadow; // encoding time (approximation)
-        // Log every 120 frames
-        timerLogCounter++;
-        if (timerLogCounter % 120 === 0) {
-          rlog(`TIMING: total=${passTimers.total.toFixed(1)}ms gbuf=${passTimers.gbuffer.toFixed(1)}ms shadow=${passTimers.shadow.toFixed(1)}ms encode=${passTimers.pathtrace.toFixed(1)}ms gpu=${(t_gpu_done - t_submit).toFixed(1)}ms`);
-        }
-      });
-
-      // Async readback: compute new exposure from accumulated luminance
-      exposureStaging.mapAsync(GPUMapMode.READ).then(() => {
-        const data = new Uint32Array(exposureStaging.getMappedRange());
-        const logLumSum = data[0];
-        const pixelCount = data[1];
-        exposureStaging.unmap();
-        exposureStaging.destroy();
+        exposureStagingBuf.mapAsync(GPUMapMode.READ).then(() => {
+          const data = new Uint32Array(exposureStagingBuf.getMappedRange());
+          const logLumSum = data[0];
+          const pixelCount = data[1];
+          exposureStagingBuf.unmap();
+          exposureStagingBusy = false;
 
         if (pixelCount > 0) {
           const avgLogLum = logLumSum / (16.0 * pixelCount) - 20.0;
@@ -2116,7 +2105,24 @@ async function init() {
         }
         // Reset accumulators for next frame
         device.queue.writeBuffer(exposureBuf, 0, new Uint32Array([0, 0]));
-      }).catch(() => { exposureStaging.destroy(); });
+      }).catch(() => { exposureStagingBusy = false; });
+      } else {
+        // Staging buffer busy — just submit without exposure readback this frame
+        device.queue.submit([encoder.finish()]);
+      }
+
+      // GPU timing
+      device.queue.onSubmittedWorkDone().then(() => {
+        const t_gpu_done = performance.now();
+        passTimers.total = t_gpu_done - t_frame_start;
+        passTimers.gbuffer = t_gbuffer - t_frame_start;
+        passTimers.shadow = t_shadow - t_gbuffer;
+        passTimers.pathtrace = t_submit - t_shadow;
+        timerLogCounter++;
+        if (timerLogCounter % 120 === 0) {
+          rlog(`TIMING: total=${passTimers.total.toFixed(1)}ms gbuf=${passTimers.gbuffer.toFixed(1)}ms shadow=${passTimers.shadow.toFixed(1)}ms encode=${passTimers.pathtrace.toFixed(1)}ms gpu=${(t_gpu_done - t_submit).toFixed(1)}ms`);
+        }
+      });
 
       if (frameIndex === 1) rlog('First frame OK');
     } catch(e) {
