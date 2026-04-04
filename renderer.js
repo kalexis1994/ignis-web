@@ -203,6 +203,8 @@ async function init() {
 
   // --- Load shaders ---
   const v = Date.now(); // cache bust
+  // Inject unique comment into each shader to force Dawn pipeline cache invalidation
+  const shaderSalt = `\n// build ${v}\n`;
   let [ptCode, dispCode, fsrCode, dnCode, tmpCode, gbCode, smCode] = await Promise.all([
     fetch(`pathtracer.wgsl?v=${v}`).then(r => r.text()),
     fetch(`display.wgsl?v=${v}`).then(r => r.text()),
@@ -233,13 +235,13 @@ async function init() {
   }
 
   const smOpts = { strictMath: false };
-  const ptModule = device.createShaderModule({ code: ptCode, ...smOpts });
-  const dispModule = device.createShaderModule({ code: dispCode, ...smOpts });
-  const fsrModule = device.createShaderModule({ code: fsrCode, ...smOpts });
-  const dnModule = device.createShaderModule({ code: dnCode, ...smOpts });
-  const tmpModule = device.createShaderModule({ code: tmpCode, ...smOpts });
-  const gbModule = device.createShaderModule({ code: gbCode, ...smOpts });
-  const shadowModule = device.createShaderModule({ code: smCode, ...smOpts });
+  const ptModule = device.createShaderModule({ code: ptCode + shaderSalt, ...smOpts });
+  const dispModule = device.createShaderModule({ code: dispCode + shaderSalt, ...smOpts });
+  const fsrModule = device.createShaderModule({ code: fsrCode + shaderSalt, ...smOpts });
+  const dnModule = device.createShaderModule({ code: dnCode + shaderSalt, ...smOpts });
+  const tmpModule = device.createShaderModule({ code: tmpCode + shaderSalt, ...smOpts });
+  const gbModule = device.createShaderModule({ code: gbCode + shaderSalt, ...smOpts });
+  const shadowModule = device.createShaderModule({ code: smCode + shaderSalt, ...smOpts });
 
   // Check shader compilation
   for (const [name, mod] of [['pathtracer',ptModule],['display',dispModule],['fsr',fsrModule],['denoise',dnModule],['temporal',tmpModule],['gbuffer',gbModule],['shadow-map',shadowModule]]) {
