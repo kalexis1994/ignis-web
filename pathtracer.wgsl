@@ -116,8 +116,17 @@ const INV_PI: f32 = 0.31830988618;
 const INF: f32 = 1e30;
 const T_MIN: f32 = 0.00001;    // minimum ray t (intersection test)
 
+// Shadow terminator fix (Cycles light/sample.h) — extra offset when shading/geo normals diverge
+fn shadow_terminator_offset(pos: vec3f, normal: vec3f, geo_normal: vec3f, light_dir: vec3f) -> vec3f {
+  let NL = dot(normal, light_dir);
+  let NgL = dot(geo_normal, light_dir);
+  let offset_cutoff = 0.1;
+  if NL < 0.0 || NgL >= NL { return pos; } // no fix needed
+  let offset_amount = clamp(1.0 - NgL / offset_cutoff, 0.0, 1.0);
+  return pos + geo_normal * offset_amount * 0.01;
+}
+
 // Robust ray origin offset (Wächter & Binder 2019, used in Cycles/PBRT)
-// Manipulates float bits to push origin along geometric normal — scales with distance from origin
 fn ray_offset(P: vec3f, Ng: vec3f) -> vec3f {
   let int_scale = 256.0;
   let oi = vec3i(vec3f(int_scale) * Ng);
@@ -928,9 +937,11 @@ fn sample_sun_nee_split(pos: vec3f, normal: vec3f, geo_normal: vec3f, V: vec3f, 
 
       if dot(normal, L) > 0.0 {
         // Sun samples use shadow map (fast), env samples use BVH shadow ray
+        // Shadow terminator fix: extra offset when shading/geo normals diverge
+        let st_origin = shadow_terminator_offset(origin, normal, geo_normal, L);
         let not_occluded = select(
-          !trace_shadow(origin, L, 200.0),    // env: BVH shadow ray
-          sample_shadow_map(pos) > 0.0,        // sun: shadow map lookup
+          !trace_shadow(st_origin, L, 200.0),  // env: BVH shadow ray
+          sample_shadow_map(pos) > 0.0,         // sun: shadow map lookup
           chose_sun
         );
         if not_occluded {
@@ -1036,7 +1047,8 @@ fn sample_scene_nee_basic(pos: vec3f, normal: vec3f, geo_normal: vec3f, V: vec3f
         let env_s = env_sample(env_r.x, env_r.y);
         L = env_s.xyz;
       }
-      if dot(normal, L) > 0.0 && !trace_shadow(origin, L, 200.0) {
+      let st_origin = shadow_terminator_offset(origin, normal, geo_normal, L);
+      if dot(normal, L) > 0.0 && !trace_shadow(st_origin, L, 200.0) {
         let radiance = sky_color(L);
         let sun_pdf_val = pdf_uniform_cone(L, g_sun_dir, env_sun_cos_half_angle());
         let env_pdf_val = env_pdf_dir(L);
