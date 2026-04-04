@@ -858,20 +858,13 @@ fn sun_nee_common(origin: vec3f, pos: vec3f, normal: vec3f, V: vec3f, surface: S
       }
     }
   } else {
-    // Bounces 1+: BVH shadow rays
-    var shadow_val = 0.0;
-    let L1 = sample_cone(g_sun_dir, env_sun_cos_half_angle());
-    let L2 = sample_cone(g_sun_dir, env_sun_cos_half_angle());
-    if !trace_shadow(origin, L1, 50.0) { shadow_val += 0.5; }
-    if !trace_shadow(origin, L2, 50.0) { shadow_val += 0.5; }
-    if shadow_val > 0.0 {
-      let L = normalize(L1 + L2);
-      if dot(normal, L) > 0.0 {
-        let brdf = eval_surface_split(surface, V, L);
-        let light = analytic_sun_radiance(L) * env_sun_solid_angle() * shadow_val;
-        result.diffuse += brdf.diffuse * light;
-        result.specular += brdf.specular * light;
-      }
+    // Bounces 1+: single BVH shadow ray (second sample is noise-dominated at indirect bounces)
+    let L = sample_cone(g_sun_dir, env_sun_cos_half_angle());
+    if dot(normal, L) > 0.0 && !trace_shadow(origin, L, 50.0) {
+      let brdf = eval_surface_split(surface, V, L);
+      let light = analytic_sun_radiance(L) * env_sun_solid_angle();
+      result.diffuse += brdf.diffuse * light;
+      result.specular += brdf.specular * light;
     }
   }
   return result;
@@ -882,8 +875,8 @@ fn sample_sun_nee_split(pos: vec3f, normal: vec3f, V: vec3f, td: vec4u, mat: Mat
   let surface = build_surface_eval(td, mat, normal, baseColor, roughness, metallic, transmission, uv0, uv1, uv2, uv3);
   var result_split = BRDFSplit(vec3f(0.0), vec3f(0.0));
 
-  // Sun NEE: shadow map for primary hits (fast raster lookup, no BVH)
-  let sun = sun_nee_common(origin, pos, normal, V, surface, true);
+  // Sun NEE: BVH shadow rays (shadow map available but disabled by user)
+  let sun = sun_nee_common(origin, pos, normal, V, surface, false);
   result_split.diffuse += sun.diffuse;
   result_split.specular += sun.specular;
 
