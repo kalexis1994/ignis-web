@@ -1,3 +1,5 @@
+import * as nishita from './sky-nishita.js';
+
 const PI = Math.PI;
 const HALF_PI = PI * 0.5;
 const TWO_PI = PI * 2.0;
@@ -525,6 +527,7 @@ export class CyclesSkyModel {
     this.sunAngularDiameter = this.defaults.sunAngularDiameter;
     this.sunSolidAngle = CYCLES_SUN_SOLID_ANGLE;
     this.atmosphereModel = null;
+    this._nishitaModule = nishita;
     this.stats = {
       rebuiltAtmosphere: false,
       rebuiltTexture: false,
@@ -535,11 +538,10 @@ export class CyclesSkyModel {
 
   _ensureAtmosphereModel(params) {
     const key = atmosphereKey(params);
-    if (key === this.lastAtmosphereKey && this.atmosphereModel) {
+    if (key === this.lastAtmosphereKey) {
       return false;
     }
-    this.atmosphereModel = new MultipleScatteringSky(params.airDensity, params.aerosolDensity, params.ozoneDensity);
-    this.atmosphereModel.precomputeTransmittanceLut();
+    // Nishita port is stateless — no precomputation needed
     this.lastAtmosphereKey = key;
     this.lastTextureKey = "";
     this.lastSunDataKey = "";
@@ -547,71 +549,56 @@ export class CyclesSkyModel {
   }
 
   _recomputeSkyTexture(params, simplified) {
-    const model = this.atmosphereModel;
-    const altitudeKm = clamp(params.altitude, 1.0, 99999.0) / 1000.0;
-    const rayOrigin = [0.0, 0.0, EARTH_RADIUS_KM + altitudeKm];
-    const sunDir = sunDirectionFromElevation(simplified.sunElevation);
-    const xyz = [0.0, 0.0, 0.0];
-    const rgb = [0.0, 0.0, 0.0];
+    // Use faithful Cycles Nishita port (sky-nishita.js)
+    const { precomputeSkyTexture } = this._nishitaModule;
+    const xyzPixels = precomputeSkyTexture(
+      this.textureWidth, this.textureHeight,
+      simplified.sunElevation,
+      params.altitude,
+      params.airDensity, params.aerosolDensity, params.ozoneDensity
+    );
 
-    for (let y = 0; y < this.textureHeight; y++) {
-      for (let x = 0; x < this.textureWidth; x++) {
-        const u = (x + 0.5) / this.textureWidth;
-        const v = (y + 0.5) / this.textureHeight;
-        const localDir = skyTextureUvToLocalDir(u, v);
-        const atmosDist = raySphereIntersection(
-          rayOrigin[0], rayOrigin[1], rayOrigin[2],
-          localDir[0], localDir[1], localDir[2],
-          ATMOSPHERE_RADIUS_KM,
-        );
-        const groundDist = raySphereIntersection(
-          rayOrigin[0], rayOrigin[1], rayOrigin[2],
-          localDir[0], localDir[1], localDir[2],
-          EARTH_RADIUS_KM,
-        );
-        const tMax = groundDist < 0.0 ? atmosDist : groundDist;
-
-        model.getInscattering(sunDir, rayOrigin, localDir, Math.max(tMax, 0.0), xyz);
-        xyzToLinearSrgb(xyz[0], xyz[1], xyz[2], rgb);
-
-        const pixel = (y * this.textureWidth + x);
-        const rgbIndex = pixel * 3;
-        // Scale down physically-based sky radiance to renderer-friendly range
-        // Raw Nishita values peak at ~250 near sun — need ~0.04x to get max ~10
-        const skyScale = 0.04;
-        this.skyTextureRgb[rgbIndex + 0] = rgb[0] * skyScale;
-        this.skyTextureRgb[rgbIndex + 1] = rgb[1] * skyScale;
-        this.skyTextureRgb[rgbIndex + 2] = rgb[2] * skyScale;
-      }
-    }
-    // Debug: log sky texture value range
-    let maxR=0, maxG=0, maxB=0, avgR=0, avgG=0, avgB=0;
+    // Convert XYZ → linear sRGB for the env map texture
+    const rgb = [0, 0, 0];
     const n = this.textureWidth * this.textureHeight;
+    let maxR=0, maxG=0, maxB=0, avgR=0, avgG=0, avgB=0;
     for (let i = 0; i < n; i++) {
-      const r = this.skyTextureRgb[i*3], g = this.skyTextureRgb[i*3+1], b = this.skyTextureRgb[i*3+2];
-      maxR = Math.max(maxR, r); maxG = Math.max(maxG, g); maxB = Math.max(maxB, b);
-      avgR += r; avgG += g; avgB += b;
+      const X = xyzPixels[i * 4];
+      const Y = xyzPixels[i * 4 + 1];
+      const Z = xyzPixels[i * 4 + 2];
+      xyzToLinearSrgb(X, Y, Z, rgb);
+      this.skyTextureRgb[i * 3 + 0] = Math.max(0, rgb[0]);
+      this.skyTextureRgb[i * 3 + 1] = Math.max(0, rgb[1]);
+      this.skyTextureRgb[i * 3 + 2] = Math.max(0, rgb[2]);
+      maxR = Math.max(maxR, rgb[0]); maxG = Math.max(maxG, rgb[1]); maxB = Math.max(maxB, rgb[2]);
+      avgR += rgb[0]; avgG += rgb[1]; avgB += rgb[2];
     }
-    console.log(`Sky texture: max=(${maxR.toFixed(2)}, ${maxG.toFixed(2)}, ${maxB.toFixed(2)}) avg=(${(avgR/n).toFixed(3)}, ${(avgG/n).toFixed(3)}, ${(avgB/n).toFixed(3)})`);
-    console.log(`Sun disc: bottom=(${this.sunBottomRgb[0]?.toFixed?.(1)}, ${this.sunBottomRgb[1]?.toFixed?.(1)}, ${this.sunBottomRgb[2]?.toFixed?.(1)})`);
+    console.log(`Nishita sky: max=(${maxR.toFixed(2)}, ${maxG.toFixed(2)}, ${maxB.toFixed(2)}) avg=(${(avgR/n).toFixed(3)}, ${(avgG/n).toFixed(3)}, ${(avgB/n).toFixed(3)})`);
   }
 
   _recomputeSunData(params, simplified) {
-    const model = this.atmosphereModel;
-    model.getSunDiscRgb(
+    // Use faithful Cycles Nishita port for sun disc
+    const { precomputeSunDisc, earthIntersectionAngle: eia } = this._nishitaModule;
+    const sun = precomputeSunDisc(
       simplified.sunElevation,
       params.sunAngularDiameter,
       params.altitude,
-      this.sunBottomRgb,
-      this.sunTopRgb,
+      params.airDensity, params.aerosolDensity
     );
+    // Convert XYZ → RGB
+    const brgb = [0,0,0], trgb = [0,0,0];
+    xyzToLinearSrgb(sun.bottomXYZ[0], sun.bottomXYZ[1], sun.bottomXYZ[2], brgb);
+    xyzToLinearSrgb(sun.topXYZ[0], sun.topXYZ[1], sun.topXYZ[2], trgb);
+    // Scale sun disc: raw values are per-steradian (~3M), need ~1000-5000 for renderer
+    const sunScale = params.sunIntensity * 0.0005;
     for (let c = 0; c < 3; c++) {
-      this.sunBottomRgb[c] *= params.sunIntensity;
-      this.sunTopRgb[c] *= params.sunIntensity;
+      this.sunBottomRgb[c] = Math.max(0, brgb[c]) * sunScale;
+      this.sunTopRgb[c] = Math.max(0, trgb[c]) * sunScale;
     }
-    this.earthIntersectionAngle = -earthIntersectionAngle(params.altitude);
+    this.earthIntersectionAngle = -eia(params.altitude);
     this.sunAngularDiameter = params.sunAngularDiameter;
     this.sunSolidAngle = TWO_PI * (1.0 - Math.cos(params.sunAngularDiameter * 0.5));
+    console.log(`Sun disc: bottom=(${this.sunBottomRgb[0].toFixed(1)}, ${this.sunBottomRgb[1].toFixed(1)}, ${this.sunBottomRgb[2].toFixed(1)}) top=(${this.sunTopRgb[0].toFixed(1)}, ${this.sunTopRgb[1].toFixed(1)}, ${this.sunTopRgb[2].toFixed(1)})`);
   }
 
   _sampleCyclesSkyWorld(worldDir, sunRotation, outRgb) {
