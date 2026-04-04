@@ -927,9 +927,13 @@ fn sample_sun_nee_split(pos: vec3f, normal: vec3f, geo_normal: vec3f, V: vec3f, 
       }
 
       if dot(normal, L) > 0.0 {
-        // Shadow map for primary hits (no BVH traversal needed)
-        let shadow_val = sample_shadow_map(pos);
-        if shadow_val > 0.0 {
+        // Sun samples use shadow map (fast), env samples use BVH shadow ray
+        let not_occluded = select(
+          !trace_shadow(origin, L, 200.0),    // env: BVH shadow ray
+          sample_shadow_map(pos) > 0.0,        // sun: shadow map lookup
+          chose_sun
+        );
+        if not_occluded {
           let radiance = sky_color(L);
 
           let sun_pdf_val = pdf_uniform_cone(L, g_sun_dir, env_sun_cos_half_angle());
