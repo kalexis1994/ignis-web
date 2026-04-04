@@ -628,10 +628,43 @@ export class CyclesSkyModel {
     console.log(`Sun disc: bottom=(${this.sunBottomRgb[0].toFixed(1)}, ${this.sunBottomRgb[1].toFixed(1)}, ${this.sunBottomRgb[2].toFixed(1)}) top=(${this.sunTopRgb[0].toFixed(1)}, ${this.sunTopRgb[1].toFixed(1)}, ${this.sunTopRgb[2].toFixed(1)})`);
   }
 
-  _sampleCyclesSkyWorld(worldDir, sunRotation, outRgb) {
-    const localDir = worldToCyclesLocal(worldDir);
-    const [u, v] = cyclesSkyUvFromLocalDir(localDir, sunRotation);
-    sampleBilinearRgb(this.skyTextureRgb, this.textureWidth, this.textureHeight, u, v, outRgb);
+  // Analytic sky matching the WGSL shader — used for env map + importance sampling
+  _analyticSkyRgb(dir, sunEl, sunAz, out) {
+    const sunDir = [Math.cos(sunEl) * Math.sin(sunAz), Math.sin(sunEl), Math.cos(sunEl) * Math.cos(sunAz)];
+    const sunFactor = clamp(sunEl / 1.2, 0.0, 1.0);
+    const sunsetWarmth = 1.0 - sunFactor;
+    const elevation = Math.asin(clamp(dir[1], -1.0, 1.0));
+
+    if (elevation < -0.01) {
+      const fade = Math.max(0.0, 1.0 + elevation * 5.0);
+      out[0] = 0.05 * fade; out[1] = 0.05 * fade; out[2] = 0.06 * fade;
+      return;
+    }
+
+    const cosGamma = clamp(dir[0]*sunDir[0] + dir[1]*sunDir[1] + dir[2]*sunDir[2], -1.0, 1.0);
+    const t = Math.pow(clamp(elevation / (PI * 0.5), 0.0, 1.0), 0.4);
+
+    const zenithR = 0.3 * (0.8 + 0.4 * sunFactor);
+    const zenithG = 0.5 * (0.8 + 0.4 * sunFactor);
+    const zenithB = 1.2 * (0.8 + 0.4 * sunFactor);
+    const horizR = 0.8 + sunsetWarmth * 0.5;
+    const horizG = 0.7 + sunsetWarmth * 0.2;
+    const horizB = 0.6 - sunsetWarmth * 0.2;
+
+    let r = mix(horizR, zenithR, t);
+    let g = mix(horizG, zenithG, t);
+    let b = mix(horizB, zenithB, t);
+
+    const rayleighF = Math.pow(Math.max(1.0 - cosGamma, 0.0), 0.5) * 0.3;
+    r += 0.1 * rayleighF; g += 0.2 * rayleighF; b += 0.5 * rayleighF;
+
+    const mie_g = 0.76;
+    const mie = (1.0 - mie_g * mie_g) / Math.pow(1.0 + mie_g * mie_g - 2.0 * mie_g * cosGamma, 1.5);
+    r += 1.2 * sunFactor * mie * 0.15;
+    g += 1.0 * sunFactor * mie * 0.15;
+    b += 0.8 * sunFactor * mie * 0.15;
+
+    out[0] = r * 2.5; out[1] = g * 2.5; out[2] = b * 2.5;
   }
 
   _rebuildPacked(params, simplified) {
@@ -657,7 +690,7 @@ export class CyclesSkyModel {
         const u = (x + 0.5) / this.width;
         const v = (y + 0.5) / this.height;
         const worldDir = envUvToWorldDir(u, v);
-        this._sampleCyclesSkyWorld(worldDir, simplified.sunRotation, this.sampleRgb);
+        this._analyticSkyRgb(worldDir, simplified.sunElevation, simplified.sunRotation, this.sampleRgb);
 
         this.packed[rgbOff + outRgb + 0] = this.sampleRgb[0];
         this.packed[rgbOff + outRgb + 1] = this.sampleRgb[1];

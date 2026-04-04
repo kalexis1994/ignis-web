@@ -1404,52 +1404,10 @@ fn power_heuristic(a: f32, b: f32) -> f32 {
 // Sky + Sun NEE
 // ============================================================
 
-// Hosek-Wilkie inspired analytic sky model (no lookup tables)
-// Produces physically plausible blue sky with sun glow, ground darkening
+// Sky color: env map lookup (fast) + analytic sun disc
+// The env map is pre-generated from the analytic sky model in JS
 fn sky_color(dir: vec3f) -> vec3f {
-  let sun_dir = g_sun_dir;
-
-  // Elevation: 0 at horizon, PI/2 at zenith, negative below
-  let elevation = asin(clamp(dir.y, -1.0, 1.0));
-
-  // Ground: fade to dark below horizon
-  if elevation < -0.01 {
-    return vec3f(0.05, 0.05, 0.06) * max(0.0, 1.0 + elevation * 5.0);
-  }
-
-  // Gamma: angle between viewing direction and sun
-  let cos_gamma = clamp(dot(dir, sun_dir), -1.0, 1.0);
-  let gamma = acos(cos_gamma);
-
-  // Zenith color (deep blue, brighter with higher sun)
-  let sun_el = asin(clamp(sun_dir.y, -1.0, 1.0));
-  let sun_factor = clamp(sun_el / 1.2, 0.0, 1.0); // 0 at sunset, 1 at high noon
-  let zenith = vec3f(0.3, 0.5, 1.2) * (0.8 + 0.4 * sun_factor);
-
-  // Horizon color (warm white/orange, especially at sunset)
-  let sunset_warmth = 1.0 - sun_factor;
-  let horizon = vec3f(0.8 + sunset_warmth * 0.5, 0.7 + sunset_warmth * 0.2, 0.6 - sunset_warmth * 0.2);
-
-  // Gradient: horizon → zenith based on elevation
-  let t = clamp(elevation / (PI * 0.5), 0.0, 1.0);
-  let gradient_power = 0.4; // controls how quickly blue takes over
-  var sky = mix(horizon, zenith, pow(t, gradient_power));
-
-  // Rayleigh scattering: makes sky bluer away from sun
-  let rayleigh = vec3f(0.1, 0.2, 0.5) * pow(max(1.0 - cos_gamma, 0.0), 0.5) * 0.3;
-  sky += rayleigh;
-
-  // Mie glow: bright halo around sun (forward scattering)
-  let mie_g = 0.76;
-  let mie = (1.0 - mie_g * mie_g) / pow(1.0 + mie_g * mie_g - 2.0 * mie_g * cos_gamma, 1.5);
-  let sun_color = vec3f(1.2, 1.0, 0.8) * sun_factor; // warm sun glow
-  sky += sun_color * mie * 0.15;
-
-  // Overall sky intensity (controls scene lighting)
-  sky *= 2.5;
-
-  // Add analytic sun disc on top
-  return sky + analytic_sun_radiance(dir);
+  return env_sample_rgb_uv(env_dir_to_uv(dir)) + analytic_sun_radiance(dir);
 }
 
 // ============================================================

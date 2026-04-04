@@ -1112,7 +1112,7 @@ async function init() {
     const t0 = performance.now();
     const skyState = skyModel.update({
       sunElevation: settings.sunElevation * Math.PI / 180,
-      sunAzimuth: -settings.sunAzimuth * Math.PI / 180 + Math.PI,
+      sunAzimuth: settings.sunAzimuth * Math.PI / 180,
     });
     device.queue.writeBuffer(envCdfBuf, 0, skyState.buffer);
     lastEnvSunEl = settings.sunElevation;
