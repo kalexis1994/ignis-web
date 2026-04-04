@@ -612,8 +612,10 @@ export class CyclesSkyModel {
     // Analytic sun disc: warm white, attenuated near horizon
     const sunEl = simplified.sunElevation;
     const sunFactor = clamp(sunEl / 1.2, 0.0, 1.0);
-    // Sun color: warm white at high elevation, reddish near horizon
-    const sunRadiance = 500.0 * params.sunIntensity;
+    // Sun radiance per steradian — shader multiplies by solid_angle to get irradiance
+    // Target irradiance ~500 → radiance = 500 / solid_angle
+    this.sunSolidAngle = TWO_PI * (1.0 - Math.cos(params.sunAngularDiameter * 0.5));
+    const sunRadiance = 500.0 * params.sunIntensity / this.sunSolidAngle;
     this.sunBottomRgb[0] = sunRadiance * (0.9 + 0.1 * sunFactor);
     this.sunBottomRgb[1] = sunRadiance * (0.7 + 0.2 * sunFactor);
     this.sunBottomRgb[2] = sunRadiance * (0.4 + 0.3 * sunFactor);

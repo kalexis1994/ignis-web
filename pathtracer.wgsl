@@ -825,19 +825,16 @@ fn sample_punctual_nee_split(pos: vec3f, origin: vec3f, V: vec3f, surface: Surfa
 fn sample_shadow_map(world_pos: vec3f) -> f32 {
   let light_clip = uniforms.light_view_proj * vec4f(world_pos, 1.0);
   let ndc = light_clip.xyz / light_clip.w;
-  // NDC to UV: x [-1,1] → [0,1], y [-1,1] → [1,0] (flip Y)
   let uv = vec2f(ndc.x * 0.5 + 0.5, -ndc.y * 0.5 + 0.5);
-  // Out of shadow map bounds → not in shadow
   if uv.x < 0.0 || uv.x > 1.0 || uv.y < 0.0 || uv.y > 1.0 { return 1.0; }
-  // Bias to prevent shadow acne (push slightly toward light)
-  let depth = ndc.z + 0.002;
-  // PCF 2x2 for softer shadows
+
+  let depth = ndc.z - 0.002;
   let texel = 1.0 / 2048.0;
   var shadow = 0.0;
-  shadow += textureSampleCompareLevel(shadow_map, shadow_sampler,uv + vec2f(-texel, -texel), depth);
-  shadow += textureSampleCompareLevel(shadow_map, shadow_sampler,uv + vec2f( texel, -texel), depth);
-  shadow += textureSampleCompareLevel(shadow_map, shadow_sampler,uv + vec2f(-texel,  texel), depth);
-  shadow += textureSampleCompareLevel(shadow_map, shadow_sampler,uv + vec2f( texel,  texel), depth);
+  shadow += textureSampleCompareLevel(shadow_map, shadow_sampler, uv + vec2f(-texel, -texel), depth);
+  shadow += textureSampleCompareLevel(shadow_map, shadow_sampler, uv + vec2f( texel, -texel), depth);
+  shadow += textureSampleCompareLevel(shadow_map, shadow_sampler, uv + vec2f(-texel,  texel), depth);
+  shadow += textureSampleCompareLevel(shadow_map, shadow_sampler, uv + vec2f( texel,  texel), depth);
   return shadow * 0.25;
 }
 
@@ -875,7 +872,6 @@ fn sample_sun_nee_split(pos: vec3f, normal: vec3f, V: vec3f, td: vec4u, mat: Mat
   let surface = build_surface_eval(td, mat, normal, baseColor, roughness, metallic, transmission, uv0, uv1, uv2, uv3);
   var result_split = BRDFSplit(vec3f(0.0), vec3f(0.0));
 
-  // Sun NEE: BVH shadow rays (shadow map available but disabled by user)
   let sun = sun_nee_common(origin, pos, normal, V, surface, false);
   result_split.diffuse += sun.diffuse;
   result_split.specular += sun.specular;
