@@ -856,14 +856,15 @@ fn sample_shadow_map(world_pos: vec3f) -> f32 {
   let uv = vec2f(ndc.x * 0.5 + 0.5, -ndc.y * 0.5 + 0.5);
   if uv.x < 0.0 || uv.x > 1.0 || uv.y < 0.0 || uv.y > 1.0 { return 1.0; }
 
-  let depth = ndc.z - 0.002;
-  let texel = 1.0 / 2048.0;
-  var shadow = 0.0;
-  shadow += textureSampleCompareLevel(shadow_map, shadow_sampler, uv + vec2f(-texel, -texel), depth);
-  shadow += textureSampleCompareLevel(shadow_map, shadow_sampler, uv + vec2f( texel, -texel), depth);
-  shadow += textureSampleCompareLevel(shadow_map, shadow_sampler, uv + vec2f(-texel,  texel), depth);
-  shadow += textureSampleCompareLevel(shadow_map, shadow_sampler, uv + vec2f( texel,  texel), depth);
-  return shadow * 0.25;
+  // Manual depth comparison (bypass sampler_comparison issues)
+  let sm_size = vec2f(textureDimensions(shadow_map));
+  let texel_coord = vec2i(uv * sm_size);
+  let sm_depth = textureLoad(shadow_map, texel_coord, 0);
+  // ndc.z < sm_depth means the point is closer to light than occluder → lit
+  if ndc.z < sm_depth + 0.002 {
+    return 1.0; // lit
+  }
+  return 0.0; // in shadow
 }
 
 fn sun_nee_common(origin: vec3f, pos: vec3f, normal: vec3f, V: vec3f, surface: SurfaceEval, use_shadow_map: bool) -> BRDFSplit {
@@ -926,11 +927,11 @@ fn sample_sun_nee_split(pos: vec3f, normal: vec3f, geo_normal: vec3f, V: vec3f, 
       }
 
       if dot(normal, L) > 0.0 {
-        if !trace_shadow(origin, L, 200.0) {
-          // Radiance from entire background (sun disc + sky)
+        // Shadow map for primary hits (no BVH traversal needed)
+        let shadow_val = sample_shadow_map(pos);
+        if shadow_val > 0.0 {
           let radiance = sky_color(L);
 
-          // Combined PDF: weighted sum of all methods
           let sun_pdf_val = pdf_uniform_cone(L, g_sun_dir, env_sun_cos_half_angle());
           let env_pdf_val = env_pdf_dir(L);
           let combined_pdf = sun_prob * sun_pdf_val + (1.0 - sun_prob) * max(env_pdf_val, 1e-8);
