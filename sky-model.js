@@ -174,7 +174,6 @@ function simplifyMultiscatterAngles(sunElevation, sunRotation) {
   }
 
   newSunRotation = wrapAnglePositive(newSunRotation);
-  newSunRotation = TWO_PI - newSunRotation;
 
   return {
     sunElevation: newSunElevation,

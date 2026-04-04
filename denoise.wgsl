@@ -531,11 +531,11 @@ fn composite(@builtin(global_invocation_id) gid: vec3u) {
     hdr = albedo * denoised_diff + denoised_spec;
   }
 
-  // Auto-exposure: accumulate log2-luminance (fixed-point, like ignis-rt)
+  // Auto-exposure: accumulate log2-luminance, excluding extreme outliers (sun disc)
   let lum = dot(hdr, vec3f(0.2126, 0.7152, 0.0722));
-  if lum > 0.001 {
-    let logLum = log2(lum) + 20.0; // offset to keep positive (range ~0-40 for typical scenes)
-    atomicAdd(&exposure_buf[0], u32(logLum * 16.0)); // fixed-point ×16
+  if lum > 0.001 && lum < 100.0 { // exclude sun disc (lum >> 100) from exposure calc
+    let logLum = log2(lum) + 20.0;
+    atomicAdd(&exposure_buf[0], u32(logLum * 16.0));
     atomicAdd(&exposure_buf[1], 1u);
   }
 

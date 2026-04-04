@@ -1089,7 +1089,7 @@ async function init() {
   const TONEMAP_NAMES = ['AgX Punchy', 'ACES', 'Reinhard', 'Uncharted 2', 'PBR Neutral', 'Standard', 'None'];
   const settings = {
     sunElevation: 58,
-    sunAzimuth: 53,
+    sunAzimuth: 0, // DEBUG: zero azimuth to verify sun alignment
     sharpness: 0.6,
     temporalAlpha: 0.02,
     tonemapMode: cfg.tonemap !== undefined ? cfg.tonemap : 0, // default: AgX Punchy (preserves saturation)
@@ -1112,7 +1112,7 @@ async function init() {
     const t0 = performance.now();
     const skyState = skyModel.update({
       sunElevation: settings.sunElevation * Math.PI / 180,
-      sunAzimuth: settings.sunAzimuth * Math.PI / 180,
+      sunAzimuth: -settings.sunAzimuth * Math.PI / 180 + Math.PI,
     });
     device.queue.writeBuffer(envCdfBuf, 0, skyState.buffer);
     lastEnvSunEl = settings.sunElevation;
