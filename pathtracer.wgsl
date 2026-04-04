@@ -2203,7 +2203,7 @@ fn path_trace_from_gbuffer(hit_pos: vec3f, normal_in: vec3f, view_dir: vec3f, ma
   let surface = build_surface_eval_basic(mat, normal, base_color, roughness, metallic, transmission);
 
   // Direct lighting (NEE to sun)
-  let direct = sample_scene_nee_basic(hit_pos, normal, geo_normal, V, surface);
+  let direct = sample_scene_nee_basic(hit_pos, normal, normal, V, surface); // no geo_normal in gbuffer path
   var radiance = direct;
 
   // SHaRC store (sparse)
@@ -2233,7 +2233,7 @@ fn path_trace_from_gbuffer(hit_pos: vec3f, normal_in: vec3f, view_dir: vec3f, ma
             let bV = -bounce_dir;
             let bbase = mat_base_color_factor(bmat);
             let bsurface = build_surface_eval_basic(bmat, bnormal, bbase, max(mat_roughness_factor(bmat), 0.04), mat_metallic_factor(bmat), 0.0);
-            let bind = sample_scene_nee_basic(bhit_pos, bnormal, bV, bsurface);
+            let bind = sample_scene_nee_basic(bhit_pos, bnormal, bnormal, bV, bsurface);
             radiance += base_color * (1.0 - metallic) * bind;
 
           // Sky irradiance on last bounce
