@@ -265,7 +265,7 @@ async function init() {
   });
 
   // --- Internal textures ---
-  const F16 = GPUTextureUsage.STORAGE_BINDING | GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_SRC;
+  const F16 = GPUTextureUsage.STORAGE_BINDING | GPUTextureUsage.TEXTURE_BINDING;
   const F16C = F16 | GPUTextureUsage.COPY_SRC | GPUTextureUsage.COPY_DST; // copyable
   const F16R = F16 | GPUTextureUsage.RENDER_ATTACHMENT; // rasterization target
   const noisyTex = device.createTexture({ size:[width,height], format:'rgba16float', usage:F16 }); // irradiance
