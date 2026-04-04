@@ -887,8 +887,9 @@ fn sun_nee_common(origin: vec3f, pos: vec3f, normal: vec3f, V: vec3f, surface: S
   return result;
 }
 
-fn sample_sun_nee_split(pos: vec3f, normal: vec3f, V: vec3f, td: vec4u, mat: Material, uv0: vec2f, uv1: vec2f, uv2: vec2f, uv3: vec2f, baseColor: vec3f, roughness: f32, metallic: f32, transmission: f32) -> BRDFSplit {
-  let origin = ray_offset(pos, normal);
+fn sample_sun_nee_split(pos: vec3f, normal: vec3f, geo_normal: vec3f, V: vec3f, td: vec4u, mat: Material, uv0: vec2f, uv1: vec2f, uv2: vec2f, uv3: vec2f, baseColor: vec3f, roughness: f32, metallic: f32, transmission: f32) -> BRDFSplit {
+  // Use GEOMETRIC normal for ray offset (Cycles approach — prevents light leaks at smooth edges)
+  let origin = ray_offset(pos, geo_normal);
   let surface = build_surface_eval(td, mat, normal, baseColor, roughness, metallic, transmission, uv0, uv1, uv2, uv3);
   var result_split = BRDFSplit(vec3f(0.0), vec3f(0.0));
 
@@ -971,13 +972,13 @@ fn sample_sun_nee_split(pos: vec3f, normal: vec3f, V: vec3f, td: vec4u, mat: Mat
   return result_split;
 }
 
-fn sample_sun_nee(pos: vec3f, normal: vec3f, V: vec3f, td: vec4u, mat: Material, uv0: vec2f, uv1: vec2f, uv2: vec2f, uv3: vec2f, baseColor: vec3f, roughness: f32, metallic: f32, transmission: f32) -> vec3f {
-  let split = sample_sun_nee_split(pos, normal, V, td, mat, uv0, uv1, uv2, uv3, baseColor, roughness, metallic, transmission);
+fn sample_sun_nee(pos: vec3f, normal: vec3f, geo_normal: vec3f, V: vec3f, td: vec4u, mat: Material, uv0: vec2f, uv1: vec2f, uv2: vec2f, uv3: vec2f, baseColor: vec3f, roughness: f32, metallic: f32, transmission: f32) -> vec3f {
+  let split = sample_sun_nee_split(pos, normal, geo_normal, V, td, mat, uv0, uv1, uv2, uv3, baseColor, roughness, metallic, transmission);
   return split.diffuse * baseColor + split.specular;
 }
 
-fn sample_scene_nee_basic(pos: vec3f, normal: vec3f, V: vec3f, surface: SurfaceEval) -> vec3f {
-  let origin = ray_offset(pos, normal);
+fn sample_scene_nee_basic(pos: vec3f, normal: vec3f, geo_normal: vec3f, V: vec3f, surface: SurfaceEval) -> vec3f {
+  let origin = ray_offset(pos, geo_normal);
   var result_split = BRDFSplit(vec3f(0.0), vec3f(0.0));
 
   // Sun NEE: BVH shadow rays for indirect bounces
@@ -2009,12 +2010,12 @@ fn path_trace(primary_origin: vec3f, primary_dir: vec3f) -> PathResult {
         blend_spec += base_color;
       } else {
         if use_primary_split {
-          let nee = sample_sun_nee_split(hit_pos, normal, V, td, mat, uv0, uv1, uv2, uv3, base_color, roughness, metallic, 0.0);
+          let nee = sample_sun_nee_split(hit_pos, normal, geo_normal, V, td, mat, uv0, uv1, uv2, uv3, base_color, roughness, metallic, 0.0);
           blend_diff += nee.diffuse * base_color;
           blend_spec += nee.specular;
           result.direct += blend_weight * (nee.diffuse * base_color + nee.specular);
         } else {
-          let direct = sample_sun_nee(hit_pos, normal, V, td, mat, uv0, uv1, uv2, uv3, base_color, roughness, metallic, 0.0);
+          let direct = sample_sun_nee(hit_pos, normal, geo_normal, V, td, mat, uv0, uv1, uv2, uv3, base_color, roughness, metallic, 0.0);
           if is_diffuse_path { blend_diff += direct; }
           else { blend_spec += direct; }
         }
@@ -2052,12 +2053,12 @@ fn path_trace(primary_origin: vec3f, primary_dir: vec3f) -> PathResult {
     // NEE: use the demodulated primary split only before crossing any glass interface.
     let use_primary_split = bounce == 0u && !went_through_glass;
     if use_primary_split {
-      let nee = sample_sun_nee_split(hit_pos, normal, V, td, mat, uv0, uv1, uv2, uv3, base_color, roughness, metallic, glass_transmission);
+      let nee = sample_sun_nee_split(hit_pos, normal, geo_normal, V, td, mat, uv0, uv1, uv2, uv3, base_color, roughness, metallic, glass_transmission);
       diff_rad += throughput * nee.diffuse;
       spec_rad += throughput * nee.specular;
       result.direct = nee.diffuse * base_color + nee.specular;
     } else {
-      let direct = sample_sun_nee(hit_pos, normal, V, td, mat, uv0, uv1, uv2, uv3, base_color, roughness, metallic, glass_transmission);
+      let direct = sample_sun_nee(hit_pos, normal, geo_normal, V, td, mat, uv0, uv1, uv2, uv3, base_color, roughness, metallic, glass_transmission);
       let gi_scale = select(1.0, GI_INTENSITY, bounce > 0u); // boost indirect bounces
       if is_diffuse_path { diff_rad += throughput * direct * gi_scale; }
       else { spec_rad += throughput * direct * gi_scale; }
@@ -2083,7 +2084,7 @@ fn path_trace(primary_origin: vec3f, primary_dir: vec3f) -> PathResult {
         if is_diffuse_path { diff_rad += gi; } else { spec_rad += gi; }
         break;
       }
-      let indirect_direct = sample_sun_nee(hit_pos, normal, V, td, mat, uv0, uv1, uv2, uv3, base_color, roughness, metallic, glass_transmission);
+      let indirect_direct = sample_sun_nee(hit_pos, normal, geo_normal, V, td, mat, uv0, uv1, uv2, uv3, base_color, roughness, metallic, glass_transmission);
       let ind = throughput * indirect_direct * GI_INTENSITY;
       if is_diffuse_path { diff_rad += ind; } else { spec_rad += ind; }
 
@@ -2202,7 +2203,7 @@ fn path_trace_from_gbuffer(hit_pos: vec3f, normal_in: vec3f, view_dir: vec3f, ma
   let surface = build_surface_eval_basic(mat, normal, base_color, roughness, metallic, transmission);
 
   // Direct lighting (NEE to sun)
-  let direct = sample_scene_nee_basic(hit_pos, normal, V, surface);
+  let direct = sample_scene_nee_basic(hit_pos, normal, geo_normal, V, surface);
   var radiance = direct;
 
   // SHaRC store (sparse)
