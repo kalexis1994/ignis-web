@@ -2297,19 +2297,25 @@ async function init() {
         rp[si++] = 1.0;    // fast_history_clamping_sigma_scale
         device.queue.writeBuffer(reblurParamBuf, 0, rp);
 
-        // Pass 1: PrePass (noisy → ping)
+        // DEBUG: ONLY temporal — everything else skipped to find bloom source
+        // PrePass SKIPPED: noisy goes directly to temporal via reblurBG_temporal
+        // which reads from pingTex. Need to copy noisy→ping first.
+        // Actually reblurBG_prepass: noisy→ping, so run it as passthrough:
+        // NO — the prepass does spatial filtering. Need a raw copy.
+        // Simplest: change reblurBG_temporal to read from noisy directly.
+        // For now: just run temporal with the prepass BG textures swapped.
+        // Actually the temporal BG reads pingTex. PrePass writes pingTex from noisy.
+        // If we skip PrePass, pingTex has stale data. We need to copy noisy→ping.
+        // Easiest hack: run PrePass but it will filter. Let's just accept that for now
+        // and skip everything AFTER temporal.
+
+        // PrePass: noisy → ping (keeps spatial filter for now)
         { const p = encoder.beginComputePass(); p.setPipeline(reblurPrepassPipeline); p.setBindGroup(0, reblurBG_prepass); p.dispatchWorkgroups(...wg); p.end(); }
-        // Pass 2: Temporal (ping + history → hdr)
+        // Temporal: ping + history → hdr (ONLY pass that matters)
         { const p = encoder.beginComputePass(); p.setPipeline(reblurTemporalPipeline); p.setBindGroup(0, reblurBG_temporal); p.setBindGroup(1, histBG); p.dispatchWorkgroups(...wg); p.end(); }
-        // Pass 3: HistoryFix (hdr → ping)
-        { const p = encoder.beginComputePass(); p.setPipeline(reblurHistoryFixPipeline); p.setBindGroup(0, reblurBG_historyfix); p.dispatchWorkgroups(...wg); p.end(); }
-        // Pass 4: Blur (ping → pong)
-        { const p = encoder.beginComputePass(); p.setPipeline(reblurBlurPipeline); p.setBindGroup(0, reblurBG_blur); p.dispatchWorkgroups(...wg); p.end(); }
-        // Pass 5: PostBlur (pong → ping)
-        { const p = encoder.beginComputePass(); p.setPipeline(reblurPostBlurPipeline); p.setBindGroup(0, reblurBG_postblur); p.dispatchWorkgroups(...wg); p.end(); }
-        // Pass 6: Stabilize (ping + history → hdr)
-        { const p = encoder.beginComputePass(); p.setPipeline(reblurStabilizePipeline); p.setBindGroup(0, reblurBG_stabilize); p.setBindGroup(1, histBG); p.dispatchWorkgroups(...wg); p.end(); }
-        // Copy to history for next frame
+        // ALL other passes SKIPPED
+        // Stabilize: SKIPPED (testing bloom source)
+        // Copy temporal output (hdrTex) to history for next frame
         { const p = encoder.beginComputePass(); p.setPipeline(copyToHistoryPipeline); p.setBindGroup(0, historyFrame === 0 ? reblurBG_copyHist_A : reblurBG_copyHist_B); p.dispatchWorkgroups(...wg); p.end(); }
         historyFrame = 1 - historyFrame;
 

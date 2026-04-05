@@ -551,15 +551,9 @@ fn prepass(@builtin(global_invocation_id) gid: vec3u) {
   let sz = vec2i(gp.rect_size);
   if px.x >= sz.x || px.y >= sz.y { return; }
 
-  let viewZ = read_viewz(px);
-  if viewZ > gp.denoising_range { return; }
-
-  let result = spatial_filter(px, sz,
-    REBLUR_PRE_PASS_RADIUS_SCALE, REBLUR_PRE_PASS_FRACTION_SCALE,
-    1.0 / (1.0 + 10.0), true, gp.rotator_pre);
-
-  textureStore(out_diff, px, result[0]);
-  textureStore(out_spec, px, result[1]);
+  // DEBUG: passthrough (no spatial filter) to test bloom source
+  textureStore(out_diff, px, textureLoad(in_diff, px, 0));
+  textureStore(out_spec, px, textureLoad(in_spec, px, 0));
 }
 
 // ============================================================
@@ -605,28 +599,32 @@ fn temporal_accumulation(@builtin(global_invocation_id) gid: vec3u) {
   var specAccumSpeed = 0.0;
 
   if is_in_screen(smbPixelUv) {
-    // Sample previous viewZ for disocclusion test
-    let prevPixel = vec2i(smbPixelUv * gp.rect_size_prev);
-    // Use history diff alpha as proxy for prev accumSpeed, depth from current frame for disocclusion
-    let prevViewZ = textureSampleLevel(history_diff, linear_clamp, smbPixelUv, 0.0).w * gp.denoising_range;
+    // Sample history
+    let diff_hist = textureSampleLevel(history_diff, linear_clamp, smbPixelUv, 0.0);
+    let spec_hist = textureSampleLevel(history_spec, linear_clamp, smbPixelUv, 0.0);
+
+    // Disocclusion: compare current viewZ with reprojected viewZ
+    // history_diff.w stores normalized accumSpeed (0-1), NOT viewZ
+    // Use camera-space Z comparison: current Xvprev.z vs what we'd expect
     let Xvprev = affine_transform(gp.world_to_view_prev, Xprev);
+    let expectedViewZ = Xvprev.z;
+    // Read neighbor depth at reprojected position from current frame's gbuffer as proxy
+    let reproj_px = clamp(vec2i(smbPixelUv * gp.rect_size), vec2i(0), vec2i(gp.rect_size) - 1);
+    let reproj_depth = read_viewz(reproj_px);
     let disocclusionThreshold = get_disocclusion_threshold(frustumSize, NoV);
-    let planeDist = abs(prevViewZ - Xvprev.z);
-    let depth_valid = planeDist < disocclusionThreshold;
+    // Simple depth similarity: if reprojected position has similar depth, it's the same surface
+    let depth_valid = abs(viewZ - reproj_depth) < frustumSize * 0.5 || length(gp.camera_delta.xyz) < 0.001;
 
     if depth_valid {
-      // Sample history (bilinear)
-      let diff_hist = textureSampleLevel(history_diff, linear_clamp, smbPixelUv, 0.0);
-      let spec_hist = textureSampleLevel(history_spec, linear_clamp, smbPixelUv, 0.0);
-
-      // Previous accumulation speeds
-      // AccumSpeed stored in history diff alpha (normalized)
-      let prevData = vec2f(textureSampleLevel(history_diff, linear_clamp, smbPixelUv, 0.0).w * REBLUR_MAX_ACCUM_FRAME_NUM);
+      // Previous accumulation speeds from history alpha (normalized to [0,1])
+      let prevAccumNorm = diff_hist.w;
+      let prevData = vec2f(prevAccumNorm * REBLUR_MAX_ACCUM_FRAME_NUM);
       diffAccumSpeed = prevData.x;
       specAccumSpeed = prevData.y;
 
-      // Footprint quality (simplified: based on disocclusion test quality)
-      let footprintQuality = clamp(1.0 - planeDist / disocclusionThreshold, 0.0, 1.0);
+      // Footprint quality (simplified: based on depth similarity)
+      let depthDiff = abs(viewZ - reproj_depth);
+      let footprintQuality = clamp(1.0 - depthDiff / (frustumSize * 0.5), 0.0, 1.0);
       diffAccumSpeed *= footprintQuality;
       specAccumSpeed *= footprintQuality;
 
@@ -782,16 +780,17 @@ fn blur(@builtin(global_invocation_id) gid: vec3u) {
   let viewZ = read_viewz(px);
   if viewZ > gp.denoising_range { return; }
 
-  // Read accumulation speed from data1
-  // (In full NRD this comes from a separate texture; here we use diff alpha as proxy)
-  let accumSpeed = textureLoad(in_diff, px, 0).w * REBLUR_MAX_ACCUM_FRAME_NUM;
+  // DEBUG: use frame_index as accumSpeed proxy to test if radius adaptation works
+  // If bloom disappears when camera is still → temporal isn't accumulating properly
+  let accumSpeed = f32(gp.frame_index % 256u);
   let nonLinearAccumSpeed = 1.0 / (1.0 + accumSpeed);
 
   let result = spatial_filter(px, sz,
     REBLUR_BLUR_RADIUS_SCALE, REBLUR_BLUR_FRACTION_SCALE,
     nonLinearAccumSpeed, false, gp.rotator_blur);
 
-  textureStore(out_diff, px, result[0]);
+  // Preserve accumNorm in alpha
+  textureStore(out_diff, px, vec4f(result[0].xyz, textureLoad(in_diff, px, 0).w));
   textureStore(out_spec, px, result[1]);
 }
 
@@ -807,7 +806,8 @@ fn post_blur(@builtin(global_invocation_id) gid: vec3u) {
   let viewZ = read_viewz(px);
   if viewZ > gp.denoising_range { return; }
 
-  let accumSpeed = textureLoad(in_diff, px, 0).w * REBLUR_MAX_ACCUM_FRAME_NUM;
+  // DEBUG: same as blur — use frame_index
+  let accumSpeed = f32(gp.frame_index % 256u);
   let nonLinearAccumSpeed = 1.0 / (1.0 + accumSpeed);
 
   let result = spatial_filter(px, sz,
