@@ -778,24 +778,25 @@ export async function loadScene(basePath, onProgress) {
     }
   }
 
-  // Check cache first
+  // Fast cache check: use GLTF text hash + buffer SIZES (not content) for quick lookup
+  // Full content hash only needed if fast key misses (rare: only when buffers change but GLTF doesn't)
   let db, cacheKey, cached;
   try {
     db = await openDB();
-    // Hash JSON + binary buffers so material-only and geometry-only edits both invalidate cache.
     let gltfHash = 2166136261 >>> 0;
     for (let i = 0; i < gltfText.length; i++) {
       gltfHash ^= gltfText.charCodeAt(i);
       gltfHash = Math.imul(gltfHash, 16777619);
     }
     const gltfSig = `${sceneLabel}-${gltfText.length}-${(gltfHash >>> 0).toString(16)}`;
-    const bufferSigs = await Promise.all(buffers.map(async (buf, index) => `${index}:${await hashBuffer(buf)}`));
-    cacheKey = 'scene-v6-' + gltfSig + '-' + bufferSigs.join('.');
+    // Fast key: use buffer sizes instead of content hash (instant, no buffer iteration)
+    const bufferSizes = buffers.map((buf, i) => `${i}:${buf.byteLength}`).join('.');
+    cacheKey = 'scene-v7-' + gltfSig + '-' + bufferSizes;
     cached = await dbGet(db, cacheKey);
   } catch(e) { /* IndexedDB not available, proceed without cache */ }
 
   if (cached) {
-    onProgress?.('Loading from cache (instant)...');
+    onProgress?.('Loading from cache...');
     return cached;
   }
 

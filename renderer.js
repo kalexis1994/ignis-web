@@ -435,7 +435,7 @@ async function init() {
       format: 'rgba8unorm',
       usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST | GPUTextureUsage.RENDER_ATTACHMENT,
     });
-    const BATCH = TEX_SIZE >= 2048 ? 2 : 6; // smaller batches for large textures
+    const BATCH = TEX_SIZE >= 2048 ? 4 : 20; // large parallel batches for faster loading
     for (let b = 0; b < texCount; b += BATCH) {
       const batch = [];
       for (let i = b; i < Math.min(b + BATCH, texCount); i++) {
@@ -446,7 +446,7 @@ async function init() {
             .then(r => r.blob())
             .then(blob => createImageBitmap(blob, {
               resizeWidth: TEX_SIZE, resizeHeight: TEX_SIZE,
-              resizeQuality: 'high',
+              resizeQuality: 'medium',
               colorSpaceConversion: 'none',
             }))
             .then(bmp => {
