@@ -53,7 +53,7 @@ struct Material {
 
 fn luma(c: vec3f) -> f32 { return dot(c, vec3f(0.2126, 0.7152, 0.0722)); }
 
-// 5x5 B3-spline kernel weights
+// 5x5 B3-spline kernel weights (used by atrous_sm first pass)
 const KW = array<f32, 25>(
   1.0/256.0,  4.0/256.0,  6.0/256.0,  4.0/256.0, 1.0/256.0,
   4.0/256.0, 16.0/256.0, 24.0/256.0, 16.0/256.0, 4.0/256.0,
@@ -62,131 +62,128 @@ const KW = array<f32, 25>(
   1.0/256.0,  4.0/256.0,  6.0/256.0,  4.0/256.0, 1.0/256.0,
 );
 
+// ReBLUR-style Poisson disk (8 taps, z = radius for Gaussian weight)
+const POISSON8 = array<vec3f, 8>(
+  vec3f(-1.00,  0.20, 0.15),
+  vec3f( 0.38, -0.85, 0.25),
+  vec3f( 0.94,  0.34, 0.35),
+  vec3f(-0.47,  0.81, 0.45),
+  vec3f(-0.74, -0.64, 0.55),
+  vec3f( 0.72, -0.58, 0.65),
+  vec3f( 0.15,  0.98, 0.75),
+  vec3f(-0.28, -0.36, 0.85),
+);
+
+// ============================================================
+// ReBLUR-style adaptive Poisson blur (replaces multi-pass à-trous)
+// Single pass with per-pixel adaptive radius based on accumulation history.
+// 8 Poisson taps with per-frame rotation — no multi-pass bleeding.
+// Geometry-only weights (normal + plane distance) — cannot cross shadow boundaries.
+// ============================================================
 @compute @workgroup_size(16, 16)
 fn atrous(@builtin(global_invocation_id) gid: vec3u) {
   let px = vec2i(gid.xy);
   let sz = vec2i(params.resolution);
   if px.x >= sz.x || px.y >= sz.y { return; }
 
-  let step_i = i32(params.step_size);
+  // ReBLUR: 3 spatial passes with different radius scales
+  // Pass 1 (step=2): Blur — main spatial filter, radiusScale=1.0
+  // Pass 2 (step=4): PostBlur — aggressive cleanup, radiusScale=2.0, fractionScale=0.5
+  // Pass 3+ (step>=8): passthrough
+  if params.step_size >= 7.5 {
+    textureStore(out_color, px, textureLoad(in_color, px, 0));
+    textureStore(out_spec, px, textureLoad(in_spec, px, 0));
+    return;
+  }
+  let radiusScale = select(1.0, 2.0, params.step_size > 3.5);   // Blur=1x, PostBlur=2x
+  let fractionScale = select(1.0, 0.5, params.step_size > 3.5); // PostBlur tightens weights
 
   let cnd = textureLoad(gbuf_nd, px, 0);
   let cn = cnd.xyz;
   let cz = cnd.w;
   let diff_sample = textureLoad(in_color, px, 0);
   let cc = diff_sample.rgb;
-  let cl = luma(cc);
-  let spec_sample = textureLoad(in_spec, px, 0);
-  let cs = spec_sample.rgb;
-  let csl = luma(cs);
-  let hit_dist = spec_sample.a;
-
-  // Roughness for specular filter width
+  let cs = textureLoad(in_spec, px, 0).rgb;
+  let hit_dist = textureLoad(in_spec, px, 0).a;
   let roughness = textureLoad(albedo_tex, px, 0).a;
 
-  // Hit distance modulates blur: contact shadows stay sharp, far GI gets smoothed
-  let hit_factor = mix(0.5, 1.0, hit_dist);
+  // === Adaptive blur radius (ReBLUR core idea) ===
+  let history_len = diff_sample.a;
+  let accumSpeed = min(history_len, 64.0);
+  let nonLinearAccumSpeed = 1.0 / (1.0 + accumSpeed);
 
-  // Depth gradient with distance-relative floor (prevents filter rejection at far distances)
-  let zr = textureLoad(gbuf_nd, min(px + vec2i(1,0), sz-1), 0).w;
-  let zu = textureLoad(gbuf_nd, min(px + vec2i(0,1), sz-1), 0).w;
+  // Blur radius: large when new, small when converged
+  // ReBLUR: blurRadius = radiusScale * sqrt(hitDistFactor * nonLinearAccumSpeed) * maxBlurRadius
+  let maxBlurRadius = 20.0;
+  let hitFactor = clamp(hit_dist, 0.1, 1.0);
+  let smc = sqrt(max(roughness, 0.01)); // specMagicCurve approximation
+  let diffRadius = radiusScale * maxBlurRadius * sqrt(hitFactor * nonLinearAccumSpeed);
+  let specRadius = radiusScale * maxBlurRadius * sqrt(hitFactor * nonLinearAccumSpeed) * smc;
+
+  // Minimum radius
+  let diff_blur_r = max(diffRadius, 0.5);
+  let spec_blur_r = max(specRadius, 0.5);
+
+  // === Per-frame Poisson rotation (reduces banding) ===
+  let frame_angle = f32(u32(params.frames_still * 100.0) % 256u) * (6.2832 / 256.0);
+  let rot_cos = cos(frame_angle);
+  let rot_sin = sin(frame_angle);
+
+  // Depth weight normalization: relative to depth gradient
+  let zr = textureLoad(gbuf_nd, clamp(px + vec2i(1, 0), vec2i(0), sz - 1), 0).w;
+  let zu = textureLoad(gbuf_nd, clamp(px + vec2i(0, 1), vec2i(0), sz - 1), 0).w;
   let gz = max(max(abs(zr - cz), abs(zu - cz)), cz * 0.002);
 
-  let step = i32(params.step_size);
+  // === 8-tap Poisson blur ===
+  var d_sum = cc;
+  var s_sum = cs;
+  var d_wsum = 1.0;
+  var s_wsum = 1.0;
 
-  // === VARIANCE (SVGF §4.2): propagated through à-trous passes ===
-  // Pass 0 (step=1): compute spatial variance, write to alpha
-  // Pass 1+ (step>1): read propagated variance from alpha (filtered by previous passes)
-  // This ensures sigma reflects ORIGINAL noise, not the already-filtered signal.
-  var d_var: f32;
-  var s_m1 = 0.0; var s_m2 = 0.0; // specular always uses spatial (no alpha channel)
+  for (var i = 0u; i < 8u; i++) {
+    let tap = POISSON8[i];
 
-  if step <= 1 {
-    // First pass: compute spatial 3×3 variance, initialize alpha chain
-    var d_m1 = 0.0; var d_m2 = 0.0;
-    for (var vy = -1; vy <= 1; vy++) {
-      for (var vx = -1; vx <= 1; vx++) {
-        let vp = clamp(px + vec2i(vx, vy), vec2i(0), sz - 1);
-        let vl = luma(textureLoad(in_color, vp, 0).rgb);
-        d_m1 += vl; d_m2 += vl * vl;
-        let vsl = luma(textureLoad(in_spec, vp, 0).rgb);
-        s_m1 += vsl; s_m2 += vsl * vsl;
-      }
-    }
-    d_m1 /= 9.0; d_m2 /= 9.0;
-    d_var = max(d_m2 - d_m1 * d_m1, 0.0);
-  } else {
-    // Subsequent passes: read propagated variance from diffuse alpha
-    // Also Gaussian-filter the variance from 3×3 neighbors for stability
-    var var_sum = 0.0;
-    for (var vy = -1; vy <= 1; vy++) {
-      for (var vx = -1; vx <= 1; vx++) {
-        let vp = clamp(px + vec2i(vx, vy), vec2i(0), sz - 1);
-        var_sum += textureLoad(in_color, vp, 0).a;
-        let vsl = luma(textureLoad(in_spec, vp, 0).rgb);
-        s_m1 += vsl; s_m2 += vsl * vsl;
-      }
-    }
-    d_var = max(var_sum / 9.0, 0.0);
-  }
-  let d_std = sqrt(d_var);
-  s_m1 /= 9.0; s_m2 /= 9.0;
-  let s_std = sqrt(max(s_m2 - s_m1 * s_m1, 0.0));
+    // Rotate and scale offset by blur radius
+    let ox = tap.x * rot_cos - tap.y * rot_sin;
+    let oy = tap.x * rot_sin + tap.y * rot_cos;
+    let d_offset = vec2i(vec2f(ox, oy) * diff_blur_r + 0.5);
+    let s_offset = vec2i(vec2f(ox, oy) * spec_blur_r + 0.5);
 
-  // Adaptive σ_l: aggressive when camera just stopped (instant cleanup),
-  // fades to minimal as temporal converges (prevents bleeding in steady state)
-  // frames_still=0: full=4.0, frames_still=32: 0.5 (almost no spatial blur)
-  let spatial_fade = 1.0 / (1.0 + params.frames_still * 0.2);
-  let diff_sigma_scale = mix(0.5, 4.0, spatial_fade);
-  let spec_sigma_scale = mix(0.1, 1.5, spatial_fade) * mix(0.5, 1.0, roughness);
+    // Gaussian weight from Poisson radius
+    let gauss_w = exp(-0.66 * tap.z * tap.z);
 
-  // === FILTER (both signals + variance filtering in one pass) ===
-  // f16 weight sums: reduces register pressure, 2x faster weight multiply on NVIDIA
-  var d_sum = vec3f(0.0); var d_wsum: f16 = 0.0h;
-  var s_sum = vec3f(0.0); var s_wsum: f16 = 0.0h;
-  var d_var_filtered = 0.0; var d_var_wsum: f16 = 0.0h;
+    // --- Diffuse tap ---
+    let dp = clamp(px + d_offset, vec2i(0), sz - 1);
+    let dnd = textureLoad(gbuf_nd, dp, 0);
+    let d_col = textureLoad(in_color, dp, 0).rgb;
 
-  for (var dy = -2; dy <= 2; dy++) {
-    for (var dx = -2; dx <= 2; dx++) {
-      let ki = u32((dy + 2) * 5 + (dx + 2));
-      let sp = clamp(px + vec2i(dx, dy) * step, vec2i(0), sz - 1);
-      let snd = textureLoad(gbuf_nd, sp, 0);
-      let s_diff = textureLoad(in_color, sp, 0);
-      let sd = s_diff.rgb;
-      let ss = textureLoad(in_spec, sp, 0).rgb;
+    // Normal weight: tighter for PostBlur (fractionScale=0.5 → exponent doubles)
+    let normal_exp = 32.0 / fractionScale;
+    let d_wn = pow(max(dot(cn, dnd.xyz), 0.0), normal_exp);
+    // Depth weight: exponential falloff based on depth gradient
+    let d_dz = abs(cz - dnd.w);
+    let d_wz = exp(-d_dz / (gz * diff_blur_r + 1e-3));
+    let d_w = gauss_w * d_wn * d_wz;
 
-      // Normal edge-stopping (SVGF σ_n=128)
-      let wn = f16(pow(max(dot(cn, snd.xyz), 0.0), 128.0));
-      let dz = abs(cz - snd.w);
-      let wz = f16(exp(-dz / (gz * f32(step) + 1e-3)));
+    d_sum += d_col * d_w;
+    d_wsum += d_w;
 
-      // Diffuse luminance edge-stopping
-      let d_dl = abs(cl - luma(sd));
-      let d_sigma = diff_sigma_scale * d_std * hit_factor + 0.01;
-      let d_wl = f16(exp(-d_dl / max(d_sigma, 0.01)));
-      let d_w = f16(KW[ki]) * wn * wz * d_wl;
-      d_sum += sd * f32(d_w);
-      d_wsum += d_w;
+    // --- Specular tap (separate radius) ---
+    let sp = clamp(px + s_offset, vec2i(0), sz - 1);
+    let snd = textureLoad(gbuf_nd, sp, 0);
+    let s_col = textureLoad(in_spec, sp, 0).rgb;
 
-      // Variance propagation
-      let geom_w = f16(KW[ki]) * wn * wz;
-      d_var_filtered += s_diff.a * f32(geom_w);
-      d_var_wsum += geom_w;
+    let s_wn = pow(max(dot(cn, snd.xyz), 0.0), 64.0 / fractionScale);
+    let s_dz = abs(cz - snd.w);
+    let s_wz = exp(-s_dz / (gz * spec_blur_r + 1e-3));
+    let s_w = gauss_w * s_wn * s_wz;
 
-      // Specular luminance edge-stopping
-      let s_dl = abs(csl - luma(ss));
-      let s_sigma = spec_sigma_scale * s_std * hit_factor + 0.01;
-      let s_wl = f16(exp(-s_dl / max(s_sigma, 0.01)));
-      let s_w = f16(KW[ki]) * wn * wz * s_wl;
-      s_sum += ss * f32(s_w);
-      s_wsum += s_w;
-    }
+    s_sum += s_col * s_w;
+    s_wsum += s_w;
   }
 
-  // Output: color + filtered variance in alpha (propagated to next pass)
-  let out_var = d_var_filtered / max(f32(d_var_wsum), 1e-6);
-  textureStore(out_color, px, vec4f(d_sum / max(f32(d_wsum), 1e-6), out_var));
-  textureStore(out_spec, px, vec4f(s_sum / max(f32(s_wsum), 1e-6), textureLoad(in_spec, px, 0).a));
+  textureStore(out_color, px, vec4f(d_sum / d_wsum, history_len));
+  textureStore(out_spec, px, vec4f(s_sum / s_wsum, hit_dist));
 }
 
 // === TILED ATROUS (step=1 only): shared memory reduces 99 textureLoad → ~5 per thread ===
@@ -225,72 +222,63 @@ fn atrous_sm(@builtin(global_invocation_id) gid: vec3u,
   let ly = i32(lid.y);
   let ci = u32((ly + HALO) * PADDED + (lx + HALO));
 
-  // Single-pass bilateral with geometry + luminance (step=1, ±2px max)
-  // Bleeding limited to 2px — imperceptible. Temporal 1/N handles convergence.
+  // === ReBLUR-style HistoryFix + Bilateral (combined single pass) ===
+  // For pixels with short history: borrow from neighbors with LONGER history (ReBLUR HistoryFix)
+  // For all pixels: 5x5 bilateral with geometry weights (cleanup pass)
   let cnd = sm_nd[ci];
   let cn = cnd.xyz;
   let cz = cnd.w;
   let cc = sm_diff[ci].rgb;
-  let cl = luma(cc);
   let cs = sm_spec[ci].rgb;
-  let csl = luma(cs);
+  let center_history = sm_diff[ci].a; // history_len from temporal
 
   // Depth gradient from tile
   let zr_i = u32((ly + HALO) * PADDED + min(lx + HALO + 1, PADDED - 1));
   let zu_i = u32(min(ly + HALO + 1, PADDED - 1) * PADDED + (lx + HALO));
   let gz = max(max(abs(sm_nd[zr_i].w - cz), abs(sm_nd[zu_i].w - cz)), cz * 0.002);
 
-  // 3x3 variance for luminance sigma
-  var d_m1 = 0.0; var d_m2 = 0.0;
-  var s_m1 = 0.0; var s_m2 = 0.0;
-  for (var vy = -1; vy <= 1; vy++) {
-    for (var vx = -1; vx <= 1; vx++) {
-      let vi = u32((ly + HALO + vy) * PADDED + (lx + HALO + vx));
-      let vl = luma(sm_diff[vi].rgb);
-      d_m1 += vl; d_m2 += vl * vl;
-      let vsl = luma(sm_spec[vi].rgb);
-      s_m1 += vsl; s_m2 += vsl * vsl;
-    }
-  }
-  let d_std = sqrt(max(d_m2 / 9.0 - (d_m1 / 9.0) * (d_m1 / 9.0), 0.0));
-  let s_std = sqrt(max(s_m2 / 9.0 - (s_m1 / 9.0) * (s_m1 / 9.0), 0.0));
+  // HistoryFix: for pixels with short history, weight neighbors by THEIR history length
+  // This fills disoccluded pixels with converged neighbor data (ReBLUR HistoryFix concept)
+  let historyFixThreshold = 8.0; // frames before HistoryFix kicks in
+  let needsFix = center_history < historyFixThreshold;
 
-  // Adaptive σ_l: same as atrous — aggressive early, fades with frames_still
-  let spatial_fade_sm = 1.0 / (1.0 + params.frames_still * 0.2);
-  let diff_sigma_sm = mix(0.5, 4.0, spatial_fade_sm);
-  let spec_sigma_sm = mix(0.1, 1.5, spatial_fade_sm) * mix(0.5, 1.0, textureLoad(albedo_tex, px, 0).a);
-
-  // 5x5 bilateral: geometry + luminance
-  var d_sum = vec3f(0.0); var d_wsum = 0.0;
-  var s_sum = vec3f(0.0); var s_wsum = 0.0;
+  // 5x5 bilateral with optional HistoryFix weighting
+  var d_sum = cc * (1.0 + center_history); // center weighted by its own history
+  var s_sum = cs * (1.0 + center_history);
+  var w_sum = 1.0 + center_history;
 
   for (var dy = -2; dy <= 2; dy++) {
     for (var dx = -2; dx <= 2; dx++) {
-      let ki = u32((dy + 2) * 5 + (dx + 2));
+      if dx == 0 && dy == 0 { continue; }
       let si = u32((ly + HALO + dy) * PADDED + (lx + HALO + dx));
       let snd = sm_nd[si];
       let sd = sm_diff[si].rgb;
       let ss = sm_spec[si].rgb;
+      let s_history = sm_diff[si].a;
 
-      // Geometry weights
-      let wn = pow(max(dot(cn, snd.xyz), 0.0), 128.0);
+      // Geometry weights (normal + depth plane)
+      let wn = pow(max(dot(cn, snd.xyz), 0.0), 64.0);
       let dz = abs(cz - snd.w);
       let wz = exp(-dz / (gz + 1e-3));
+      let geom = KW[u32((dy + 2) * 5 + (dx + 2))] * wn * wz;
 
-      // Luminance weights (adaptive σ based on frames_still)
-      let d_wl = exp(-abs(cl - luma(sd)) / (diff_sigma_sm * d_std + 0.02));
-      let s_wl = exp(-abs(csl - luma(ss)) / (spec_sigma_sm * s_std + 0.02));
+      if geom < 0.001 { continue; }
 
-      let geom = KW[ki] * wn * wz;
-      d_sum += sd * (geom * d_wl);
-      s_sum += ss * (geom * s_wl);
-      d_wsum += geom * d_wl;
-      s_wsum += geom * s_wl;
+      // HistoryFix: if this pixel needs fixing, boost weight of neighbors with more history
+      // Neighbor with history=30 contributes 30x more than neighbor with history=1
+      var w = geom;
+      if needsFix {
+        w *= (1.0 + s_history); // ReBLUR: w *= (1.0 + frameNum_sample)
+      }
+
+      d_sum += sd * w;
+      s_sum += ss * w;
+      w_sum += w;
     }
   }
 
-  textureStore(out_color, px, vec4f(d_sum / max(d_wsum, 1e-6), sm_diff[ci].a));
-  textureStore(out_spec, px, vec4f(s_sum / max(s_wsum, 1e-6), sm_spec[ci].a));
+  textureStore(out_color, px, vec4f(d_sum / max(w_sum, 1e-6), center_history));
+  textureStore(out_spec, px, vec4f(s_sum / max(w_sum, 1e-6), sm_spec[ci].a));
 }
 
 // === PRE-BLUR: anti-firefly percentile clamp + lightweight 3x3 bilateral ===
@@ -328,7 +316,7 @@ fn preblur(@builtin(global_invocation_id) gid: vec3u) {
   let s_std = sqrt(max(s_m2 / 9.0 - s_mean * s_mean, 0.0));
   let s_max_lum = s_mean + 1.5 * s_std + 0.05;
 
-  // Anti-firefly clamp (3σ — only clips extreme outliers)
+  // Anti-firefly clamp
   let cl_raw = luma(cc_raw);
   var cc = cc_raw;
   if cl_raw > d_max_lum && cl_raw > 0.01 { cc = cc_raw * (d_max_lum / cl_raw); }
@@ -336,9 +324,51 @@ fn preblur(@builtin(global_invocation_id) gid: vec3u) {
   var cs = cs_raw;
   if csl_raw > s_max_lum && csl_raw > 0.01 { cs = cs_raw * (s_max_lum / csl_raw); }
 
+  // === ReBLUR PrePass: 8-tap Poisson blur (radius=15px) ===
+  // Large spatial filter BEFORE temporal → gives temporal a cleaner base on frame 1
+  // Uses geometry-only weights (normal + depth plane) — no shadow bleeding
+  let frustumSize = max(cz * 0.01, 0.01);
+  let prepassRadius = 15.0;
+  let pre_angle = f32(u32(params.frames_still * 73.0) % 256u) * (6.2832 / 256.0);
+  let pre_cos = cos(pre_angle);
+  let pre_sin = sin(pre_angle);
+
+  var d_sum = cc;
+  var s_sum = cs;
+  var w_sum = 1.0;
+
+  for (var i = 0u; i < 8u; i++) {
+    let tap = POISSON8[i];
+    let ox = tap.x * pre_cos - tap.y * pre_sin;
+    let oy = tap.x * pre_sin + tap.y * pre_cos;
+    let offset = vec2i(vec2f(ox, oy) * prepassRadius + 0.5);
+    let sp = clamp(px + offset, vec2i(0), sz - 1);
+
+    let snd = textureLoad(gbuf_nd, sp, 0);
+    let wn = pow(max(dot(cn, snd.xyz), 0.0), 16.0);
+    let planeDist = abs(cz - snd.w) / max(frustumSize, 0.01);
+    let wz = exp(-planeDist * planeDist);
+    let gauss = exp(-0.66 * tap.z * tap.z);
+    let w = gauss * wn * wz;
+
+    if w > 0.01 {
+      // Also clamp each neighbor (anti-firefly propagation)
+      var sd = textureLoad(in_color, sp, 0).rgb;
+      let sdl = luma(sd);
+      if sdl > d_max_lum && sdl > 0.01 { sd *= d_max_lum / sdl; }
+      var ss = textureLoad(in_spec, sp, 0).rgb;
+      let ssl = luma(ss);
+      if ssl > s_max_lum && ssl > 0.01 { ss *= s_max_lum / ssl; }
+
+      d_sum += sd * w;
+      s_sum += ss * w;
+      w_sum += w;
+    }
+  }
+
   let center_hit_dist = textureLoad(in_spec, px, 0).a;
-  textureStore(out_color, px, vec4f(cc, 1.0));
-  textureStore(out_spec, px, vec4f(cs, center_hit_dist));
+  textureStore(out_color, px, vec4f(d_sum / w_sum, 1.0));
+  textureStore(out_spec, px, vec4f(s_sum / w_sum, center_hit_dist));
 }
 
 // === TILED PRE-BLUR: shared memory version (18x18 tile, ±1 halo) ===
@@ -397,7 +427,7 @@ fn preblur_sm(@builtin(global_invocation_id) gid: vec3u,
   let s_std = sqrt(max(s_m2 / 9.0 - s_mean * s_mean, 0.0));
   let s_max_lum = s_mean + 1.5 * s_std + 0.05;
 
-  // Anti-firefly clamp (3σ — only clips extreme outliers)
+  // Anti-firefly clamp
   let cl_raw = luma(cc_raw);
   var cc = cc_raw;
   if cl_raw > d_max_lum && cl_raw > 0.01 { cc = cc_raw * (d_max_lum / cl_raw); }
@@ -405,8 +435,47 @@ fn preblur_sm(@builtin(global_invocation_id) gid: vec3u,
   var cs = cs_raw;
   if csl_raw > s_max_lum && csl_raw > 0.01 { cs = cs_raw * (s_max_lum / csl_raw); }
 
-  textureStore(out_color, px, vec4f(cc, 1.0));
-  textureStore(out_spec, px, vec4f(cs, sm_spec[ci].a));
+  // === ReBLUR PrePass: 8-tap Poisson blur ===
+  // Can't use shared memory here (radius=15 exceeds ±1 halo), so textureLoad directly
+  let frustumSize_pb = max(cz * 0.01, 0.01);
+  let pre_angle_sm = f32(u32(params.frames_still * 73.0) % 256u) * (6.2832 / 256.0);
+  let pre_cos_sm = cos(pre_angle_sm);
+  let pre_sin_sm = sin(pre_angle_sm);
+
+  var d_sum_pb = cc;
+  var s_sum_pb = cs;
+  var w_sum_pb = 1.0;
+
+  for (var i = 0u; i < 8u; i++) {
+    let tap = POISSON8[i];
+    let ox = tap.x * pre_cos_sm - tap.y * pre_sin_sm;
+    let oy = tap.x * pre_sin_sm + tap.y * pre_cos_sm;
+    let offset = vec2i(vec2f(ox, oy) * 15.0 + 0.5);
+    let sp = clamp(px + offset, vec2i(0), sz - 1);
+
+    let snd = textureLoad(gbuf_nd, sp, 0);
+    let wn = pow(max(dot(cn, snd.xyz), 0.0), 16.0);
+    let pd = abs(cz - snd.w) / max(frustumSize_pb, 0.01);
+    let wz = exp(-pd * pd);
+    let gauss = exp(-0.66 * tap.z * tap.z);
+    let w = gauss * wn * wz;
+
+    if w > 0.01 {
+      var sd = textureLoad(in_color, sp, 0).rgb;
+      let sdl = luma(sd);
+      if sdl > d_max_lum && sdl > 0.01 { sd *= d_max_lum / sdl; }
+      var ss = textureLoad(in_spec, sp, 0).rgb;
+      let ssl = luma(ss);
+      if ssl > s_max_lum && ssl > 0.01 { ss *= s_max_lum / ssl; }
+
+      d_sum_pb += sd * w;
+      s_sum_pb += ss * w;
+      w_sum_pb += w;
+    }
+  }
+
+  textureStore(out_color, px, vec4f(d_sum_pb / w_sum_pb, 1.0));
+  textureStore(out_spec, px, vec4f(s_sum_pb / w_sum_pb, sm_spec[ci].a));
 }
 
 // ============================================================
@@ -563,7 +632,9 @@ fn composite(@builtin(global_invocation_id) gid: vec3u) {
 }
 
 // ============================================================
-// COPY TO HISTORY: merge denoised .rgb with temporal .a (history_len/cam_z)
+// TEMPORAL STABILIZATION (ReBLUR-style anti-flicker)
+// Operates on LUMINANCE only — clamps to neighborhood statistics.
+// This prevents frame-to-frame flickering without color artifacts.
 // Uses same layout as à-trous (bindings 0-6):
 //   in_color(1) = denoised diffuse, out_color(2) = history diffuse
 //   gbuf_nd(3) = temporal hdrTex (reused: .a = history_len)
@@ -576,11 +647,52 @@ fn copy_to_history(@builtin(global_invocation_id) gid: vec3u) {
   let sz = vec2i(params.resolution);
   if px.x >= sz.x || px.y >= sz.y { return; }
 
-  let denoised_diff = textureLoad(in_color, px, 0).rgb;
   let history_len = textureLoad(gbuf_nd, px, 0).a;
-  textureStore(out_color, px, vec4f(denoised_diff, history_len));
-
-  let denoised_spec = textureLoad(in_spec, px, 0).rgb;
   let cam_z = textureLoad(albedo_tex, px, 0).a;
-  textureStore(out_spec, px, vec4f(denoised_spec, cam_z));
+
+  // === Temporal Stabilization: neighborhood luminance clamp ===
+  // Compute luma statistics from 5x5 neighborhood of current denoised frame
+  var diff_luma_m1 = 0.0;
+  var diff_luma_m2 = 0.0;
+  var spec_luma_m1 = 0.0;
+  var spec_luma_m2 = 0.0;
+  var count = 0.0;
+  for (var dy = -2; dy <= 2; dy++) {
+    for (var dx = -2; dx <= 2; dx++) {
+      let sp = clamp(px + vec2i(dx, dy), vec2i(0), sz - 1);
+      let dl = luma(textureLoad(in_color, sp, 0).rgb);
+      let sl = luma(textureLoad(in_spec, sp, 0).rgb);
+      diff_luma_m1 += dl;
+      diff_luma_m2 += dl * dl;
+      spec_luma_m1 += sl;
+      spec_luma_m2 += sl * sl;
+      count += 1.0;
+    }
+  }
+  let d_mean = diff_luma_m1 / count;
+  let d_sigma = sqrt(max(diff_luma_m2 / count - d_mean * d_mean, 0.0));
+  let s_mean = spec_luma_m1 / count;
+  let s_sigma = sqrt(max(spec_luma_m2 / count - s_mean * s_mean, 0.0));
+
+  // Stabilization strength based on history (more history → more stabilization)
+  let stabilization = clamp(history_len / 8.0, 0.0, 1.0);
+
+  // Read current denoised
+  var diff = textureLoad(in_color, px, 0).rgb;
+  var spec = textureLoad(in_spec, px, 0).rgb;
+  let diff_l = luma(diff);
+  let spec_l = luma(spec);
+
+  // Clamp luminance to neighborhood range (± sigma * scale)
+  // ReBLUR uses sigma * (1 + 3*framerateScale*historyWeight) — we simplify
+  let sigma_scale = 1.0 + 2.0 * stabilization;
+  let clamped_dl = clamp(diff_l, d_mean - d_sigma * sigma_scale, d_mean + d_sigma * sigma_scale);
+  let clamped_sl = clamp(spec_l, s_mean - s_sigma * sigma_scale, s_mean + s_sigma * sigma_scale);
+
+  // Apply clamped luminance (preserves hue, only changes brightness)
+  if diff_l > 0.001 { diff *= clamped_dl / diff_l; }
+  if spec_l > 0.001 { spec *= clamped_sl / spec_l; }
+
+  textureStore(out_color, px, vec4f(diff, history_len));
+  textureStore(out_spec, px, vec4f(spec, cam_z));
 }

@@ -1,5 +1,5 @@
-// FSR3-inspired Upscaling + Sharpening (WebGPU Compute)
-// Pass 1: EASU - Edge Adaptive Spatial Upscaling (Lanczos 2-lobe)
+// Upscaling + Sharpening (WebGPU Compute)
+// Pass 1: EASU - Edge Adaptive Spatial Upscaling (CatmullRom, sharper than Lanczos)
 // Pass 2: RCAS - Robust Contrast Adaptive Sharpening
 
 struct FSRParams {
@@ -15,32 +15,23 @@ struct FSRParams {
 @group(0) @binding(1) var output_tex: texture_storage_2d<rgba8unorm, write>;
 @group(0) @binding(2) var tex_sampler: sampler;
 @group(0) @binding(3) var<uniform> params: FSRParams;
-
-const PI: f32 = 3.14159265359;
+@group(0) @binding(4) var guide_nd: texture_2d<f32>;  // unused by EASU, needed for layout
 
 // ============================================================
-// Lanczos 2-lobe kernel
+// Catmull-Rom weight (sharper than Lanczos, slight negative lobe)
 // ============================================================
-fn lanczos2(x: f32) -> f32 {
+fn catmull_rom(x: f32) -> f32 {
   let ax = abs(x);
-  if ax < 1e-6 { return 1.0; }
   if ax >= 2.0 { return 0.0; }
-  let px = PI * x;
-  return (sin(px) / px) * (sin(px * 0.5) / (px * 0.5));
+  let ax2 = ax * ax;
+  let ax3 = ax2 * ax;
+  if ax <= 1.0 { return 1.5 * ax3 - 2.5 * ax2 + 1.0; }
+  return -0.5 * ax3 + 2.5 * ax2 - 4.0 * ax + 2.0;
 }
 
 // ============================================================
-// Edge-aware weight: reduce ringing at strong edges
-// ============================================================
-fn edge_weight(center: vec3f, sample: vec3f) -> f32 {
-  let diff = abs(center - sample);
-  let d = max(diff.x, max(diff.y, diff.z));
-  return exp(-d * 4.0);
-}
-
-// ============================================================
-// EASU: Edge Adaptive Spatial Upscaling
-// Lanczos 2-lobe with edge-directed weighting
+// EASU: CatmullRom 4x4 with edge-aware weighting
+// Sharper than Lanczos: negative lobes enhance edges
 // ============================================================
 @compute @workgroup_size(16, 16)
 fn easu(@builtin(global_invocation_id) gid: vec3u) {
@@ -48,39 +39,36 @@ fn easu(@builtin(global_invocation_id) gid: vec3u) {
   let out_size = vec2i(params.output_size);
   if out_px.x >= out_size.x || out_px.y >= out_size.y { return; }
 
-  // Map output pixel to fractional input position
   let ratio = params.input_size / params.output_size;
   let src_pos = (vec2f(gid.xy) + 0.5) * ratio;
   let src_center = floor(src_pos);
   let f = src_pos - src_center - 0.5;
 
-  // Pre-sample center for edge awareness
+  // Pre-sample center for edge detection
   let center_uv = (src_center + 0.5) / params.input_size;
   let center_col = textureSampleLevel(input_tex, tex_sampler, center_uv, 0.0).rgb;
 
-  // 4x4 Lanczos kernel with edge-adaptive weighting (f16 weights)
   var color = vec3f(0.0);
-  var tw: f16 = 0.0h;
+  var tw = 0.0;
 
   for (var y = -1; y <= 2; y++) {
-    let wy = lanczos2(f32(y) - f.y);
+    let wy = catmull_rom(f32(y) - f.y);
     for (var x = -1; x <= 2; x++) {
-      let wx = lanczos2(f32(x) - f.x);
+      let wx = catmull_rom(f32(x) - f.x);
+      let uv = clamp((src_center + vec2f(f32(x), f32(y)) + 0.5) / params.input_size, vec2f(0.001), vec2f(0.999));
+      let s = textureSampleLevel(input_tex, tex_sampler, uv, 0.0).rgb;
 
-      let uv = (src_center + vec2f(f32(x), f32(y)) + 0.5) / params.input_size;
-      let clamped_uv = clamp(uv, vec2f(0.001), vec2f(0.999));
-      let s = textureSampleLevel(input_tex, tex_sampler, clamped_uv, 0.0).rgb;
+      // Edge-aware: reduce ringing near strong edges
+      let diff = max(abs(center_col.r - s.r), max(abs(center_col.g - s.g), abs(center_col.b - s.b)));
+      let ew = exp(-diff * 6.0);
+      let w = wx * wy * mix(1.0, ew, 0.4);
 
-      // Edge-aware: reduce contribution of samples that differ strongly from center
-      let ew = edge_weight(center_col, s);
-      let w = f16(wx * wy * mix(1.0, ew, 0.5));
-
-      color += s * f32(w);
+      color += s * w;
       tw += w;
     }
   }
 
-  color = max(color / f32(tw), vec3f(0.0));
+  color = max(color / tw, vec3f(0.0));
   textureStore(output_tex, out_px, vec4f(color, 1.0));
 }
 

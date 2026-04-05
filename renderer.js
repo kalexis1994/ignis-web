@@ -54,9 +54,13 @@ async function init() {
 
   const hasSubgroups = adapter.features.has('subgroups');
   const hasF16 = adapter.features.has('shader-f16');
+  const hasSubgroupMatrix = adapter.features.has('chromium-experimental-subgroup-matrix');
+  console.log(`GPU Features: subgroups=${hasSubgroups}, f16=${hasF16}, subgroup-matrix=${hasSubgroupMatrix}`);
+  if (hasSubgroupMatrix) console.log('🟢 TENSOR CORES AVAILABLE via subgroup-matrix!');
   const requiredFeatures = [];
   if (hasSubgroups) requiredFeatures.push('subgroups');
   if (hasF16) requiredFeatures.push('shader-f16');
+  if (hasSubgroupMatrix) requiredFeatures.push('chromium-experimental-subgroup-matrix');
 
   const device = await adapter.requestDevice({
     requiredFeatures,
@@ -637,6 +641,7 @@ async function init() {
       { binding: 1, visibility: GPUShaderStage.COMPUTE, storageTexture: { access: 'write-only', format: 'rgba8unorm' } },
       { binding: 2, visibility: GPUShaderStage.COMPUTE, sampler: { type: 'filtering' } },
       { binding: 3, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'uniform' } },
+      { binding: 4, visibility: GPUShaderStage.COMPUTE, texture: { sampleType: 'float' } }, // G-buffer ND (high-res guide)
     ],
   });
   const fsrPipelineLayout = device.createPipelineLayout({ bindGroupLayouts: [fsrBGLayout] });
@@ -652,7 +657,7 @@ async function init() {
 
   const sampler = device.createSampler({ magFilter: 'linear', minFilter: 'linear' });
 
-  // EASU: reads ptOutput (internal), writes upscaled (display)
+  // EASU/JBU: reads ptOutput (internal) + G-buffer guide, writes upscaled (display)
   const easuBG = device.createBindGroup({
     layout: fsrBGLayout,
     entries: [
@@ -660,10 +665,11 @@ async function init() {
       { binding: 1, resource: upscaledTex.createView() },
       { binding: 2, resource: sampler },
       { binding: 3, resource: { buffer: fsrParamsBuf } },
+      { binding: 4, resource: ndTex.createView() },  // high-res G-buffer normals+depth
     ],
   });
 
-  // RCAS: reads upscaled, writes final
+  // RCAS: reads upscaled, writes final (ndTex unused but layout requires it)
   const rcasBG = device.createBindGroup({
     layout: fsrBGLayout,
     entries: [
@@ -671,6 +677,7 @@ async function init() {
       { binding: 1, resource: finalTex.createView() },
       { binding: 2, resource: sampler },
       { binding: 3, resource: { buffer: fsrParamsBuf } },
+      { binding: 4, resource: ndTex.createView() },
     ],
   });
 
@@ -986,6 +993,18 @@ async function init() {
         { binding: 5, resource: denoiseNdTex.createView() },      // normals
         { binding: 6, resource: pingTex.createView() },           // unused for input (write texture)
         { binding: 7, resource: specNoisyTex.createView() },      // noisy specular radiance
+      ]});
+
+      // Input BG reading from TEMPORAL output (pre-converged, more stable for OIDN)
+      oidn.inputBG_temporal = device.createBindGroup({ layout: oidn.ioBGL, entries: [
+        { binding: 0, resource: { buffer: ioParams } },
+        { binding: 1, resource: { buffer: oidnDummy } },
+        { binding: 2, resource: { buffer: oidn.skipInput } },
+        { binding: 3, resource: hdrTex.createView() },             // temporal accumulated diffuse
+        { binding: 4, resource: albedoTex.createView() },
+        { binding: 5, resource: denoiseNdTex.createView() },
+        { binding: 6, resource: pingTex.createView() },
+        { binding: 7, resource: specHdrTex.createView() },         // temporal accumulated specular
       ]});
 
       // Input BG reading from preblurred textures (pingTex/specPingTex after anti-firefly pass)
@@ -1974,32 +1993,53 @@ async function init() {
       }
 
       if (denoiseMode.startsWith('oidn') && oidn) {
-        // Neural denoiser (reads raw noisy input — OIDN expects unfiltered 1SPP)
-        // Firefly rejection is done inline in input_assembly via luminance clamp
-        oidn.encode(encoder, oidn.inputBG, oidn.outputBG);
+        // === Temporal BEFORE OIDN: stabilizes input → stable OIDN output ===
+        // 1. Run temporal on noisy input → partially converged in hdrTex/specHdrTex
+        // 2. Feed temporal output to OIDN → clean + stable result
+        // 3. No post-OIDN blend needed (temporal already handled stability)
 
-        // Temporal blend with reprojection
-        const blendAlpha = framesStill < 3 ? 0.5 : Math.max(0.05, 1.0 / (framesStill * 0.5 + 1));
-        // Write BlendCameraParams: 4 u32 header + 8 vec4f camera data + fov/aspect
-        const bcam = new Float32Array(40); // 160 bytes = 40 floats
-        const bcamU = new Uint32Array(bcam.buffer);
-        bcamU[0] = width; bcamU[1] = height; bcamU[2] = Math.round(blendAlpha * 1000); bcamU[3] = 0;
-        bcam[4] = right[0]; bcam[5] = right[1]; bcam[6] = right[2]; bcam[7] = 0;
-        bcam[8] = up[0]; bcam[9] = up[1]; bcam[10] = up[2]; bcam[11] = 0;
-        bcam[12] = forward[0]; bcam[13] = forward[1]; bcam[14] = forward[2]; bcam[15] = 0;
-        bcam[16] = camera.pos[0]; bcam[17] = camera.pos[1]; bcam[18] = camera.pos[2]; bcam[19] = 0;
-        bcam[20] = prevCam.right[0]; bcam[21] = prevCam.right[1]; bcam[22] = prevCam.right[2]; bcam[23] = 0;
-        bcam[24] = prevCam.up[0]; bcam[25] = prevCam.up[1]; bcam[26] = prevCam.up[2]; bcam[27] = 0;
-        bcam[28] = prevCam.fwd[0]; bcam[29] = prevCam.fwd[1]; bcam[30] = prevCam.fwd[2]; bcam[31] = 0;
-        bcam[32] = prevCam.pos[0]; bcam[33] = prevCam.pos[1]; bcam[34] = prevCam.pos[2]; bcam[35] = 0;
-        bcam[36] = fovFactor; bcam[37] = aspect; bcam[38] = 0; bcam[39] = 0;
-        device.queue.writeBuffer(oidn.blendCamBuf, 0, bcam);
-        const blendPass = encoder.beginComputePass();
-        blendPass.setPipeline(oidn.blendPipeline);
-        blendPass.setBindGroup(0, oidn.blendFrame === 0 ? oidn.blendBG_A : oidn.blendBG_B);
-        blendPass.dispatchWorkgroups(Math.ceil(width / 16), Math.ceil(height / 16));
-        blendPass.end();
-        oidn.blendFrame = 1 - oidn.blendFrame;
+        // Step 1: Temporal accumulation (same as 'full' mode)
+        const pbPass = encoder.beginComputePass();
+        pbPass.setPipeline(preblurSMPipeline);
+        pbPass.setBindGroup(0, preblurBG);
+        pbPass.dispatchWorkgroups(Math.ceil(width/16), Math.ceil(height/16));
+        pbPass.end();
+
+        const tmpPass = encoder.beginComputePass();
+        tmpPass.setPipeline(tmpPipeline);
+        tmpPass.setBindGroup(0, historyFrame === 0 ? tmpBG_A : tmpBG_B);
+        tmpPass.dispatchWorkgroups(Math.ceil(width/16), Math.ceil(height/16));
+        tmpPass.end();
+        historyFrame = 1 - historyFrame;
+
+        // Step 2: OIDN reads temporal output (stable, partially converged)
+        // Run every frame when moving, skip when still (temporal already converged)
+        const runOidn = framesStill < 4 || (framesStill < 32 && frameIndex % 4 === 0) || framesStill === 4;
+        if (runOidn) {
+          oidn.encode(encoder, oidn.inputBG_temporal, oidn.outputBG);
+          // Copy OIDN result to history for composite to read
+          const blendAlpha = 1.0; // 100% OIDN (no blend, just store)
+          const bcam = new Float32Array(40);
+          const bcamU = new Uint32Array(bcam.buffer);
+          bcamU[0] = width; bcamU[1] = height; bcamU[2] = Math.round(blendAlpha * 1000); bcamU[3] = 0;
+          bcam[4] = right[0]; bcam[5] = right[1]; bcam[6] = right[2]; bcam[7] = 0;
+          bcam[8] = up[0]; bcam[9] = up[1]; bcam[10] = up[2]; bcam[11] = 0;
+          bcam[12] = forward[0]; bcam[13] = forward[1]; bcam[14] = forward[2]; bcam[15] = 0;
+          bcam[16] = camera.pos[0]; bcam[17] = camera.pos[1]; bcam[18] = camera.pos[2]; bcam[19] = 0;
+          bcam[20] = prevCam.right[0]; bcam[21] = prevCam.right[1]; bcam[22] = prevCam.right[2]; bcam[23] = 0;
+          bcam[24] = prevCam.up[0]; bcam[25] = prevCam.up[1]; bcam[26] = prevCam.up[2]; bcam[27] = 0;
+          bcam[28] = prevCam.fwd[0]; bcam[29] = prevCam.fwd[1]; bcam[30] = prevCam.fwd[2]; bcam[31] = 0;
+          bcam[32] = prevCam.pos[0]; bcam[33] = prevCam.pos[1]; bcam[34] = prevCam.pos[2]; bcam[35] = 0;
+          bcam[36] = fovFactor; bcam[37] = aspect; bcam[38] = 0; bcam[39] = 0;
+          device.queue.writeBuffer(oidn.blendCamBuf, 0, bcam);
+          const blendPass = encoder.beginComputePass();
+          blendPass.setPipeline(oidn.blendPipeline);
+          blendPass.setBindGroup(0, oidn.blendFrame === 0 ? oidn.blendBG_A : oidn.blendBG_B);
+          blendPass.dispatchWorkgroups(Math.ceil(width / 16), Math.ceil(height / 16));
+          blendPass.end();
+          oidn.blendFrame = 1 - oidn.blendFrame;
+        }
+        // When OIDN skipped: composite reads last OIDN result from history (still clean)
       } else if (denoiseMode === 'full') {
         // Pre-blur: lightweight 3×3 bilateral → stabilizes temporal AABB + removes fireflies
         const pbPass = encoder.beginComputePass();
@@ -2032,8 +2072,13 @@ async function init() {
           dp.end();
         }
 
-        // NOTE: history keeps the temporal blend output (noisy but spatially sharp).
-        // Feeding spatially-filtered result to history causes progressive blur.
+        // Temporal Stabilization (ReBLUR anti-flicker): clamps luminance to neighborhood
+        // Uses copyToHistBG which reads denoised final and writes to history
+        const stabPass = encoder.beginComputePass();
+        stabPass.setPipeline(copyToHistoryPipeline);
+        stabPass.setBindGroup(0, historyFrame === 0 ? copyToHistBG_B : copyToHistBG_A);
+        stabPass.dispatchWorkgroups(Math.ceil(width/16), Math.ceil(height/16));
+        stabPass.end();
       }
 
       // Composite (tonemap → LDR)
@@ -2108,8 +2153,10 @@ async function init() {
           const avgLum = Math.pow(2, avgLogLum);
           const keyValue = 0.18;
           const targetExposure = Math.min(Math.max(keyValue / Math.max(avgLum, 0.001), 0.1), 10.0);
-          // EMA smoothing
-          autoExposure = autoExposure + (targetExposure - autoExposure) * 0.05;
+          // EMA smoothing: fast response (20%) for large changes, smooth (5%) for small
+          const expDiff = Math.abs(targetExposure - autoExposure) / Math.max(autoExposure, 0.01);
+          const expSpeed = expDiff > 0.3 ? 0.3 : 0.08;
+          autoExposure = autoExposure + (targetExposure - autoExposure) * expSpeed;
         }
         // Reset accumulators for next frame
         device.queue.writeBuffer(exposureBuf, 0, new Uint32Array([0, 0]));
