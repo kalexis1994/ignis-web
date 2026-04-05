@@ -612,7 +612,7 @@ fn composite(@builtin(global_invocation_id) gid: vec3u) {
 
   // Auto-exposure: accumulate log2-luminance, excluding extreme outliers (sun disc)
   let lum = dot(hdr, vec3f(0.2126, 0.7152, 0.0722));
-  if lum > 0.001 && lum < 100.0 { // exclude sun disc (lum >> 100) from exposure calc
+  if lum > 0.001 && lum < 100.0 {
     let logLum = log2(lum) + 20.0;
     atomicAdd(&exposure_buf[0], u32(logLum * 16.0));
     atomicAdd(&exposure_buf[1], 1u);

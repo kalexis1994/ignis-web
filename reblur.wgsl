@@ -458,6 +458,18 @@ fn spatial_filter(
   let roughnessWeightParams = get_roughness_weight_params(roughness, gp.roughness_fraction * fractionScale);
   let minHitDistWeight = gp.min_hit_dist_weight * fractionScale * smc;
 
+  // Per-pixel rotation (Bayer4x4 + frame) — eliminates workgroup boundary artifacts
+  let bayer = fract(f32((u32(px.x) & 3u) * 4u + (u32(px.y) & 3u)) / 16.0 + f32(gp.frame_index % 16u) / 16.0);
+  let px_angle = bayer * 6.2832;
+  let px_rot = vec4f(cos(px_angle), sin(px_angle), -sin(px_angle), cos(px_angle));
+  // Combine per-pixel with per-frame rotator
+  let final_rot = vec4f(
+    px_rot.x * rotator.x - px_rot.y * rotator.y,
+    px_rot.x * rotator.y + px_rot.y * rotator.x,
+    -(px_rot.x * rotator.y + px_rot.y * rotator.x),
+    px_rot.x * rotator.x - px_rot.y * rotator.y
+  );
+
   // Screen-space sampling
   let skew_d = gp.rect_size_inv * blurRadius_d;
   let skew_s = gp.rect_size_inv * blurRadius_s;
@@ -465,7 +477,7 @@ fn spatial_filter(
   // 8 Poisson taps
   for (var n = 0u; n < 8u; n++) {
     let offset = POISSON8[n];
-    let rotated = rotate_2d(rotator, offset.xy);
+    let rotated = rotate_2d(final_rot, offset.xy);
 
     // Diffuse tap
     let uv_d = pixelUv + rotated * skew_d;
@@ -583,9 +595,8 @@ fn temporal_accumulation(@builtin(global_invocation_id) gid: vec3u) {
   let diff = textureLoad(in_diff, px, 0);
   let spec = textureLoad(in_spec, px, 0);
 
-  // === Surface motion reprojection ===
-  let mv = textureLoad(in_mv, px, 0).xyz;
-  var Xprev = X + mv;
+  // === Surface motion reprojection (compute from matrices, no MV texture) ===
+  let Xprev = X; // static world: previous position = current position
   let smbPixelUv = project_to_screen(gp.world_to_clip_prev, Xprev);
 
   var diff_blend = diff;

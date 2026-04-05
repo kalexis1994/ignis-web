@@ -74,7 +74,16 @@
       "Bash(curl:*)",
       "WebFetch(domain:deepwiki.com)",
       "WebFetch(domain:rust-gpu.github.io)",
-      "WebFetch(domain:openreview.net)"
+      "WebFetch(domain:openreview.net)",
+      "WebFetch(domain:developer.chrome.google.cn)",
+      "Bash(gh search:*)",
+      "Bash(gh auth:*)",
+      "WebFetch(domain:gpuweb.github.io)",
+      "Read(//c/tmp/NRD/Shaders/**)",
+      "Read(//c/tmp/NRD/**)",
+      "Read(//f//**)",
+      "Bash(git clone:*)",
+      "Bash(node --input-type=module -e \"import\\('./renderer.js'\\)\")"
     ]
   }
 }

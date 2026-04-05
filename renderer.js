@@ -43,7 +43,7 @@ async function init() {
   const adapter = await navigator.gpu.requestAdapter({ powerPreference: 'high-performance' });
   if (!adapter) { showError('Failed to get GPU adapter.'); return; }
 
-  const requiredStorageBuffersPerStage = 12;
+  const requiredStorageBuffersPerStage = Math.min(adapter.limits.maxStorageBuffersPerShaderStage, 16);
   if (adapter.limits.maxStorageBuffersPerShaderStage < requiredStorageBuffersPerStage) {
     showError(
       `This GPU/browser exposes maxStorageBuffersPerShaderStage=${adapter.limits.maxStorageBuffersPerShaderStage}, `
@@ -165,7 +165,7 @@ async function init() {
   if (!FSR_MODES[fsrMode]) fsrMode = 'balanced';
   const displayCap = cfg.displayCap || gpuProfile.displayCap || 1080;
   const texSize = cfg.texSize ?? gpuProfile.texSize ?? 512;
-  const denoiseMode = cfg.denoise || gpuProfile.denoise || 'full';
+  const denoiseMode = 'reblur'; // cfg.denoise || gpuProfile.denoise || 'full';
   const maxBounces = cfg.bounces || gpuProfile.maxBounces || 3;
   const sppPerFrame = cfg.spp || gpuProfile.spp || 1;
   const sharcEnabled = cfg.sharc !== undefined ? cfg.sharc : (gpuProfile.sharc !== false);
@@ -247,6 +247,16 @@ async function init() {
   const shadowModule = device.createShaderModule({ code: smCode, ...smOpts });
   const reblurModule = device.createShaderModule({ code: reblurCode, ...smOpts });
   rlog('ReBLUR shader compiled: ' + (reblurModule ? 'OK' : 'FAIL'));
+
+  // ReBLUR: history bind group layout (group 1)
+  const reblurHistoryLayout = device.createBindGroupLayout({
+    entries: [
+      { binding: 0, visibility: GPUShaderStage.COMPUTE, texture: { sampleType: 'float' } },          // history_diff
+      { binding: 1, visibility: GPUShaderStage.COMPUTE, texture: { sampleType: 'float' } },          // history_spec
+      { binding: 2, visibility: GPUShaderStage.COMPUTE, sampler: { type: 'filtering' } },             // linear_clamp
+      { binding: 3, visibility: GPUShaderStage.COMPUTE, texture: { sampleType: 'float' } },          // motion vectors (depth_tex)
+    ],
+  });
 
   // Check shader compilation
   for (const [name, mod] of [['pathtracer',ptModule],['display',dispModule],['fsr',fsrModule],['denoise',dnModule],['temporal',tmpModule],['gbuffer',gbModule],['shadow-map',shadowModule]]) {
@@ -769,6 +779,108 @@ async function init() {
     layout: device.createPipelineLayout({ bindGroupLayouts: [dnAtrousLayout] }),
     compute: { module: dnModule, entryPoint: 'copy_to_history' },
   });
+
+  // --- ReBLUR pipelines (6 passes) ---
+  const reblurSpatialPipelineLayout = device.createPipelineLayout({ bindGroupLayouts: [dnAtrousLayout] });
+  const reblurTemporalPipelineLayout = device.createPipelineLayout({ bindGroupLayouts: [dnAtrousLayout, reblurHistoryLayout] });
+
+  const reblurPrepassPipeline = device.createComputePipeline({ layout: reblurSpatialPipelineLayout, compute: { module: reblurModule, entryPoint: 'prepass' } });
+  const reblurTemporalPipeline = device.createComputePipeline({ layout: reblurTemporalPipelineLayout, compute: { module: reblurModule, entryPoint: 'temporal_accumulation' } });
+  const reblurHistoryFixPipeline = device.createComputePipeline({ layout: reblurSpatialPipelineLayout, compute: { module: reblurModule, entryPoint: 'history_fix' } });
+  const reblurBlurPipeline = device.createComputePipeline({ layout: reblurSpatialPipelineLayout, compute: { module: reblurModule, entryPoint: 'blur' } });
+  const reblurPostBlurPipeline = device.createComputePipeline({ layout: reblurSpatialPipelineLayout, compute: { module: reblurModule, entryPoint: 'post_blur' } });
+  const reblurStabilizePipeline = device.createComputePipeline({ layout: reblurTemporalPipelineLayout, compute: { module: reblurModule, entryPoint: 'temporal_stabilization' } });
+  // ReBLUR uniform buffer (ReblurParams struct, ~640 bytes)
+  const reblurParamBuf = device.createBuffer({ size: 640, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
+
+  // ReBLUR bind groups — spatial passes use group(0) only, temporal passes use group(0)+group(1)
+  // Reuse dnParamBufs[0] as uniform for spatial passes (step_size + frames_still)
+  const reblurBG_prepass = device.createBindGroup({ layout: dnAtrousLayout, entries: [
+    { binding: 0, resource: { buffer: reblurParamBuf } },
+    { binding: 1, resource: noisyTex.createView() },        // in: noisy diffuse
+    { binding: 2, resource: pingTex.createView() },          // out: pre-filtered
+    { binding: 3, resource: denoiseNdTex.createView() },     // gbuf (normal+depth)
+    { binding: 4, resource: specNoisyTex.createView() },     // in: noisy specular
+    { binding: 5, resource: specPingTex.createView() },      // out: pre-filtered spec
+    { binding: 6, resource: albedoTex.createView() },        // albedo+roughness
+  ]});
+  const reblurBG_temporal = device.createBindGroup({ layout: dnAtrousLayout, entries: [
+    { binding: 0, resource: { buffer: reblurParamBuf } },
+    { binding: 1, resource: pingTex.createView() },          // in: prepass output
+    { binding: 2, resource: hdrTex.createView() },           // out: temporal result
+    { binding: 3, resource: denoiseNdTex.createView() },
+    { binding: 4, resource: specPingTex.createView() },
+    { binding: 5, resource: specHdrTex.createView() },
+    { binding: 6, resource: albedoTex.createView() },
+  ]});
+  const reblurHistBG_A = device.createBindGroup({ layout: reblurHistoryLayout, entries: [
+    { binding: 0, resource: historyA.createView() },
+    { binding: 1, resource: specHistoryA.createView() },
+    { binding: 2, resource: sampler },
+    { binding: 3, resource: denoiseNdTex.createView() },     // reuse as MV proxy
+  ]});
+  const reblurHistBG_B = device.createBindGroup({ layout: reblurHistoryLayout, entries: [
+    { binding: 0, resource: historyB.createView() },
+    { binding: 1, resource: specHistoryB.createView() },
+    { binding: 2, resource: sampler },
+    { binding: 3, resource: denoiseNdTex.createView() },
+  ]});
+  const reblurBG_historyfix = device.createBindGroup({ layout: dnAtrousLayout, entries: [
+    { binding: 0, resource: { buffer: reblurParamBuf } },
+    { binding: 1, resource: hdrTex.createView() },           // in: temporal output
+    { binding: 2, resource: pingTex.createView() },          // out: fixed
+    { binding: 3, resource: denoiseNdTex.createView() },
+    { binding: 4, resource: specHdrTex.createView() },
+    { binding: 5, resource: specPingTex.createView() },
+    { binding: 6, resource: albedoTex.createView() },
+  ]});
+  const reblurBG_blur = device.createBindGroup({ layout: dnAtrousLayout, entries: [
+    { binding: 0, resource: { buffer: reblurParamBuf } },
+    { binding: 1, resource: pingTex.createView() },          // in: history-fixed
+    { binding: 2, resource: pongTex.createView() },          // out: blurred
+    { binding: 3, resource: denoiseNdTex.createView() },
+    { binding: 4, resource: specPingTex.createView() },
+    { binding: 5, resource: specPongTex.createView() },
+    { binding: 6, resource: albedoTex.createView() },
+  ]});
+  const reblurBG_postblur = device.createBindGroup({ layout: dnAtrousLayout, entries: [
+    { binding: 0, resource: { buffer: reblurParamBuf } },
+    { binding: 1, resource: pongTex.createView() },          // in: blurred
+    { binding: 2, resource: pingTex.createView() },          // out: post-blurred
+    { binding: 3, resource: denoiseNdTex.createView() },
+    { binding: 4, resource: specPongTex.createView() },
+    { binding: 5, resource: specPingTex.createView() },
+    { binding: 6, resource: albedoTex.createView() },
+  ]});
+  const reblurBG_stabilize = device.createBindGroup({ layout: dnAtrousLayout, entries: [
+    { binding: 0, resource: { buffer: reblurParamBuf } },
+    { binding: 1, resource: pingTex.createView() },          // in: post-blurred
+    { binding: 2, resource: hdrTex.createView() },           // out: stabilized (final)
+    { binding: 3, resource: denoiseNdTex.createView() },
+    { binding: 4, resource: specPingTex.createView() },
+    { binding: 5, resource: specHdrTex.createView() },
+    { binding: 6, resource: albedoTex.createView() },
+  ]});
+  // Copy stabilized to history for next frame
+  const reblurBG_copyHist_A = device.createBindGroup({ layout: dnAtrousLayout, entries: [
+    { binding: 0, resource: { buffer: reblurParamBuf } },
+    { binding: 1, resource: hdrTex.createView() },           // in: stabilized
+    { binding: 2, resource: historyB.createView() },         // out: history
+    { binding: 3, resource: denoiseNdTex.createView() },
+    { binding: 4, resource: specHdrTex.createView() },
+    { binding: 5, resource: specHistoryB.createView() },
+    { binding: 6, resource: albedoTex.createView() },
+  ]});
+  const reblurBG_copyHist_B = device.createBindGroup({ layout: dnAtrousLayout, entries: [
+    { binding: 0, resource: { buffer: reblurParamBuf } },
+    { binding: 1, resource: hdrTex.createView() },
+    { binding: 2, resource: historyA.createView() },
+    { binding: 3, resource: denoiseNdTex.createView() },
+    { binding: 4, resource: specHdrTex.createView() },
+    { binding: 5, resource: specHistoryA.createView() },
+    { binding: 6, resource: albedoTex.createView() },
+  ]});
+  rlog('ReBLUR pipelines + bind groups created');
   // Shared-memory tiled atrous for step=1 (first pass): 99 textureLoad → ~5 per thread
   const dnAtrousSMPipeline = device.createComputePipeline({
     layout: device.createPipelineLayout({ bindGroupLayouts: [dnAtrousLayout] }),
@@ -812,9 +924,8 @@ async function init() {
     ],
   });
 
-  // Auto-exposure buffer: [0]=logLumSum (atomic u32), [1]=pixelCount (atomic u32), [2]=currentExposure (f32)
   const exposureBuf = device.createBuffer({ size: 16, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC | GPUBufferUsage.COPY_DST });
-  device.queue.writeBuffer(exposureBuf, 0, new Float32Array([0, 0, 1.0, 0])); // init exposure=1.0
+  device.queue.writeBuffer(exposureBuf, 0, new Float32Array([0, 0, 1.0, 0]));
   const dnCompPipeline = device.createComputePipeline({
     layout: device.createPipelineLayout({ bindGroupLayouts: [dnCompLayout] }),
     compute: { module: dnModule, entryPoint: 'composite' },
@@ -884,6 +995,20 @@ async function init() {
     { binding: 0, resource: { buffer: dnCompParamBuf } },
     { binding: 1, resource: (dnFinalInPing ? pingTex : pongTex).createView() },
     { binding: 4, resource: (dnFinalInPing ? specPingTex : specPongTex).createView() },
+    { binding: 6, resource: albedoTex.createView() },
+    { binding: 7, resource: ptOutputTex.createView() },
+    { binding: 8, resource: matIdTex.createView() },
+    { binding: 9, resource: ndTex.createView() },
+    { binding: 10, resource: prevFrameTex.createView() },
+    { binding: 11, resource: compSampler },
+    { binding: 12, resource: { buffer: matBuf } },
+    { binding: 13, resource: { buffer: exposureBuf } },
+  ]});
+  // ReBLUR composite: reads from hdrTex/specHdrTex (stabilized output)
+  const dnBG_comp_reblur = device.createBindGroup({ layout: dnCompLayout, entries: [
+    { binding: 0, resource: { buffer: dnCompParamBuf } },
+    { binding: 1, resource: hdrTex.createView() },
+    { binding: 4, resource: specHdrTex.createView() },
     { binding: 6, resource: albedoTex.createView() },
     { binding: 7, resource: ptOutputTex.createView() },
     { binding: 8, resource: matIdTex.createView() },
@@ -2043,6 +2168,151 @@ async function init() {
           oidn.blendFrame = 1 - oidn.blendFrame;
         }
         // When OIDN skipped: composite reads last OIDN result from history (still clean)
+      } else if (denoiseMode === 'reblur') {
+        // === ReBLUR pipeline: 6 passes ===
+        const wg = [Math.ceil(width/16), Math.ceil(height/16)];
+        const histBG = historyFrame === 0 ? reblurHistBG_A : reblurHistBG_B;
+
+        // Fill ReblurParams: 5 mat4x4 + 4 vec4 + 3 vec4 rotators + 6 vec2 + ~25 scalars
+        // WGSL layout (byte offsets):
+        //   0-63:   world_to_clip (mat4x4f)
+        //  64-127:  view_to_world
+        // 128-191:  world_to_view_prev
+        // 192-255:  world_to_clip_prev
+        // 256-319:  world_prev_to_world (identity for now)
+        // 320-335:  frustum (vec4f)
+        // 336-351:  frustum_prev
+        // 352-367:  camera_delta
+        // 368-383:  hit_dist_params
+        // 384-399:  rotator_pre
+        // 400-415:  rotator_blur
+        // 416-431:  rotator_post
+        // 432-439:  rect_size (vec2f)
+        // 440-447:  rect_size_inv
+        // 448-455:  rect_size_prev
+        // 456-463:  resource_size_inv_prev
+        // 464-471:  jitter
+        // 472-475:  padding (align to 4)
+        // 476+:     scalars (f32 each, u32 for frame_index)
+        const rp = new Float32Array(160); // 640 bytes
+
+        // Build view matrix (column-major) — simplified using our camera vectors
+        // view_to_world = [right | up | -forward | pos] columns
+        const vtw = rp.subarray(16, 32); // offset 64 = float[16]
+        vtw[0]=right[0]; vtw[1]=right[1]; vtw[2]=right[2]; vtw[3]=0;
+        vtw[4]=up[0]; vtw[5]=up[1]; vtw[6]=up[2]; vtw[7]=0;
+        vtw[8]=-forward[0]; vtw[9]=-forward[1]; vtw[10]=-forward[2]; vtw[11]=0;
+        vtw[12]=camera.pos[0]; vtw[13]=camera.pos[1]; vtw[14]=camera.pos[2]; vtw[15]=1;
+
+        // frustum params (offset 320 = float[80]): reconstructs view pos from UV
+        // Xv = (uv.x * frustum.x + frustum.z, uv.y * frustum.y + frustum.w, 1) * viewZ
+        // For perspective: frustum = (2*tan(fovH/2), 2*tan(fovV/2), -tan(fovH/2), -tan(fovV/2))
+        const tanH = aspect * fovFactor;
+        const tanV = fovFactor;
+        rp[80] = 2*tanH; rp[81] = 2*tanV; rp[82] = -tanH; rp[83] = -tanV; // frustum
+        rp[84] = 2*tanH; rp[85] = 2*tanV; rp[86] = -tanH; rp[87] = -tanV; // frustum_prev (same for now)
+
+        // world_to_view_prev (offset 128 = float[32]): column-major
+        // viewPrev = [prevRight | prevUp | -prevFwd | prevPos] inverse
+        {
+          const pr = prevCam.right, pu = prevCam.up, pf = prevCam.fwd, pp = prevCam.pos;
+          const wtvp = rp.subarray(32, 48);
+          wtvp[0]=pr[0]; wtvp[1]=pu[0]; wtvp[2]=-pf[0]; wtvp[3]=0;
+          wtvp[4]=pr[1]; wtvp[5]=pu[1]; wtvp[6]=-pf[1]; wtvp[7]=0;
+          wtvp[8]=pr[2]; wtvp[9]=pu[2]; wtvp[10]=-pf[2]; wtvp[11]=0;
+          wtvp[12]=-(pr[0]*pp[0]+pr[1]*pp[1]+pr[2]*pp[2]);
+          wtvp[13]=-(pu[0]*pp[0]+pu[1]*pp[1]+pu[2]*pp[2]);
+          wtvp[14]=(pf[0]*pp[0]+pf[1]*pp[1]+pf[2]*pp[2]);
+          wtvp[15]=1;
+        }
+
+        // world_to_clip_prev (offset 192 = float[48]): proj * viewPrev
+        // Perspective proj: similar to our buildViewProj
+        {
+          const near = 0.1, far = 1000.0;
+          const proj = new Float32Array(16);
+          proj[0] = 1.0 / (aspect * fovFactor); proj[5] = -1.0 / fovFactor;
+          proj[10] = -far / (far - near); proj[11] = -1;
+          proj[14] = -(far * near) / (far - near);
+          // Multiply proj * viewPrev
+          const vp = rp.subarray(32, 48); // world_to_view_prev
+          const wcp = rp.subarray(48, 64); // world_to_clip_prev
+          for (let c = 0; c < 4; c++)
+            for (let r = 0; r < 4; r++)
+              wcp[c*4+r] = proj[r]*vp[c*4] + proj[4+r]*vp[c*4+1] + proj[8+r]*vp[c*4+2] + proj[12+r]*vp[c*4+3];
+        }
+
+        // camera_delta (offset 352 = float[88])
+        rp[88] = camera.pos[0]-prevCam.pos[0]; rp[89] = camera.pos[1]-prevCam.pos[1];
+        rp[90] = camera.pos[2]-prevCam.pos[2]; rp[91] = 0;
+
+        // hit_dist_params (offset 368 = float[92]): (A=3, B=0.1, C=1, 0)
+        rp[92] = 3.0; rp[93] = 0.1; rp[94] = 1.0; rp[95] = 0;
+
+        // Rotators (offset 384,400,416 = float[96,100,104])
+        const angle = (frameIndex % 256) * (6.2832 / 256.0);
+        const rc = Math.cos(angle), rs = Math.sin(angle);
+        rp[96] = rc; rp[97] = rs; rp[98] = -rs; rp[99] = rc;
+        rp[100] = rc; rp[101] = rs; rp[102] = -rs; rp[103] = rc;
+        rp[104] = rc; rp[105] = rs; rp[106] = -rs; rp[107] = rc;
+
+        // rect_size (offset 432 = float[108])
+        rp[108] = width; rp[109] = height;
+        rp[110] = 1.0/width; rp[111] = 1.0/height;
+        rp[112] = width; rp[113] = height;
+        rp[114] = 1.0/width; rp[115] = 1.0/height;
+        // jitter (offset 464 = float[116])
+        rp[116] = 0; rp[117] = 0;
+
+        // Scalars (offset 472 = float[118], but we need padding for align)
+        // After vec2f jitter (8 bytes), next f32 starts at offset 472
+        // But the struct has f32 fields starting at disocclusion_threshold
+        // With WGSL alignment: after vec2f, f32 aligns to 4 → offset 472
+        let si = 118; // float index for offset 472
+        rp[si++] = 0.015;  // disocclusion_threshold
+        rp[si++] = 2.0;    // plane_dist_sensitivity
+        rp[si++] = 0.5;    // min_blur_radius
+        rp[si++] = 20.0;   // max_blur_radius
+        rp[si++] = 30.0;   // diff_prepass_blur_radius
+        rp[si++] = 30.0;   // spec_prepass_blur_radius
+        rp[si++] = 63.0;   // max_accumulated_frame_num
+        rp[si++] = 8.0;    // max_fast_accumulated_frame_num
+        rp[si++] = 0.5;    // lobe_angle_fraction
+        rp[si++] = 0.5;    // roughness_fraction
+        rp[si++] = 7.0;    // history_fix_frame_num
+        rp[si++] = 14.0;   // history_fix_stride
+        rp[si++] = 1.0;    // stabilization_strength
+        rp[si++] = 1.0;    // anti_firefly
+        rp[si++] = 1.0;    // antilag_power
+        rp[si++] = 1.0;    // antilag_threshold
+        rp[si++] = 1.0;    // framerate_scale
+        rp[si++] = 10000.0;// denoising_range
+        rp[si++] = Math.min(width,height) * fovFactor / width; // min_rect_dim_mul_unproject
+        rp[si++] = fovFactor; // unproject
+        rp[si++] = 0.0;    // ortho_mode
+        new Uint32Array(rp.buffer)[si] = frameIndex; si++; // frame_index (u32)
+        rp[si++] = 1.0;    // view_z_scale
+        rp[si++] = 0.2;    // min_hit_dist_weight
+        rp[si++] = 1.0;    // firefly_suppressor_min_relative_scale
+        rp[si++] = 1.0;    // fast_history_clamping_sigma_scale
+        device.queue.writeBuffer(reblurParamBuf, 0, rp);
+
+        // Pass 1: PrePass (noisy → ping)
+        { const p = encoder.beginComputePass(); p.setPipeline(reblurPrepassPipeline); p.setBindGroup(0, reblurBG_prepass); p.dispatchWorkgroups(...wg); p.end(); }
+        // Pass 2: Temporal (ping + history → hdr)
+        { const p = encoder.beginComputePass(); p.setPipeline(reblurTemporalPipeline); p.setBindGroup(0, reblurBG_temporal); p.setBindGroup(1, histBG); p.dispatchWorkgroups(...wg); p.end(); }
+        // Pass 3: HistoryFix (hdr → ping)
+        { const p = encoder.beginComputePass(); p.setPipeline(reblurHistoryFixPipeline); p.setBindGroup(0, reblurBG_historyfix); p.dispatchWorkgroups(...wg); p.end(); }
+        // Pass 4: Blur (ping → pong)
+        { const p = encoder.beginComputePass(); p.setPipeline(reblurBlurPipeline); p.setBindGroup(0, reblurBG_blur); p.dispatchWorkgroups(...wg); p.end(); }
+        // Pass 5: PostBlur (pong → ping)
+        { const p = encoder.beginComputePass(); p.setPipeline(reblurPostBlurPipeline); p.setBindGroup(0, reblurBG_postblur); p.dispatchWorkgroups(...wg); p.end(); }
+        // Pass 6: Stabilize (ping + history → hdr)
+        { const p = encoder.beginComputePass(); p.setPipeline(reblurStabilizePipeline); p.setBindGroup(0, reblurBG_stabilize); p.setBindGroup(1, histBG); p.dispatchWorkgroups(...wg); p.end(); }
+        // Copy to history for next frame
+        { const p = encoder.beginComputePass(); p.setPipeline(copyToHistoryPipeline); p.setBindGroup(0, historyFrame === 0 ? reblurBG_copyHist_A : reblurBG_copyHist_B); p.dispatchWorkgroups(...wg); p.end(); }
+        historyFrame = 1 - historyFrame;
+
       } else if (denoiseMode === 'full') {
         // Pre-blur: lightweight 3×3 bilateral → stabilizes temporal AABB + removes fireflies
         const pbPass = encoder.beginComputePass();
@@ -2060,7 +2330,7 @@ async function init() {
         historyFrame = 1 - historyFrame;
       }
 
-      if (denoiseMode !== 'off' && denoiseMode !== 'oidn') {
+      if (denoiseMode !== 'off' && denoiseMode !== 'oidn' && denoiseMode !== 'reblur') {
         // Update denoise params with framesStill for motion-adaptive filtering
         for (let di = 0; di < denoisePasses; di++) {
           device.queue.writeBuffer(dnParamBufs[di], 0, new Float32Array([width, height, dnSteps[di], framesStill]));
@@ -2105,6 +2375,7 @@ async function init() {
       compPass.setPipeline(dnCompPipeline);
       const compBG = (denoiseMode.startsWith('oidn') && oidn)
                    ? (oidn.blendFrame === 0 ? dnBG_comp_oidn_A : dnBG_comp_oidn_B)
+                   : denoiseMode === 'reblur' ? dnBG_comp_reblur
                    : denoiseMode !== 'off' ? dnBG_comp : dnBG_comp_noisy;
       compPass.setBindGroup(0, compBG);
       compPass.dispatchWorkgroups(Math.ceil(width/16), Math.ceil(height/16));

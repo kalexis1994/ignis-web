@@ -2483,4 +2483,5 @@ fn main(@builtin(global_invocation_id) gid: vec3u) {
   textureStore(specular_out, vec2i(pixel), vec4f(spec_color, norm_hit_dist));
   textureStore(albedo_out, vec2i(pixel), vec4f(pt.albedo, pt.roughness));
   textureStore(denoise_nd_out, vec2i(pixel), vec4f(pt.normal, pt.depth));
+
 }
