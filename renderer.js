@@ -207,7 +207,7 @@ async function init() {
 
   // --- Load shaders ---
   const v = Date.now(); // cache bust
-  let [ptCode, dispCode, fsrCode, dnCode, tmpCode, gbCode, smCode] = await Promise.all([
+  let [ptCode, dispCode, fsrCode, dnCode, tmpCode, gbCode, smCode, reblurCode] = await Promise.all([
     fetch(`pathtracer.wgsl?v=${v}`).then(r => r.text()),
     fetch(`display.wgsl?v=${v}`).then(r => r.text()),
     fetch(`fsr.wgsl?v=${v}`).then(r => r.text()),
@@ -215,6 +215,7 @@ async function init() {
     fetch(`temporal.wgsl?v=${v}`).then(r => r.text()),
     fetch(`gbuffer.wgsl?v=${v}`).then(r => r.text()),
     fetch(`shadow-map.wgsl?v=${v}`).then(r => r.text()),
+    fetch(`reblur.wgsl?v=${v}`).then(r => r.text()),
   ]);
 
   if (hasSubgroups) rlog('Subgroups available (reserved for denoiser)');
@@ -244,6 +245,8 @@ async function init() {
   const tmpModule = device.createShaderModule({ code: tmpCode, ...smOpts });
   const gbModule = device.createShaderModule({ code: gbCode, ...smOpts });
   const shadowModule = device.createShaderModule({ code: smCode, ...smOpts });
+  const reblurModule = device.createShaderModule({ code: reblurCode, ...smOpts });
+  rlog('ReBLUR shader compiled: ' + (reblurModule ? 'OK' : 'FAIL'));
 
   // Check shader compilation
   for (const [name, mod] of [['pathtracer',ptModule],['display',dispModule],['fsr',fsrModule],['denoise',dnModule],['temporal',tmpModule],['gbuffer',gbModule],['shadow-map',shadowModule]]) {
