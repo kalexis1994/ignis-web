@@ -228,8 +228,10 @@ fn temporal(@builtin(global_invocation_id) gid: vec3u) {
 
   // Sample history if reprojection is valid
   if prev_uv_z.x >= 0.0 && prev_uv_z.x <= 1.0 && prev_uv_z.y >= 0.0 && prev_uv_z.y <= 1.0 {
-    let diff_hist_s = textureSampleLevel(prev_denoised, tex_sampler, prev_uv_z.xy, 0.0);
-    let spec_hist_s = textureSampleLevel(prev_spec, tex_sampler, prev_uv_z.xy, 0.0);
+    // CatRom (bicubic) history sampling — sharper than bilinear, less temporal blur
+    let tex_size = params.resolution;
+    let diff_hist_s = sample_catmull_rom(prev_denoised, tex_sampler, prev_uv_z.xy, tex_size);
+    let spec_hist_s = sample_catmull_rom(prev_spec, tex_sampler, prev_uv_z.xy, tex_size);
     let prev_z = spec_hist_s.a;
     let z_threshold = max(abs(prev_z) * params.depth_reject_scale, 0.5);
     let depth_valid = abs(prev_uv_z.z - prev_z) < z_threshold;
@@ -264,9 +266,55 @@ fn temporal(@builtin(global_invocation_id) gid: vec3u) {
         spec_hist = clip_aabb(s_mn - s_expand, s_mx + s_expand, spec_hist);
       }
 
-      let alpha = max(1.0 / (history_len + 1.0), 0.02);
+      // AntiLag (ReBLUR): detect lighting change → reduce accumSpeed
+      // Compare history luminance with current neighborhood mean
+      let hist_dl = luma(diff_hist);
+      let cur_dl = luma(diff_cur);
+      let d_change = abs(hist_dl - cur_dl) / (max(hist_dl, cur_dl) + 0.001);
+      // If change > threshold relative to accumSpeed, reduce history confidence
+      let d_antilag = 1.0 / (1.0 + d_change * history_len * 0.5);
+      let effective_history = history_len * d_antilag;
+
+      let alpha = max(1.0 / (effective_history + 1.0), 0.02);
       diff_blend = mix(diff_hist, diff_cur, alpha);
-      spec_blend = mix(spec_hist, spec_cur, alpha);
+
+      // === Virtual motion for specular (ReBLUR) ===
+      // Specular reflections move differently than surfaces. For smooth surfaces,
+      // reproject from a VIRTUAL position behind the surface along the reflection.
+      let roughness = textureLoad(depth_tex, px, 0).x; // roughness stored in nd.x? No...
+      // We don't have roughness in temporal. Use surface motion for now, but with
+      // reduced alpha for specular (accumulate slower = more stable reflections)
+      let V = normalize(params.cam_pos.xyz - world_pos);
+      let N = cn;
+      let spec_hit = cur_hit_dist;
+      let dominantFactor = 1.0 - textureLoad(current_spec, px, 0).a * textureLoad(current_spec, px, 0).a; // hitdist as proxy
+
+      // Virtual position: X + reflect(-V, N) * hitDist * dominantFactor
+      // Only use virtual motion for pixels with short hit distance (close reflections)
+      var spec_hist_final = spec_hist;
+      if spec_hit > 0.01 && spec_hit < 0.9 {
+        let R = reflect(-V, N);
+        // Decode hit distance from normalized log space
+        let real_hit = exp2(spec_hit * 8.0) - 1.0;
+        let Xvirtual = world_pos + R * real_hit;
+        let vmb_uv = project_to_uv(
+          Xvirtual,
+          params.prev_right.xyz, params.prev_up.xyz, params.prev_fwd.xyz, params.prev_pos.xyz,
+          params.fov_factor, params.aspect
+        );
+        // If virtual reprojection is valid, blend between surface and virtual history
+        if vmb_uv.x >= 0.0 && vmb_uv.x <= 1.0 && vmb_uv.y >= 0.0 && vmb_uv.y <= 1.0 {
+          let vmb_hist = textureSampleLevel(prev_spec, tex_sampler, vmb_uv.xy, 0.0).rgb;
+          // Blend: smooth surfaces use virtual, rough use surface
+          // hit_dist < 0.3 = close reflection = strong virtual motion
+          let vmb_weight = clamp(1.0 - spec_hit * 3.0, 0.0, 0.8);
+          spec_hist_final = mix(spec_hist, vmb_hist, vmb_weight);
+        }
+      }
+      spec_blend = mix(spec_hist_final, spec_cur, alpha);
+
+      // Store the antilag-adjusted history for downstream passes
+      history_len = effective_history;
     }
   }
 

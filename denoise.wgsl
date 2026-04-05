@@ -62,16 +62,21 @@ const KW = array<f32, 25>(
   1.0/256.0,  4.0/256.0,  6.0/256.0,  4.0/256.0, 1.0/256.0,
 );
 
-// ReBLUR-style Poisson disk (8 taps, z = radius for Gaussian weight)
-const POISSON8 = array<vec3f, 8>(
-  vec3f(-1.00,  0.20, 0.15),
-  vec3f( 0.38, -0.85, 0.25),
-  vec3f( 0.94,  0.34, 0.35),
-  vec3f(-0.47,  0.81, 0.45),
-  vec3f(-0.74, -0.64, 0.55),
-  vec3f( 0.72, -0.58, 0.65),
-  vec3f( 0.15,  0.98, 0.75),
-  vec3f(-0.28, -0.36, 0.85),
+// Poisson disk 12 taps (xy = offset, z = radius [0,1] for Gaussian weight)
+const POISSON_COUNT: u32 = 12u;
+const POISSON = array<vec3f, 12>(
+  vec3f(-0.36,  0.22, 0.10),
+  vec3f( 0.50, -0.40, 0.18),
+  vec3f(-0.83,  0.05, 0.25),
+  vec3f( 0.15,  0.78, 0.32),
+  vec3f( 0.90, -0.15, 0.38),
+  vec3f(-0.55, -0.72, 0.45),
+  vec3f(-0.18,  0.95, 0.52),
+  vec3f( 0.68,  0.58, 0.58),
+  vec3f(-0.92, -0.35, 0.65),
+  vec3f( 0.28, -0.90, 0.72),
+  vec3f( 0.85,  0.42, 0.80),
+  vec3f(-0.42, -0.20, 0.90),
 );
 
 // ============================================================
@@ -90,13 +95,16 @@ fn atrous(@builtin(global_invocation_id) gid: vec3u) {
   // Pass 1 (step=2): Blur — main spatial filter, radiusScale=1.0
   // Pass 2 (step=4): PostBlur — aggressive cleanup, radiusScale=2.0, fractionScale=0.5
   // Pass 3+ (step>=8): passthrough
+  // Pass 3+ (step>=8): passthrough
   if params.step_size >= 7.5 {
     textureStore(out_color, px, textureLoad(in_color, px, 0));
     textureStore(out_spec, px, textureLoad(in_spec, px, 0));
     return;
   }
-  let radiusScale = select(1.0, 2.0, params.step_size > 3.5);   // Blur=1x, PostBlur=2x
-  let fractionScale = select(1.0, 0.5, params.step_size > 3.5); // PostBlur tightens weights
+  // Pass 1 (step=2): Blur — radiusScale=1.0
+  // Pass 2 (step=4): PostBlur — radiusScale=1.5, tighter weights
+  let radiusScale = select(1.0, 1.5, params.step_size > 3.5);
+  let fractionScale = select(1.0, 0.5, params.step_size > 3.5);
 
   let cnd = textureLoad(gbuf_nd, px, 0);
   let cn = cnd.xyz;
@@ -140,8 +148,8 @@ fn atrous(@builtin(global_invocation_id) gid: vec3u) {
   var d_wsum = 1.0;
   var s_wsum = 1.0;
 
-  for (var i = 0u; i < 8u; i++) {
-    let tap = POISSON8[i];
+  for (var i = 0u; i < POISSON_COUNT; i++) {
+    let tap = POISSON[i];
 
     // Rotate and scale offset by blur radius
     let ox = tap.x * rot_cos - tap.y * rot_sin;
@@ -155,15 +163,23 @@ fn atrous(@builtin(global_invocation_id) gid: vec3u) {
     // --- Diffuse tap ---
     let dp = clamp(px + d_offset, vec2i(0), sz - 1);
     let dnd = textureLoad(gbuf_nd, dp, 0);
-    let d_col = textureLoad(in_color, dp, 0).rgb;
+    let d_sample = textureLoad(in_color, dp, 0);
+    let d_col = d_sample.rgb;
 
-    // Normal weight: tighter for PostBlur (fractionScale=0.5 → exponent doubles)
+    // Normal weight
     let normal_exp = 32.0 / fractionScale;
     let d_wn = pow(max(dot(cn, dnd.xyz), 0.0), normal_exp);
-    // Depth weight: exponential falloff based on depth gradient
+    // Depth weight
     let d_dz = abs(cz - dnd.w);
     let d_wz = exp(-d_dz / (gz * diff_blur_r + 1e-3));
-    let d_w = gauss_w * d_wn * d_wz;
+    // Soft luminance weight (radius-dependent: far taps stricter)
+    let d_lum_diff = abs(luma(cc) - luma(d_col));
+    let d_lum_tol = max(luma(cc), 0.1) * (1.5 - tap.z);
+    let d_wl = exp(-d_lum_diff * d_lum_diff / (d_lum_tol * d_lum_tol + 0.01));
+    // Hit distance weight (ReBLUR): preserves contact shadows
+    let d_hd = abs(hit_dist - textureLoad(in_spec, dp, 0).a);
+    let d_wh = exp(-d_hd * d_hd * 4.0 / max(nonLinearAccumSpeed, 0.01));
+    let d_w = gauss_w * d_wn * d_wz * d_wl * d_wh;
 
     d_sum += d_col * d_w;
     d_wsum += d_w;
@@ -171,12 +187,19 @@ fn atrous(@builtin(global_invocation_id) gid: vec3u) {
     // --- Specular tap (separate radius) ---
     let sp = clamp(px + s_offset, vec2i(0), sz - 1);
     let snd = textureLoad(gbuf_nd, sp, 0);
-    let s_col = textureLoad(in_spec, sp, 0).rgb;
+    let s_sample = textureLoad(in_spec, sp, 0);
+    let s_col = s_sample.rgb;
 
     let s_wn = pow(max(dot(cn, snd.xyz), 0.0), 64.0 / fractionScale);
     let s_dz = abs(cz - snd.w);
     let s_wz = exp(-s_dz / (gz * spec_blur_r + 1e-3));
-    let s_w = gauss_w * s_wn * s_wz;
+    let s_lum_diff = abs(luma(cs) - luma(s_col));
+    let s_lum_tol = max(luma(cs), 0.1) * (1.0 - tap.z * 0.5);
+    let s_wl = exp(-s_lum_diff * s_lum_diff / (s_lum_tol * s_lum_tol + 0.01));
+    // Hit distance weight for specular
+    let s_hd = abs(hit_dist - s_sample.a);
+    let s_wh = exp(-s_hd * s_hd * 8.0 / max(nonLinearAccumSpeed, 0.01));
+    let s_w = gauss_w * s_wn * s_wz * s_wl * s_wh;
 
     s_sum += s_col * s_w;
     s_wsum += s_w;
@@ -337,8 +360,8 @@ fn preblur(@builtin(global_invocation_id) gid: vec3u) {
   var s_sum = cs;
   var w_sum = 1.0;
 
-  for (var i = 0u; i < 8u; i++) {
-    let tap = POISSON8[i];
+  for (var i = 0u; i < POISSON_COUNT; i++) {
+    let tap = POISSON[i];
     let ox = tap.x * pre_cos - tap.y * pre_sin;
     let oy = tap.x * pre_sin + tap.y * pre_cos;
     let offset = vec2i(vec2f(ox, oy) * prepassRadius + 0.5);
@@ -446,8 +469,8 @@ fn preblur_sm(@builtin(global_invocation_id) gid: vec3u,
   var s_sum_pb = cs;
   var w_sum_pb = 1.0;
 
-  for (var i = 0u; i < 8u; i++) {
-    let tap = POISSON8[i];
+  for (var i = 0u; i < POISSON_COUNT; i++) {
+    let tap = POISSON[i];
     let ox = tap.x * pre_cos_sm - tap.y * pre_sin_sm;
     let oy = tap.x * pre_sin_sm + tap.y * pre_cos_sm;
     let offset = vec2i(vec2f(ox, oy) * 15.0 + 0.5);
