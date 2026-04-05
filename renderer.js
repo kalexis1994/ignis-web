@@ -791,7 +791,7 @@ async function init() {
   const reblurPostBlurPipeline = device.createComputePipeline({ layout: reblurSpatialPipelineLayout, compute: { module: reblurModule, entryPoint: 'post_blur' } });
   const reblurStabilizePipeline = device.createComputePipeline({ layout: reblurTemporalPipelineLayout, compute: { module: reblurModule, entryPoint: 'temporal_stabilization' } });
   // ReBLUR uniform buffer (ReblurParams struct, ~640 bytes)
-  const reblurParamBuf = device.createBuffer({ size: 640, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
+  const reblurParamBuf = device.createBuffer({ size: 576, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
 
   // ReBLUR bind groups — spatial passes use group(0) only, temporal passes use group(0)+group(1)
   // Reuse dnParamBufs[0] as uniform for spatial passes (step_size + frames_still)
@@ -2204,107 +2204,109 @@ async function init() {
         // 464-471:  jitter
         // 472-475:  padding (align to 4)
         // 476+:     scalars (f32 each, u32 for frame_index)
-        const rp = new Float32Array(160); // 640 bytes
+        // ReblurParams: 576 bytes (144 floats), offsets verified by struct layout calculator
+        const rp = new Float32Array(144);
+        const rpu = new Uint32Array(rp.buffer);
+        const tanH = aspect * fovFactor, tanV = fovFactor;
+        const near = 0.1, far = 1000.0;
+        const pr = prevCam.right, pu = prevCam.up, pf = prevCam.fwd, pp = prevCam.pos;
 
-        // Build view matrix (column-major) — simplified using our camera vectors
-        // view_to_world = [right | up | -forward | pos] columns
-        const vtw = rp.subarray(16, 32); // offset 64 = float[16]
-        vtw[0]=right[0]; vtw[1]=right[1]; vtw[2]=right[2]; vtw[3]=0;
-        vtw[4]=up[0]; vtw[5]=up[1]; vtw[6]=up[2]; vtw[7]=0;
-        vtw[8]=-forward[0]; vtw[9]=-forward[1]; vtw[10]=-forward[2]; vtw[11]=0;
-        vtw[12]=camera.pos[0]; vtw[13]=camera.pos[1]; vtw[14]=camera.pos[2]; vtw[15]=1;
-
-        // frustum params (offset 320 = float[80]): reconstructs view pos from UV
-        // Xv = (uv.x * frustum.x + frustum.z, uv.y * frustum.y + frustum.w, 1) * viewZ
-        // For perspective: frustum = (2*tan(fovH/2), 2*tan(fovV/2), -tan(fovH/2), -tan(fovV/2))
-        const tanH = aspect * fovFactor;
-        const tanV = fovFactor;
-        rp[80] = 2*tanH; rp[81] = 2*tanV; rp[82] = -tanH; rp[83] = -tanV; // frustum
-        rp[84] = 2*tanH; rp[85] = 2*tanV; rp[86] = -tanH; rp[87] = -tanV; // frustum_prev (same for now)
-
-        // world_to_view_prev (offset 128 = float[32]): column-major
-        // viewPrev = [prevRight | prevUp | -prevFwd | prevPos] inverse
-        {
-          const pr = prevCam.right, pu = prevCam.up, pf = prevCam.fwd, pp = prevCam.pos;
-          const wtvp = rp.subarray(32, 48);
-          wtvp[0]=pr[0]; wtvp[1]=pu[0]; wtvp[2]=-pf[0]; wtvp[3]=0;
-          wtvp[4]=pr[1]; wtvp[5]=pu[1]; wtvp[6]=-pf[1]; wtvp[7]=0;
-          wtvp[8]=pr[2]; wtvp[9]=pu[2]; wtvp[10]=-pf[2]; wtvp[11]=0;
-          wtvp[12]=-(pr[0]*pp[0]+pr[1]*pp[1]+pr[2]*pp[2]);
-          wtvp[13]=-(pu[0]*pp[0]+pu[1]*pp[1]+pu[2]*pp[2]);
-          wtvp[14]=(pf[0]*pp[0]+pf[1]*pp[1]+pf[2]*pp[2]);
-          wtvp[15]=1;
+        // Helper: build view matrix (world→view, column-major) from camera vectors
+        function buildViewMatrix(r, u, f, p, out, off) {
+          out[off]=r[0];out[off+1]=u[0];out[off+2]=-f[0];out[off+3]=0;
+          out[off+4]=r[1];out[off+5]=u[1];out[off+6]=-f[1];out[off+7]=0;
+          out[off+8]=r[2];out[off+9]=u[2];out[off+10]=-f[2];out[off+11]=0;
+          out[off+12]=-(r[0]*p[0]+r[1]*p[1]+r[2]*p[2]);
+          out[off+13]=-(u[0]*p[0]+u[1]*p[1]+u[2]*p[2]);
+          out[off+14]=(f[0]*p[0]+f[1]*p[1]+f[2]*p[2]);
+          out[off+15]=1;
+        }
+        // Helper: build view_to_world (view→world, column-major)
+        function buildViewToWorld(r, u, f, p, out, off) {
+          out[off]=r[0];out[off+1]=r[1];out[off+2]=r[2];out[off+3]=0;
+          out[off+4]=u[0];out[off+5]=u[1];out[off+6]=u[2];out[off+7]=0;
+          out[off+8]=-f[0];out[off+9]=-f[1];out[off+10]=-f[2];out[off+11]=0;
+          out[off+12]=p[0];out[off+13]=p[1];out[off+14]=p[2];out[off+15]=1;
+        }
+        // Helper: proj * view → clip matrix
+        function mulProjView(proj, view, off, out, outOff) {
+          for (let c=0;c<4;c++) for (let r=0;r<4;r++)
+            out[outOff+c*4+r]=proj[r]*view[off+c*4]+proj[4+r]*view[off+c*4+1]+proj[8+r]*view[off+c*4+2]+proj[12+r]*view[off+c*4+3];
         }
 
-        // world_to_clip_prev (offset 192 = float[48]): proj * viewPrev
-        // Perspective proj: similar to our buildViewProj
-        {
-          const near = 0.1, far = 1000.0;
-          const proj = new Float32Array(16);
-          proj[0] = 1.0 / (aspect * fovFactor); proj[5] = -1.0 / fovFactor;
-          proj[10] = -far / (far - near); proj[11] = -1;
-          proj[14] = -(far * near) / (far - near);
-          // Multiply proj * viewPrev
-          const vp = rp.subarray(32, 48); // world_to_view_prev
-          const wcp = rp.subarray(48, 64); // world_to_clip_prev
-          for (let c = 0; c < 4; c++)
-            for (let r = 0; r < 4; r++)
-              wcp[c*4+r] = proj[r]*vp[c*4] + proj[4+r]*vp[c*4+1] + proj[8+r]*vp[c*4+2] + proj[12+r]*vp[c*4+3];
-        }
+        // Projection matrix (shared for current+prev, perspective)
+        const proj = new Float32Array(16);
+        proj[0]=1/(aspect*fovFactor); proj[5]=-1/fovFactor;
+        proj[10]=-far/(far-near); proj[11]=-1; proj[14]=-(far*near)/(far-near);
 
-        // camera_delta (offset 352 = float[88])
-        rp[88] = camera.pos[0]-prevCam.pos[0]; rp[89] = camera.pos[1]-prevCam.pos[1];
-        rp[90] = camera.pos[2]-prevCam.pos[2]; rp[91] = 0;
+        // [0] world_to_clip (float[0-15]): proj * current view
+        buildViewMatrix(right, up, forward, camera.pos, rp, 0); // temp: view in [0]
+        const curView = rp.slice(0, 16);
+        mulProjView(proj, curView, 0, rp, 0); // overwrite [0] with clip
 
-        // hit_dist_params (offset 368 = float[92]): (A=3, B=0.1, C=1, 0)
-        rp[92] = 3.0; rp[93] = 0.1; rp[94] = 1.0; rp[95] = 0;
+        // [16] view_to_world (float[16-31])
+        buildViewToWorld(right, up, forward, camera.pos, rp, 16);
 
-        // Rotators (offset 384,400,416 = float[96,100,104])
-        const angle = (frameIndex % 256) * (6.2832 / 256.0);
-        const rc = Math.cos(angle), rs = Math.sin(angle);
-        rp[96] = rc; rp[97] = rs; rp[98] = -rs; rp[99] = rc;
-        rp[100] = rc; rp[101] = rs; rp[102] = -rs; rp[103] = rc;
-        rp[104] = rc; rp[105] = rs; rp[106] = -rs; rp[107] = rc;
+        // [32] world_to_view_prev (float[32-47])
+        buildViewMatrix(pr, pu, pf, pp, rp, 32);
 
-        // rect_size (offset 432 = float[108])
-        rp[108] = width; rp[109] = height;
-        rp[110] = 1.0/width; rp[111] = 1.0/height;
-        rp[112] = width; rp[113] = height;
-        rp[114] = 1.0/width; rp[115] = 1.0/height;
-        // jitter (offset 464 = float[116])
-        rp[116] = 0; rp[117] = 0;
+        // [48] world_to_clip_prev (float[48-63]): proj * prev view
+        mulProjView(proj, rp, 32, rp, 48);
 
-        // Scalars (offset 472 = float[118], but we need padding for align)
-        // After vec2f jitter (8 bytes), next f32 starts at offset 472
-        // But the struct has f32 fields starting at disocclusion_threshold
-        // With WGSL alignment: after vec2f, f32 aligns to 4 → offset 472
-        let si = 118; // float index for offset 472
-        rp[si++] = 0.015;  // disocclusion_threshold
-        rp[si++] = 2.0;    // plane_dist_sensitivity
-        rp[si++] = 0.5;    // min_blur_radius
-        rp[si++] = 20.0;   // max_blur_radius
-        rp[si++] = 30.0;   // diff_prepass_blur_radius
-        rp[si++] = 30.0;   // spec_prepass_blur_radius
-        rp[si++] = 63.0;   // max_accumulated_frame_num
-        rp[si++] = 8.0;    // max_fast_accumulated_frame_num
-        rp[si++] = 0.5;    // lobe_angle_fraction
-        rp[si++] = 0.5;    // roughness_fraction
-        rp[si++] = 7.0;    // history_fix_frame_num
-        rp[si++] = 14.0;   // history_fix_stride
-        rp[si++] = 1.0;    // stabilization_strength
-        rp[si++] = 1.0;    // anti_firefly
-        rp[si++] = 1.0;    // antilag_power
-        rp[si++] = 1.0;    // antilag_threshold
-        rp[si++] = 1.0;    // framerate_scale
-        rp[si++] = 10000.0;// denoising_range
-        rp[si++] = Math.min(width,height) * fovFactor / width; // min_rect_dim_mul_unproject
-        rp[si++] = fovFactor; // unproject
-        rp[si++] = 0.0;    // ortho_mode
-        new Uint32Array(rp.buffer)[si] = frameIndex; si++; // frame_index (u32)
-        rp[si++] = 1.0;    // view_z_scale
-        rp[si++] = 0.2;    // min_hit_dist_weight
-        rp[si++] = 1.0;    // firefly_suppressor_min_relative_scale
-        rp[si++] = 1.0;    // fast_history_clamping_sigma_scale
+        // [64] world_prev_to_world (float[64-79]): identity (static scene)
+        rp[64]=1;rp[69]=1;rp[74]=1;rp[79]=1;
+
+        // [80] frustum (float[80-83])
+        rp[80]=2*tanH; rp[81]=2*tanV; rp[82]=-tanH; rp[83]=-tanV;
+        // [84] frustum_prev (float[84-87])
+        rp[84]=2*tanH; rp[85]=2*tanV; rp[86]=-tanH; rp[87]=-tanV;
+        // [88] camera_delta (float[88-91])
+        rp[88]=camera.pos[0]-pp[0]; rp[89]=camera.pos[1]-pp[1]; rp[90]=camera.pos[2]-pp[2]; rp[91]=0;
+        // [92] hit_dist_params (float[92-95]): (A=3, B=0.1, C=1, 0)
+        rp[92]=3.0; rp[93]=0.1; rp[94]=1.0; rp[95]=0;
+
+        // [96] rotators (float[96-107]): per-frame rotation (cos,sin,-sin,cos)
+        const ang = (frameIndex % 256) * (6.2832 / 256);
+        const rc = Math.cos(ang), rs = Math.sin(ang);
+        rp[96]=rc;rp[97]=rs;rp[98]=-rs;rp[99]=rc;   // rotator_pre
+        rp[100]=rc;rp[101]=rs;rp[102]=-rs;rp[103]=rc; // rotator_blur
+        rp[104]=rc;rp[105]=rs;rp[106]=-rs;rp[107]=rc; // rotator_post
+
+        // [108] rect_size, rect_size_inv, rect_size_prev, resource_size_inv_prev, jitter
+        rp[108]=width; rp[109]=height;                    // rect_size
+        rp[110]=1/width; rp[111]=1/height;                // rect_size_inv
+        rp[112]=width; rp[113]=height;                    // rect_size_prev
+        rp[114]=1/width; rp[115]=1/height;                // resource_size_inv_prev
+        rp[116]=0; rp[117]=0;                              // jitter
+
+        // [118-143] scalar params (f32 each, u32 for frame_index at [139])
+        rp[118]=0.015;   // disocclusion_threshold
+        rp[119]=2.0;     // plane_dist_sensitivity
+        rp[120]=0.5;     // min_blur_radius
+        rp[121]=20.0;    // max_blur_radius
+        rp[122]=30.0;    // diff_prepass_blur_radius
+        rp[123]=30.0;    // spec_prepass_blur_radius
+        rp[124]=63.0;    // max_accumulated_frame_num
+        rp[125]=8.0;     // max_fast_accumulated_frame_num
+        rp[126]=0.5;     // lobe_angle_fraction
+        rp[127]=0.5;     // roughness_fraction
+        rp[128]=7.0;     // history_fix_frame_num
+        rp[129]=14.0;    // history_fix_stride
+        rp[130]=1.0;     // stabilization_strength
+        rp[131]=1.0;     // anti_firefly
+        rp[132]=1.0;     // antilag_power
+        rp[133]=1.0;     // antilag_threshold
+        rp[134]=1.0;     // framerate_scale
+        rp[135]=10000.0; // denoising_range
+        rp[136]=Math.min(width,height)*fovFactor/width; // min_rect_dim_mul_unproject
+        rp[137]=fovFactor; // unproject
+        rp[138]=0.0;     // ortho_mode
+        rpu[139]=frameIndex; // frame_index (u32)
+        rp[140]=1.0;     // view_z_scale
+        rp[141]=0.2;     // min_hit_dist_weight
+        rp[142]=1.0;     // firefly_suppressor_min_relative_scale
+        rp[143]=1.0;     // fast_history_clamping_sigma_scale
+
         device.queue.writeBuffer(reblurParamBuf, 0, rp);
 
         // === ReBLUR hybrid pipeline (complete, no shortcuts) ===
