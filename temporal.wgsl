@@ -96,6 +96,18 @@ fn project_to_uv(world_pos: vec3f, right: vec3f, up: vec3f, fwd: vec3f, pos: vec
   return vec3f(ndcx * 0.5 + 0.5, ndcy * 0.5 + 0.5, z);
 }
 
+// RGB ↔ YCoCg (lossless, tighter AABB bounds than RGB)
+fn rgb_to_ycocg(c: vec3f) -> vec3f {
+  return vec3f(
+    0.25 * c.r + 0.5 * c.g + 0.25 * c.b,
+    0.5 * c.r - 0.5 * c.b,
+    -0.25 * c.r + 0.5 * c.g - 0.25 * c.b
+  );
+}
+fn ycocg_to_rgb(c: vec3f) -> vec3f {
+  return vec3f(c.x + c.y - c.z, c.x + c.z, c.x - c.y - c.z);
+}
+
 // AABB clip (Salvi) — clip history color to neighborhood AABB
 fn clip_aabb(mn: vec3f, mx: vec3f, history: vec3f) -> vec3f {
   let center = 0.5 * (mn + mx);
@@ -112,7 +124,7 @@ fn accumulate_signal(
   current: vec3f, history: vec3f, motion: f32, base_alpha: f32,
   px: vec2i, sz: vec2i, src: texture_2d<f32>
 ) -> vec3f {
-  // Neighborhood statistics for AABB clamping
+  // Neighborhood statistics for AABB clamping (RGB space — wider bounds preserve energy)
   var mn = current;
   var mx = current;
   var m1 = vec3f(0.0);
@@ -139,9 +151,9 @@ fn accumulate_signal(
 
   let clipped = clip_aabb(mn, mx, history);
 
-  // Alpha: very low when stable (max accumulation), higher when noisy/new
+  // Variance-dependent alpha: high variance → more current (faster update)
   let var_lum = dot(stddev, vec3f(0.2126, 0.7152, 0.0722));
-  let motion_alpha = mix(0.08, base_alpha, motion); // 0.08 for new, base_alpha for stable
+  let motion_alpha = mix(0.08, base_alpha, motion);
   let alpha = max(motion_alpha * 0.1, motion_alpha / (1.0 + var_lum * 10.0));
 
   return mix(clipped, current, alpha);
@@ -153,63 +165,111 @@ fn temporal(@builtin(global_invocation_id) gid: vec3u) {
   let sz = vec2i(params.resolution);
   if px.x >= sz.x || px.y >= sz.y { return; }
 
-  let diff_cur = textureLoad(current_hdr, px, 0).rgb;
-  let spec_cur_sample = textureLoad(current_spec, px, 0);
-  let spec_cur = spec_cur_sample.rgb;
-  let cur_hit_dist = spec_cur_sample.a; // hit distance from path tracer (via preblur)
-  let nd = textureLoad(depth_tex, px, 0);
-  let depth = nd.w;
+  let nd_center = textureLoad(depth_tex, px, 0);
+  let cn = nd_center.xyz;
+  let cz = nd_center.w;
+  let diff_raw = textureLoad(current_hdr, px, 0).rgb;
+  let spec_raw_s = textureLoad(current_spec, px, 0);
+  let spec_raw = spec_raw_s.rgb;
+  let cur_hit_dist = spec_raw_s.a;
 
-  // Sky (depth very large): no meaningful history
-  if depth > 1e5 {
+  // === Spatial pre-filter: 3x3 geometry-weighted average of noisy input ===
+  // Done HERE instead of a separate pass — no multi-pass bleeding.
+  // Only blends neighbors on the same surface (normal+depth test).
+  var d_sum = diff_raw;
+  var s_sum = spec_raw;
+  var w_sum = 1.0;
+  let gz = max(abs(cz) * 0.01, 0.1);
+  for (var dy = -1; dy <= 1; dy++) {
+    for (var dx = -1; dx <= 1; dx++) {
+      if dx == 0 && dy == 0 { continue; }
+      let np = clamp(px + vec2i(dx, dy), vec2i(0), sz - 1);
+      let nnd = textureLoad(depth_tex, np, 0);
+      let wn = pow(max(dot(cn, nnd.xyz), 0.0), 64.0);
+      let wz = exp(-abs(cz - nnd.w) / gz);
+      let w = wn * wz;
+      if w > 0.01 {
+        d_sum += textureLoad(current_hdr, np, 0).rgb * w;
+        s_sum += textureLoad(current_spec, np, 0).rgb * w;
+        w_sum += w;
+      }
+    }
+  }
+  let diff_cur = d_sum / w_sum;
+  let spec_cur = s_sum / w_sum;
+
+  // === Temporal accumulation with reprojection ===
+  var diff_blend = diff_cur;
+  var spec_blend = spec_cur;
+  var history_len = 0.0;
+
+  // Sky: no history
+  if cz > 1e5 {
     textureStore(accum_out, px, vec4f(diff_cur, 0.0));
     textureStore(history_out, px, vec4f(diff_cur, 0.0));
-    textureStore(spec_accum_out, px, vec4f(spec_cur, 1.0));  // hit_dist=1.0 (far/sky)
+    textureStore(spec_accum_out, px, vec4f(spec_cur, 1.0));
     textureStore(spec_history_out, px, vec4f(spec_cur, 0.0));
     return;
   }
 
-  // Reconstruct world position from current pixel + depth
+  // Reconstruct world position and reproject to previous frame
+  // depth_tex.w = ray hit distance (not camera-space Z)
   let world_pos = reconstruct_world(
-    vec2f(f32(px.x), f32(px.y)), depth,
+    vec2f(f32(px.x), f32(px.y)), nd_center.w,
     params.cam_right.xyz, params.cam_up.xyz, params.cam_fwd.xyz, params.cam_pos.xyz,
     params.fov_factor, params.aspect, params.resolution
   );
-
-  // Camera-space Z for current pixel (stored in specular alpha for next frame)
   let cam_z = dot(world_pos - params.cam_pos.xyz, params.cam_fwd.xyz);
-
-  // Reproject to previous frame UV
   let prev_uv_z = project_to_uv(
     world_pos,
     params.prev_right.xyz, params.prev_up.xyz, params.prev_fwd.xyz, params.prev_pos.xyz,
     params.fov_factor, params.aspect
   );
 
-  var diff_blend = diff_cur;
-  var spec_blend = spec_cur;
-  var history_len = 0.0; // disoccluded / new pixel
-
-  // Valid reprojection? (UV in bounds)
+  // Sample history if reprojection is valid
   if prev_uv_z.x >= 0.0 && prev_uv_z.x <= 1.0 && prev_uv_z.y >= 0.0 && prev_uv_z.y <= 1.0 {
-    let diff_hist_sample = textureSampleLevel(prev_denoised, tex_sampler, prev_uv_z.xy, 0.0);
-    let spec_hist_sample = textureSampleLevel(prev_spec, tex_sampler, prev_uv_z.xy, 0.0);
-    let diff_hist = diff_hist_sample.rgb;
-    let spec_hist = spec_hist_sample.rgb;
-    let prev_history = diff_hist_sample.a;
-    let prev_z = spec_hist_sample.a;
-
+    let diff_hist_s = textureSampleLevel(prev_denoised, tex_sampler, prev_uv_z.xy, 0.0);
+    let spec_hist_s = textureSampleLevel(prev_spec, tex_sampler, prev_uv_z.xy, 0.0);
+    let prev_z = spec_hist_s.a;
     let z_threshold = max(abs(prev_z) * params.depth_reject_scale, 0.5);
     let depth_valid = abs(prev_uv_z.z - prev_z) < z_threshold;
 
     if depth_valid {
-      history_len = min(prev_history + 1.0, params.max_history);
-      let motion = clamp(history_len / 32.0, 0.0, 1.0);
+      // When camera moves, cap history to respond faster to illumination changes
+      // frames_still=0 → max_hist=8 (alpha~12%), still=32+ → max_hist=512 (alpha~0.2%)
+      let effective_max = mix(8.0, params.max_history, clamp(params.frames_still / 32.0, 0.0, 1.0));
+      history_len = min(diff_hist_s.a + 1.0, effective_max);
 
-      diff_blend = accumulate_signal(diff_cur, diff_hist, motion, params.alpha, px, sz, current_hdr);
-      spec_blend = accumulate_signal(spec_cur, spec_hist, motion, params.alpha, px, sz, current_spec);
+      // AABB ghosting rejection: only during motion (history < 32 frames)
+      // When still, skip AABB to preserve converged illumination
+      var diff_hist = diff_hist_s.rgb;
+      var spec_hist = spec_hist_s.rgb;
+      if history_len < 32.0 {
+        // Compute 3x3 AABB from current noisy input
+        var d_mn = diff_cur; var d_mx = diff_cur;
+        var s_mn = spec_cur; var s_mx = spec_cur;
+        for (var dy = -1; dy <= 1; dy++) {
+          for (var dx = -1; dx <= 1; dx++) {
+            let sp = clamp(px + vec2i(dx, dy), vec2i(0), sz - 1);
+            let sd = textureLoad(current_hdr, sp, 0).rgb;
+            let ss = textureLoad(current_spec, sp, 0).rgb;
+            d_mn = min(d_mn, sd); d_mx = max(d_mx, sd);
+            s_mn = min(s_mn, ss); s_mx = max(s_mx, ss);
+          }
+        }
+        // Expand AABB by 50% to tolerate noise while still rejecting ghosts
+        let d_expand = (d_mx - d_mn) * 0.5;
+        let s_expand = (s_mx - s_mn) * 0.5;
+        diff_hist = clip_aabb(d_mn - d_expand, d_mx + d_expand, diff_hist);
+        spec_hist = clip_aabb(s_mn - s_expand, s_mx + s_expand, spec_hist);
+      }
+
+      let alpha = max(1.0 / (history_len + 1.0), 0.02);
+      diff_blend = mix(diff_hist, diff_cur, alpha);
+      spec_blend = mix(spec_hist, spec_cur, alpha);
     }
   }
+
 
   textureStore(accum_out, px, vec4f(diff_blend, history_len));
   textureStore(history_out, px, vec4f(diff_blend, history_len));

@@ -148,6 +148,14 @@ fn ray_offset(P: vec3f, Ng: vec3f) -> vec3f {
 // MAX_BOUNCES now comes from uniforms.max_bounces
 
 const GI_INTENSITY: f32 = 1.5; // multiplier for indirect lighting (surface bounces + sky)
+const FILTER_GLOSSY: f32 = 1.0; // Cycles-style glossy blur: reduce noise in rough reflections after diffuse bounces
+const CLAMP_INDIRECT: f32 = 10.0; // Cycles-style sample clamp: prevent fireflies from extreme indirect samples
+
+// Cycles-style per-sample clamp: limit contribution magnitude to prevent fireflies
+fn clamp_contribution(L: vec3f, limit: f32) -> vec3f {
+  let s = abs(L.x) + abs(L.y) + abs(L.z);
+  return select(L, L * (limit / s), s > limit);
+}
 const MAX_FIREFLY_LUM: f32 = 32.0;
 const MAT_FLAG_THIN_TRANSMISSION: u32 = 1u;
 const MAT_FLAG_DOUBLE_SIDED: u32 = 2u;
@@ -603,6 +611,12 @@ fn approx_ggx_albedo(NdotX: f32, alpha: f32) -> f32 {
   return clamp(-1.04 * a004 + r.z, 0.0, 1.0);
 }
 
+// Cosine-weighted hemisphere average of GGX directional albedo E_avg(alpha).
+// Polynomial fit from numerical integration of the Lazarov/Filament E(mu,alpha).
+fn approx_ggx_avg_albedo(alpha: f32) -> f32 {
+  return clamp(1.0 + alpha * (-0.2 + alpha * (-0.12 + alpha * 0.05)), 0.0, 1.0);
+}
+
 fn ggx_d(NdotH: f32, alpha: f32) -> f32 {
   let a2 = alpha * alpha;
   let d = NdotH * NdotH * (a2 - 1.0) + 1.0;
@@ -763,13 +777,16 @@ fn eval_surface_split(surface: SurfaceEval, V: vec3f, L: vec3f) -> BRDFSplit {
     Vterm = ggx_v_anisotropic(NdotL, NdotV, BdotV, TdotV, TdotL, BdotL, at, ab);
   }
 
-  // Kulla-Conty multi-scatter energy compensation (ported from ignis-rt)
-  // Single-scatter GGX loses energy on rough surfaces; this recovers it.
+  // Multi-scatter GGX energy conservation (Kulla-Conty + Cycles Fms darkening)
   let Eo = approx_ggx_albedo(NdotV, alpha);
   let Ei = approx_ggx_albedo(NdotL, alpha);
-  let ms_scale = 1.0 + (1.0 - Eo) * (1.0 - Ei) / max(Eo + Ei - Eo * Ei, 0.01);
+  let E_avg_eval = approx_ggx_avg_albedo(alpha);
+  let white_ms = 1.0 + (1.0 - Eo) * (1.0 - Ei) / max(Eo + Ei - Eo * Ei, 0.01);
+  // Colored Fresnel multi-bounce darkening (Kulla & Conty 2017 / Cycles)
+  let Fms_eval = F0 * E_avg_eval / max(vec3f(1.0) - F0 * (1.0 - E_avg_eval), vec3f(0.001));
+  let ms_factor = vec3f(1.0) + Fms_eval * (white_ms - 1.0);
 
-  let specular = F * D * Vterm * NdotL * ms_scale;
+  let specular = F * D * Vterm * NdotL * ms_factor;
   // Energy-conserving kd using directional albedo (ported from ignis-rt)
   let avg_f0 = (F0.x + F0.y + F0.z) / 3.0;
   let spec_albedo = Eo * avg_f0;
@@ -936,14 +953,9 @@ fn sample_sun_nee_split(pos: vec3f, normal: vec3f, geo_normal: vec3f, V: vec3f, 
       }
 
       if dot(normal, L) > 0.0 {
-        // Sun samples use shadow map (fast), env samples use BVH shadow ray
-        // Shadow terminator fix: extra offset when shading/geo normals diverge
+        // BVH shadow ray for both sun and env (shadow map depth comparison unreliable)
         let st_origin = shadow_terminator_offset(origin, normal, geo_normal, L);
-        let not_occluded = select(
-          !trace_shadow(st_origin, L, 200.0),  // env: BVH shadow ray
-          sample_shadow_map(pos) > 0.0,         // sun: shadow map lookup
-          chose_sun
-        );
+        let not_occluded = !trace_shadow(st_origin, L, 200.0);
         if not_occluded {
           let radiance = sky_color(L);
 
@@ -1199,7 +1211,7 @@ fn trace_bvh_hint(origin: vec3f, dir: vec3f, t_hint: f32) -> HitInfo {
 // Shadow with material skip (for emissive NEE — skip the emissive's own geometry)
 fn trace_shadow_skip_mat(origin: vec3f, dir: vec3f, max_t: f32, skip_mat: u32) -> bool {
   let inv_dir = 1.0 / dir;
-  var stk: array<u32, 6>; var sp = 0u; var cur = 0u;
+  var stk: array<u32, 16>; var sp = 0u; var cur = 0u;
   let root = bvh_nodes[0u];
   if intersect_aabb(origin, inv_dir, root.aabb_min, root.aabb_max, max_t) >= max_t { return false; }
   loop {
@@ -1211,9 +1223,6 @@ fn trace_shadow_skip_mat(origin: vec3f, dir: vec3f, max_t: f32, skip_mat: u32) -
         let r = intersect_tri(origin, dir, vertices[td.x].xyz, vertices[td.y].xyz, vertices[td.z].xyz, max_t);
         if r.x < max_t {
           let mat = material_buf[td.w];
-          let geo_normal = triangle_geo_normal(td);
-          let front_face = dot(dir, geo_normal) < 0.0;
-          if !material_is_double_sided(mat) && !front_face { continue; }
           let bw = 1.0 - r.y - r.z;
           let uv0 = get_uv0(td, bw, r.y, r.z);
           let uv1 = get_uv1(td, bw, r.y, r.z);
@@ -1233,20 +1242,20 @@ fn trace_shadow_skip_mat(origin: vec3f, dir: vec3f, max_t: f32, skip_mat: u32) -
     let tl=intersect_aabb(origin,inv_dir,bvh_nodes[l].aabb_min,bvh_nodes[l].aabb_max,max_t);
     let tr=intersect_aabb(origin,inv_dir,bvh_nodes[r].aabb_min,bvh_nodes[r].aabb_max,max_t);
     if tl<tr {
-      if tr<max_t && sp<6u { stk[sp]=r; sp++; }
+      if tr<max_t && sp<16u { stk[sp]=r; sp++; }
       if tl<max_t { cur=l; } else { if sp==0u{break;} sp--; cur=stk[sp]; }
     } else {
-      if tl<max_t && sp<6u { stk[sp]=l; sp++; }
+      if tl<max_t && sp<16u { stk[sp]=l; sp++; }
       if tr<max_t { cur=r; } else { if sp==0u{break;} sp--; cur=stk[sp]; }
     }
   }
   return false;
 }
 
-// Shadow (any hit, stack of 6)
+// Shadow (any hit)
 fn trace_shadow(origin: vec3f, dir: vec3f, max_t: f32) -> bool {
   let inv_dir = 1.0 / dir;
-  var stk: array<u32, 6>; var sp = 0u; var cur = 0u;
+  var stk: array<u32, 16>; var sp = 0u; var cur = 0u;
   let root = bvh_nodes[0u];
   if intersect_aabb(origin, inv_dir, root.aabb_min, root.aabb_max, max_t) >= max_t { return false; }
   loop {
@@ -1256,11 +1265,9 @@ fn trace_shadow(origin: vec3f, dir: vec3f, max_t: f32) -> bool {
         let ti = nd.left_first+i; let td = tri_data[ti];
         let r = intersect_tri(origin, dir, vertices[td.x].xyz, vertices[td.y].xyz, vertices[td.z].xyz, max_t);
         if r.x < max_t {
-          // Inline alpha test — transparent surfaces don't block light
+          // Shadow rays: blocked by ANY opaque surface regardless of face orientation
+          // (backface culling only applies to camera rays, not shadow rays — Cycles convention)
           let mat = material_buf[td.w];
-          let geo_normal = triangle_geo_normal(td);
-          let front_face = dot(dir, geo_normal) < 0.0;
-          if !material_is_double_sided(mat) && !front_face { continue; }
           let bw = 1.0 - r.y - r.z;
           let uv0 = get_uv0(td, bw, r.y, r.z);
           let uv1 = get_uv1(td, bw, r.y, r.z);
@@ -1280,10 +1287,10 @@ fn trace_shadow(origin: vec3f, dir: vec3f, max_t: f32) -> bool {
     let tl=intersect_aabb(origin,inv_dir,bvh_nodes[l].aabb_min,bvh_nodes[l].aabb_max,max_t);
     let tr=intersect_aabb(origin,inv_dir,bvh_nodes[r].aabb_min,bvh_nodes[r].aabb_max,max_t);
     if tl<tr {
-      if tr<max_t && sp<6u { stk[sp]=r; sp++; }
+      if tr<max_t && sp<16u { stk[sp]=r; sp++; }
       if tl<max_t { cur=l; } else { if sp==0u{break;} sp--; cur=stk[sp]; }
     } else {
-      if tl<max_t && sp<6u { stk[sp]=l; sp++; }
+      if tl<max_t && sp<16u { stk[sp]=l; sp++; }
       if tr<max_t { cur=r; } else { if sp==0u{break;} sp--; cur=stk[sp]; }
     }
   }
@@ -1876,6 +1883,7 @@ fn path_trace(primary_origin: vec3f, primary_dir: vec3f) -> PathResult {
   var medium_att_color: array<vec3f, MAX_VOLUME_STACK>;
   var medium_depth = 0u;
   var last_bsdf_pdf = 0.0; // tracked for env MIS on miss
+  var min_ray_pdf = 1e6;   // Cycles filter glossy: minimum PDF along path
 
   var bounce = 0u;
   loop {
@@ -1890,6 +1898,7 @@ fn path_trace(primary_origin: vec3f, primary_dir: vec3f) -> PathResult {
         let mis_w = power_heuristic(last_bsdf_pdf, env_pdf);
         sky *= mis_w;
       }
+      if bounce > 0u { sky = clamp_contribution(sky, CLAMP_INDIRECT); }
       if bounce == 0u || !is_diffuse_path { spec_rad += sky; }
       else { diff_rad += sky; }
       break;
@@ -1923,7 +1932,14 @@ fn path_trace(primary_origin: vec3f, primary_dir: vec3f) -> PathResult {
     let alpha_mode = mat_alpha_mode(mat);
     let mr = sample_metallic_roughness(mat, uv0, uv1, uv2, uv3);
     let metallic = mr.x;
-    let roughness = max(mr.y, 0.04);
+    var roughness = max(mr.y, 0.04);
+    // Cycles filter glossy: blur rough reflections after low-probability bounces
+    if bounce > 0u && min_ray_pdf < 1e5 {
+      let blur_pdf = min(FILTER_GLOSSY * min_ray_pdf, 1.0);
+      if blur_pdf < 1.0 {
+        roughness = max(roughness, sqrt(1.0 - blur_pdf) * 0.5);
+      }
+    }
     let emissive = sample_emissive(mat, uv0, uv1, uv2, uv3);
     let specular_params = sample_specular_params(mat, uv0, uv1, uv2, uv3);
     let clearcoat_params = sample_clearcoat_params(mat, uv0, uv1, uv2, uv3);
@@ -2102,7 +2118,8 @@ fn path_trace(primary_origin: vec3f, primary_dir: vec3f) -> PathResult {
     // Emission
     if dot(emissive, vec3f(1.0)) > 1e-6 {
       if specular_bounce {
-        let e = throughput * emissive;
+        var e = throughput * emissive;
+        if bounce > 0u { e = clamp_contribution(e, CLAMP_INDIRECT); }
         if bounce == 0u { spec_rad += e; }
         else if is_diffuse_path { diff_rad += e; }
         else { spec_rad += e; }
@@ -2120,8 +2137,10 @@ fn path_trace(primary_origin: vec3f, primary_dir: vec3f) -> PathResult {
     } else {
       let direct = sample_sun_nee(hit_pos, normal, geo_normal, V, td, mat, uv0, uv1, uv2, uv3, base_color, roughness, metallic, glass_transmission);
       let gi_scale = select(1.0, GI_INTENSITY, bounce > 0u); // boost indirect bounces
-      if is_diffuse_path { diff_rad += throughput * direct * gi_scale; }
-      else { spec_rad += throughput * direct * gi_scale; }
+      var nee_contrib = throughput * direct * gi_scale;
+      if bounce > 0u { nee_contrib = clamp_contribution(nee_contrib, CLAMP_INDIRECT); }
+      if is_diffuse_path { diff_rad += nee_contrib; }
+      else { spec_rad += nee_contrib; }
       if bounce == 0u { result.direct = direct; }
       // SHaRC backpropagation with direction (for path guiding)
       if bounce > 0u && sharc_count < 4u {
@@ -2133,29 +2152,34 @@ fn path_trace(primary_origin: vec3f, primary_dir: vec3f) -> PathResult {
       }
     }
 
-    // Bounce 2+: try SHaRC cache for late indirect GI.
-    // The cache currently stores direct illumination at cached bounce points,
-    // so using it at the first indirect hit truncates higher-order transport too early.
+    // Bounce 2+: NEE for late indirect GI
+    // SHaRC cache disabled — stale cached values caused persistent illumination errors
+    // (cache accumulates to 65535 samples and freezes, can't self-correct)
     if bounce >= 2u && !is_glass {
-      let cached_gi = sharc_read_cached(hit_pos, normal);
-      let has_cache = dot(cached_gi, vec3f(1.0)) > 0.001;
-      if has_cache {
-        let gi = throughput * cached_gi * GI_INTENSITY;
-        if is_diffuse_path { diff_rad += gi; } else { spec_rad += gi; }
-        break;
-      }
       let indirect_direct = sample_sun_nee(hit_pos, normal, geo_normal, V, td, mat, uv0, uv1, uv2, uv3, base_color, roughness, metallic, glass_transmission);
-      let ind = throughput * indirect_direct * GI_INTENSITY;
+      let ind = clamp_contribution(throughput * indirect_direct * GI_INTENSITY, CLAMP_INDIRECT);
       if is_diffuse_path { diff_rad += ind; } else { spec_rad += ind; }
 
-      // Last bounce: energy terminates. No fake sky — SHaRC + extra bounces provide real GI.
       if bounce >= uniforms.max_bounces - 1u { break; }
     }
 
-    // BRDF sampling — at bounce 0, classify path and demodulate diffuse throughput
-    let clearcoat_prob = clamp(clearcoat_params.x * 0.25, 0.0, 0.5);
-    let base_specular_prob = clamp(mix(specular_params.a, 1.0, metallic), 0.05, 0.95);
-    if clearcoat_prob > 0.001 && rand() < clearcoat_prob {
+    // BRDF sampling — Cycles-style stochastic closure selection
+    // Compute specular probability from Fresnel directional albedo (matches Cycles sample_weight)
+    let alpha_prob = max(roughness * roughness, 0.001);
+    let NdotV_prob = max(dot(normal, V), 0.001);
+    let F0_prob = mix(dielectric_f0, base_color, metallic);
+    let F0_avg_prob = (F0_prob.x + F0_prob.y + F0_prob.z) / 3.0;
+    let spec_w = approx_ggx_albedo(NdotV_prob, alpha_prob) * max(F0_avg_prob, 0.04);
+    let diff_w = max((1.0 - spec_w) * (1.0 - metallic) * (1.0 - glass_transmission), 0.001);
+    let cc_w = max(clearcoat_params.x * 0.25, 0.0);
+    let total_w = spec_w + diff_w + cc_w;
+    let p_cc = cc_w / total_w;
+    let p_spec = spec_w / total_w;
+    // p_diff = 1.0 - p_cc - p_spec (implicit)
+
+    let closure_rand = rand();
+    if p_cc > 0.001 && closure_rand < p_cc {
+      // Clearcoat closure
       let clearcoat_normal = apply_detail_normal(
         mat_clearcoat_normal_tex(mat),
         mat_clearcoat_normal_texcoord(mat),
@@ -2169,12 +2193,12 @@ fn path_trace(primary_origin: vec3f, primary_dir: vec3f) -> PathResult {
       let VdotHc = max(dot(V, Hc), 0.0);
       let Fc = fresnel_schlick_vec(vec3f(0.04), vec3f(1.0), VdotHc);
       let G1c = smith_g1(max(dot(clearcoat_normal, dir), 0.0), alpha_c);
-      throughput *= Fc * G1c / max(clearcoat_prob, 0.01);
+      throughput *= Fc * G1c / max(p_cc, 0.01);
       specular_bounce = true;
       if bounce == 0u { is_diffuse_path = false; }
       last_bsdf_pdf = 0.0; // clearcoat: skip env MIS (narrow lobe)
-    } else if metallic > 0.5 || base_specular_prob > 0.35 || roughness < 0.18 {
-      // Metal / specular-dominant: GGX VNDF sampling → specular path
+    } else if closure_rand < p_cc + p_spec {
+      // Specular closure (GGX VNDF sampling)
       let alpha = max(roughness * roughness, 0.001);
       let H = sample_ggx_vndf(rand2(), V, normal, alpha);
       dir = reflect(-V, H);
@@ -2184,44 +2208,40 @@ fn path_trace(primary_origin: vec3f, primary_dir: vec3f) -> PathResult {
       let F90 = mix(vec3f(specular_params.a), vec3f(1.0), metallic);
       let F = fresnel_schlick_vec(F0, F90, VdotH);
       let G1_L = smith_g1(max(dot(normal, dir), 0.0), alpha);
-      throughput *= F * G1_L;
+      // Multi-scatter GGX energy compensation (Cycles-style)
+      let NdotV_ms = max(dot(normal, V), 0.001);
+      let Eo_s = approx_ggx_albedo(NdotV_ms, alpha);
+      let E_avg_s = approx_ggx_avg_albedo(alpha);
+      let missing_s = (1.0 - Eo_s) / max(Eo_s, 0.01);
+      let Fms_s = F0 * E_avg_s / max(vec3f(1.0) - F0 * (1.0 - E_avg_s), vec3f(0.001));
+      throughput *= F * G1_L * (vec3f(1.0) + Fms_s * missing_s) / max(p_spec, 0.01);
       specular_bounce = roughness < 0.1;
       if bounce == 0u { is_diffuse_path = false; }
       // GGX VNDF PDF ≈ D(H)*G1(V)/(4*NdotV) — for MIS vs env
       let NdotH = max(dot(normal, H), 0.0);
       let D_val = ggx_d(NdotH, alpha);
       let G1_V = smith_g1(max(dot(normal, V), 0.001), alpha);
-      last_bsdf_pdf = D_val * G1_V / max(4.0 * max(dot(normal, V), 0.001), 1e-6);
+      last_bsdf_pdf = p_spec * D_val * G1_V / max(4.0 * max(dot(normal, V), 0.001), 1e-6);
     } else {
-      // Dielectric: guided cosine hemisphere → diffuse path
-      // Path guiding: read dominant light direction from SHaRC cache
-      let guide = sharc_read_guide(hit_pos, normal);
-      var bent = normal;
-      if guide.w > 0.1 && dot(guide.xyz, normal) > 0.1 {
-        // Bend normal toward guide direction (L1 SH path guiding)
-        // Strength proportional to concentration: 0 = pure cosine, 0.5 = max bend
-        bent = normalize(mix(normal, guide.xyz, guide.w * 0.5));
-        if dot(bent, normal) < 0.2 { bent = normal; } // safety: don't bend too far
-      }
-      dir = cosine_sample_hemisphere(bent);
+      // Diffuse closure: cosine hemisphere sampling (pure, no SHaRC guiding)
+      let p_diff = max(1.0 - p_cc - p_spec, 0.01);
+      dir = cosine_sample_hemisphere(normal);
       if dot(normal, dir) <= 0.0 { break; }
-      // PDF correction for bent normal: compensate bias for unbiased result
-      // cosine hemisphere PDF relative to bent: cos(dir,bent)/π
-      // actual BRDF uses cos(dir,normal)/π → correction = cos(dir,normal)/cos(dir,bent)
-      let pdf_correction = max(dot(dir, normal), 0.001) / max(dot(dir, bent), 0.001);
       let diffuse_scale = max((1.0 - metallic) * (1.0 - glass_transmission), 0.0);
       if bounce == 0u && !went_through_glass {
-        // True primary diffuse surface: store demodulated irradiance for the denoiser.
-        throughput *= vec3f(diffuse_scale * pdf_correction);
+        throughput *= vec3f(diffuse_scale / p_diff);
       } else {
-        throughput *= base_color * diffuse_scale * pdf_correction;
+        throughput *= base_color * diffuse_scale / p_diff;
       }
       if bounce == 0u { is_diffuse_path = true; }
       specular_bounce = false;
-      last_bsdf_pdf = max(dot(dir, normal), 0.0) * INV_PI; // cosine hemisphere PDF
+      last_bsdf_pdf = p_diff * max(dot(dir, normal), 0.0) * INV_PI; // cosine hemisphere PDF × selection prob
     }
 
     origin = ray_offset(hit_pos, normal);
+
+    // Track minimum BSDF PDF for filter glossy (Cycles)
+    if last_bsdf_pdf > 0.0 { min_ray_pdf = min(min_ray_pdf, last_bsdf_pdf); }
 
     // Perceptual √ Russian roulette (ignis-rt / NRD guideline)
     // sqrt prevents dim paths from surviving with huge weight → fewer fireflies
@@ -2320,8 +2340,7 @@ fn main(@builtin(global_invocation_id) gid: vec3u) {
   let res = vec2u(uniforms.resolution);
   if pixel.x >= res.x || pixel.y >= res.y { return; }
 
-  // All pixels traced every frame — temporal denoiser handles accumulation
-  // Checkerboard/adaptive disabled: causes visible jitter with temporal blend
+  // Adaptive sampling disabled: storage textures don't guarantee stale-pixel retention across frames
 
   let idx = pixel.y * res.x + pixel.x;
 
@@ -2357,7 +2376,18 @@ fn main(@builtin(global_invocation_id) gid: vec3u) {
   // Full quality path trace with all features:
   // - Normal maps, texture sampling, alpha testing, full BRDF
   // - G-buffer depth hint accelerates BVH traversal ~60-80% (prunes far nodes)
-  let jitter = rand2();
+  // Per-pixel Halton jitter: each pixel gets its own low-discrepancy sequence
+  // pixel_hash offsets the Halton index so neighbors sample different sub-pixel positions
+  // → no image shake (each pixel jitters independently), fine noise, good temporal convergence
+  let halton_hash = (pixel.x * 12979u + pixel.y * 48271u) & 0xFFu;
+  let hidx = ((uniforms.frame_seed + halton_hash) % 256u) + 1u;
+  var hx = 0.0; var hb2 = 0.5;
+  var hi2 = hidx;
+  for (var _h = 0u; _h < 10u; _h++) { if hi2 == 0u { break; } hx += hb2 * f32(hi2 % 2u); hi2 /= 2u; hb2 *= 0.5; }
+  var hy = 0.0; var hb3 = 1.0 / 3.0;
+  var hi3 = hidx;
+  for (var _h = 0u; _h < 10u; _h++) { if hi3 == 0u { break; } hy += hb3 * f32(hi3 % 3u); hi3 /= 3u; hb3 /= 3.0; }
+  let jitter = vec2f(hx, hy);
   let uv_px = (vec2f(f32(pixel.x), f32(pixel.y)) + jitter) / uniforms.resolution;
   let ndc = uv_px * 2.0 - 1.0;
   let aspect = uniforms.resolution.x / uniforms.resolution.y;

@@ -68,6 +68,8 @@ fn atrous(@builtin(global_invocation_id) gid: vec3u) {
   let sz = vec2i(params.resolution);
   if px.x >= sz.x || px.y >= sz.y { return; }
 
+  let step_i = i32(params.step_size);
+
   let cnd = textureLoad(gbuf_nd, px, 0);
   let cn = cnd.xyz;
   let cz = cnd.w;
@@ -131,11 +133,12 @@ fn atrous(@builtin(global_invocation_id) gid: vec3u) {
   s_m1 /= 9.0; s_m2 /= 9.0;
   let s_std = sqrt(max(s_m2 - s_m1 * s_m1, 0.0));
 
-  // σ_l = 4.0 per SVGF (Schied 2017, eq.5)
-  let diff_sigma_scale = 4.0;
-  // Specular: roughness modulates (ReLAX, NRD)
-  // Specular: much tighter sigma to prevent smearing bright reflections → pale wash
-  let spec_sigma_scale = mix(0.5, 1.5, roughness);
+  // Adaptive σ_l: aggressive when camera just stopped (instant cleanup),
+  // fades to minimal as temporal converges (prevents bleeding in steady state)
+  // frames_still=0: full=4.0, frames_still=32: 0.5 (almost no spatial blur)
+  let spatial_fade = 1.0 / (1.0 + params.frames_still * 0.2);
+  let diff_sigma_scale = mix(0.5, 4.0, spatial_fade);
+  let spec_sigma_scale = mix(0.1, 1.5, spatial_fade) * mix(0.5, 1.0, roughness);
 
   // === FILTER (both signals + variance filtering in one pass) ===
   // f16 weight sums: reduces register pressure, 2x faster weight multiply on NVIDIA
@@ -157,7 +160,7 @@ fn atrous(@builtin(global_invocation_id) gid: vec3u) {
       let dz = abs(cz - snd.w);
       let wz = f16(exp(-dz / (gz * f32(step) + 1e-3)));
 
-      // Diffuse luminance edge-stopping (hit distance modulated)
+      // Diffuse luminance edge-stopping
       let d_dl = abs(cl - luma(sd));
       let d_sigma = diff_sigma_scale * d_std * hit_factor + 0.01;
       let d_wl = f16(exp(-d_dl / max(d_sigma, 0.01)));
@@ -165,12 +168,12 @@ fn atrous(@builtin(global_invocation_id) gid: vec3u) {
       d_sum += sd * f32(d_w);
       d_wsum += d_w;
 
-      // Filter variance through à-trous kernel (SVGF §4.2)
+      // Variance propagation
       let geom_w = f16(KW[ki]) * wn * wz;
       d_var_filtered += s_diff.a * f32(geom_w);
       d_var_wsum += geom_w;
 
-      // Specular luminance edge-stopping (roughness + hit distance modulated)
+      // Specular luminance edge-stopping
       let s_dl = abs(csl - luma(ss));
       let s_sigma = spec_sigma_scale * s_std * hit_factor + 0.01;
       let s_wl = f16(exp(-s_dl / max(s_sigma, 0.01)));
@@ -222,26 +225,22 @@ fn atrous_sm(@builtin(global_invocation_id) gid: vec3u,
   let ly = i32(lid.y);
   let ci = u32((ly + HALO) * PADDED + (lx + HALO));
 
+  // Single-pass bilateral with geometry + luminance (step=1, ±2px max)
+  // Bleeding limited to 2px — imperceptible. Temporal 1/N handles convergence.
   let cnd = sm_nd[ci];
   let cn = cnd.xyz;
   let cz = cnd.w;
-  let diff_sample = sm_diff[ci];
-  let cc = diff_sample.rgb;
+  let cc = sm_diff[ci].rgb;
   let cl = luma(cc);
-  let spec_sample = sm_spec[ci];
-  let cs = spec_sample.rgb;
+  let cs = sm_spec[ci].rgb;
   let csl = luma(cs);
-  let hit_dist = spec_sample.a;
-  let roughness = textureLoad(albedo_tex, px, 0).a; // albedo: 1 read, not cached
-
-  let hit_factor = mix(0.5, 1.0, hit_dist);
 
   // Depth gradient from tile
   let zr_i = u32((ly + HALO) * PADDED + min(lx + HALO + 1, PADDED - 1));
   let zu_i = u32(min(ly + HALO + 1, PADDED - 1) * PADDED + (lx + HALO));
   let gz = max(max(abs(sm_nd[zr_i].w - cz), abs(sm_nd[zu_i].w - cz)), cz * 0.002);
 
-  // Variance: 3x3 from tile (step=1, always first pass)
+  // 3x3 variance for luminance sigma
   var d_m1 = 0.0; var d_m2 = 0.0;
   var s_m1 = 0.0; var s_m2 = 0.0;
   for (var vy = -1; vy <= 1; vy++) {
@@ -253,57 +252,45 @@ fn atrous_sm(@builtin(global_invocation_id) gid: vec3u,
       s_m1 += vsl; s_m2 += vsl * vsl;
     }
   }
-  d_m1 /= 9.0; d_m2 /= 9.0;
-  let d_var = max(d_m2 - d_m1 * d_m1, 0.0);
-  let d_std = sqrt(d_var);
-  s_m1 /= 9.0; s_m2 /= 9.0;
-  let s_std = sqrt(max(s_m2 - s_m1 * s_m1, 0.0));
+  let d_std = sqrt(max(d_m2 / 9.0 - (d_m1 / 9.0) * (d_m1 / 9.0), 0.0));
+  let s_std = sqrt(max(s_m2 / 9.0 - (s_m1 / 9.0) * (s_m1 / 9.0), 0.0));
 
-  let diff_sigma_scale = 4.0;
-  // Specular: much tighter sigma to prevent smearing bright reflections → pale wash
-  let spec_sigma_scale = mix(0.5, 1.5, roughness);
+  // Adaptive σ_l: same as atrous — aggressive early, fades with frames_still
+  let spatial_fade_sm = 1.0 / (1.0 + params.frames_still * 0.2);
+  let diff_sigma_sm = mix(0.5, 4.0, spatial_fade_sm);
+  let spec_sigma_sm = mix(0.1, 1.5, spatial_fade_sm) * mix(0.5, 1.0, textureLoad(albedo_tex, px, 0).a);
 
-  // Filter: 5x5 from tile (step=1, offsets are ±1 pixels)
-  var d_sum = vec3f(0.0); var d_wsum: f16 = 0.0h;
-  var s_sum = vec3f(0.0); var s_wsum: f16 = 0.0h;
-  var d_var_filtered = 0.0; var d_var_wsum: f16 = 0.0h;
+  // 5x5 bilateral: geometry + luminance
+  var d_sum = vec3f(0.0); var d_wsum = 0.0;
+  var s_sum = vec3f(0.0); var s_wsum = 0.0;
 
   for (var dy = -2; dy <= 2; dy++) {
     for (var dx = -2; dx <= 2; dx++) {
       let ki = u32((dy + 2) * 5 + (dx + 2));
       let si = u32((ly + HALO + dy) * PADDED + (lx + HALO + dx));
       let snd = sm_nd[si];
-      let s_diff = sm_diff[si];
-      let sd = s_diff.rgb;
+      let sd = sm_diff[si].rgb;
       let ss = sm_spec[si].rgb;
 
-      let wn = f16(pow(max(dot(cn, snd.xyz), 0.0), 64.0));
+      // Geometry weights
+      let wn = pow(max(dot(cn, snd.xyz), 0.0), 128.0);
       let dz = abs(cz - snd.w);
-      let wz = f16(exp(-dz / (gz + 1e-3)));
+      let wz = exp(-dz / (gz + 1e-3));
 
-      let d_dl = abs(cl - luma(sd));
-      let d_sigma = diff_sigma_scale * d_std * hit_factor + 0.01;
-      let d_wl = f16(exp(-d_dl / max(d_sigma, 0.01)));
-      let d_w = f16(KW[ki]) * wn * wz * d_wl;
-      d_sum += sd * f32(d_w);
-      d_wsum += d_w;
+      // Luminance weights (adaptive σ based on frames_still)
+      let d_wl = exp(-abs(cl - luma(sd)) / (diff_sigma_sm * d_std + 0.02));
+      let s_wl = exp(-abs(csl - luma(ss)) / (spec_sigma_sm * s_std + 0.02));
 
-      let geom_w = f16(KW[ki]) * wn * wz;
-      d_var_filtered += s_diff.a * f32(geom_w);
-      d_var_wsum += geom_w;
-
-      let s_dl = abs(csl - luma(ss));
-      let s_sigma = spec_sigma_scale * s_std * hit_factor + 0.01;
-      let s_wl = f16(exp(-s_dl / max(s_sigma, 0.01)));
-      let s_w = f16(KW[ki]) * wn * wz * s_wl;
-      s_sum += ss * f32(s_w);
-      s_wsum += s_w;
+      let geom = KW[ki] * wn * wz;
+      d_sum += sd * (geom * d_wl);
+      s_sum += ss * (geom * s_wl);
+      d_wsum += geom * d_wl;
+      s_wsum += geom * s_wl;
     }
   }
 
-  let out_var = d_var_filtered / max(f32(d_var_wsum), 1e-6);
-  textureStore(out_color, px, vec4f(d_sum / max(f32(d_wsum), 1e-6), out_var));
-  textureStore(out_spec, px, vec4f(s_sum / max(f32(s_wsum), 1e-6), sm_spec[ci].a));
+  textureStore(out_color, px, vec4f(d_sum / max(d_wsum, 1e-6), sm_diff[ci].a));
+  textureStore(out_spec, px, vec4f(s_sum / max(s_wsum, 1e-6), sm_spec[ci].a));
 }
 
 // === PRE-BLUR: anti-firefly percentile clamp + lightweight 3x3 bilateral ===
@@ -320,7 +307,8 @@ fn preblur(@builtin(global_invocation_id) gid: vec3u) {
   let cc_raw = textureLoad(in_color, px, 0).rgb;
   let cs_raw = textureLoad(in_spec, px, 0).rgb;
 
-  // === Anti-firefly: 3σ percentile clamp (HPG 2025, Lalber) ===
+  // === Anti-firefly: 3σ percentile clamp over 3×3 neighborhood ===
+  // Only clips extreme outliers; preserves legitimate bright samples (sun highlights, etc.)
   var d_m1 = 0.0; var d_m2 = 0.0;
   var s_m1 = 0.0; var s_m2 = 0.0;
   for (var fy = -1; fy <= 1; fy++) {
@@ -340,7 +328,7 @@ fn preblur(@builtin(global_invocation_id) gid: vec3u) {
   let s_std = sqrt(max(s_m2 / 9.0 - s_mean * s_mean, 0.0));
   let s_max_lum = s_mean + 1.5 * s_std + 0.05;
 
-  // Anti-firefly clamp ONLY — no bilateral blur
+  // Anti-firefly clamp (3σ — only clips extreme outliers)
   let cl_raw = luma(cc_raw);
   var cc = cc_raw;
   if cl_raw > d_max_lum && cl_raw > 0.01 { cc = cc_raw * (d_max_lum / cl_raw); }
@@ -390,7 +378,7 @@ fn preblur_sm(@builtin(global_invocation_id) gid: vec3u,
   let cc_raw = sm_diff[ci].rgb;
   let cs_raw = sm_spec[ci].rgb;
 
-  // Anti-firefly: 3σ percentile clamp from tile
+  // Anti-firefly: 3σ percentile clamp from 3×3 tile (preserves legitimate bright samples)
   var d_m1 = 0.0; var d_m2 = 0.0;
   var s_m1 = 0.0; var s_m2 = 0.0;
   for (var fy = -1; fy <= 1; fy++) {
@@ -409,8 +397,7 @@ fn preblur_sm(@builtin(global_invocation_id) gid: vec3u,
   let s_std = sqrt(max(s_m2 / 9.0 - s_mean * s_mean, 0.0));
   let s_max_lum = s_mean + 1.5 * s_std + 0.05;
 
-  // Anti-firefly clamp ONLY — no bilateral blur (à-trous handles spatial filtering)
-  // The bilateral was diluting irradiance in HDR linear space → pale sky-lit materials
+  // Anti-firefly clamp (3σ — only clips extreme outliers)
   let cl_raw = luma(cc_raw);
   var cc = cc_raw;
   if cl_raw > d_max_lum && cl_raw > 0.01 { cc = cc_raw * (d_max_lum / cl_raw); }

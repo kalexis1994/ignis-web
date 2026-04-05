@@ -1664,6 +1664,14 @@ async function init() {
     gctx.restore();
   }
 
+  // Halton sequence for sub-pixel jitter (base 2 and 3, cycles every 256 frames)
+  function halton(index, base) {
+    let f = 1, r = 0;
+    let i = index;
+    while (i > 0) { f /= base; r += f * (i % base); i = Math.floor(i / base); }
+    return r;
+  }
+
   // --- Render state ---
   let frameIndex = 0, cameraMoved = false, framesStill = 0, autoExposure = 1.0;
   // Reusable staging buffer for autoexposure readback (avoids creating one per frame)
