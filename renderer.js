@@ -834,6 +834,16 @@ async function init() {
     { binding: 5, resource: specPingTex.createView() },
     { binding: 6, resource: albedoTex.createView() },
   ]});
+  // Blur: hdr→pong (so PostBlur can go pong→ping, then Stabilize ping→hdr)
+  const reblurBG_blur_hdr2pong = device.createBindGroup({ layout: dnAtrousLayout, entries: [
+    { binding: 0, resource: { buffer: reblurParamBuf } },
+    { binding: 1, resource: hdrTex.createView() },           // in: temporal output
+    { binding: 2, resource: pongTex.createView() },          // out: blurred
+    { binding: 3, resource: denoiseNdTex.createView() },
+    { binding: 4, resource: specHdrTex.createView() },
+    { binding: 5, resource: specPongTex.createView() },
+    { binding: 6, resource: albedoTex.createView() },
+  ]});
   const reblurBG_blur = device.createBindGroup({ layout: dnAtrousLayout, entries: [
     { binding: 0, resource: { buffer: reblurParamBuf } },
     { binding: 1, resource: pingTex.createView() },          // in: history-fixed
@@ -2297,26 +2307,31 @@ async function init() {
         rp[si++] = 1.0;    // fast_history_clamping_sigma_scale
         device.queue.writeBuffer(reblurParamBuf, 0, rp);
 
-        // DEBUG: ONLY temporal — everything else skipped to find bloom source
-        // PrePass SKIPPED: noisy goes directly to temporal via reblurBG_temporal
-        // which reads from pingTex. Need to copy noisy→ping first.
-        // Actually reblurBG_prepass: noisy→ping, so run it as passthrough:
-        // NO — the prepass does spatial filtering. Need a raw copy.
-        // Simplest: change reblurBG_temporal to read from noisy directly.
-        // For now: just run temporal with the prepass BG textures swapped.
-        // Actually the temporal BG reads pingTex. PrePass writes pingTex from noisy.
-        // If we skip PrePass, pingTex has stale data. We need to copy noisy→ping.
-        // Easiest hack: run PrePass but it will filter. Let's just accept that for now
-        // and skip everything AFTER temporal.
+        // === ReBLUR hybrid pipeline (complete, no shortcuts) ===
+        //
+        // Texture flow:
+        //   noisy → [PrePass] → ping → [Temporal] → hdr → [Blur] → ping → [PostBlur] → pong
+        //   → [Stabilize] → hdr → [CopyToHistory] → history
+        //   Composite reads: hdr (final stabilized)
+        //
+        // Temporal uses proven temporal.wgsl (actually accumulates)
+        // Spatial uses ReBLUR Poisson blur (radius adapts to accumSpeed from temporal)
 
-        // PrePass: noisy → ping (keeps spatial filter for now)
+        // Texture flow: noisy→ping→hdr→pong→ping→hdr→history
+        //
+        // Pass 1: PrePass (noisy → ping)
         { const p = encoder.beginComputePass(); p.setPipeline(reblurPrepassPipeline); p.setBindGroup(0, reblurBG_prepass); p.dispatchWorkgroups(...wg); p.end(); }
-        // Temporal: ping + history → hdr (ONLY pass that matters)
-        { const p = encoder.beginComputePass(); p.setPipeline(reblurTemporalPipeline); p.setBindGroup(0, reblurBG_temporal); p.setBindGroup(1, histBG); p.dispatchWorkgroups(...wg); p.end(); }
-        // ALL other passes SKIPPED
-        // Stabilize: SKIPPED (testing bloom source)
-        // Copy temporal output (hdrTex) to history for next frame
-        { const p = encoder.beginComputePass(); p.setPipeline(copyToHistoryPipeline); p.setBindGroup(0, historyFrame === 0 ? reblurBG_copyHist_A : reblurBG_copyHist_B); p.dispatchWorkgroups(...wg); p.end(); }
+        // Pass 2: Temporal (ping + history → hdr)
+        { const p = encoder.beginComputePass(); p.setPipeline(tmpPipeline); p.setBindGroup(0, historyFrame === 0 ? tmpBG_A : tmpBG_B); p.dispatchWorkgroups(...wg); p.end(); }
+        historyFrame = 1 - historyFrame;
+        // Pass 3: Blur (hdr → pong)
+        { const p = encoder.beginComputePass(); p.setPipeline(reblurBlurPipeline); p.setBindGroup(0, reblurBG_blur_hdr2pong); p.dispatchWorkgroups(...wg); p.end(); }
+        // Pass 4: PostBlur (pong → ping)
+        { const p = encoder.beginComputePass(); p.setPipeline(reblurPostBlurPipeline); p.setBindGroup(0, reblurBG_postblur); p.dispatchWorkgroups(...wg); p.end(); }
+        // Pass 5: Stabilize (ping → hdr)
+        { const p = encoder.beginComputePass(); p.setPipeline(reblurStabilizePipeline); p.setBindGroup(0, reblurBG_stabilize); p.setBindGroup(1, historyFrame === 0 ? reblurHistBG_A : reblurHistBG_B); p.dispatchWorkgroups(...wg); p.end(); }
+        // Pass 6: Copy to history (hdr → history)
+        { const p = encoder.beginComputePass(); p.setPipeline(copyToHistoryPipeline); p.setBindGroup(0, historyFrame === 0 ? reblurBG_copyHist_B : reblurBG_copyHist_A); p.dispatchWorkgroups(...wg); p.end(); }
         historyFrame = 1 - historyFrame;
 
       } else if (denoiseMode === 'full') {
@@ -2381,7 +2396,7 @@ async function init() {
       compPass.setPipeline(dnCompPipeline);
       const compBG = (denoiseMode.startsWith('oidn') && oidn)
                    ? (oidn.blendFrame === 0 ? dnBG_comp_oidn_A : dnBG_comp_oidn_B)
-                   : denoiseMode === 'reblur' ? dnBG_comp_reblur
+                   : denoiseMode === 'reblur' ? dnBG_comp_reblur  // reads hdrTex (stabilized)
                    : denoiseMode !== 'off' ? dnBG_comp : dnBG_comp_noisy;
       compPass.setBindGroup(0, compBG);
       compPass.dispatchWorkgroups(Math.ceil(width/16), Math.ceil(height/16));

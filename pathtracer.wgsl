@@ -175,7 +175,7 @@ const LIGHT_TYPE_SPOT: u32 = 2u;
 // ============================================================
 var<private> rng_state: u32;
 var<private> g_sun_dir: vec3f;
-var<private> g_r2_offset: vec2f;
+// g_r2_offset removed: PCG3D + spatial decorrelation replaces R2 Cranley-Patterson
 var<private> g_sample_idx: u32;
 var<private> g_alpha_dither: f32; // spatiotemporal R2 dither for alpha testing
 
@@ -189,14 +189,24 @@ fn pcg(state: ptr<private, u32>) -> u32 {
   let word = ((s >> ((s >> 28u) + 4u)) ^ s) * 277803737u;
   return (word >> 22u) ^ word;
 }
+
+// PCG3D: generates 3 decorrelated u32s from a uvec3 seed (better for vec2/vec3 random)
+fn pcg3d(v_in: vec3u) -> vec3u {
+  var v = v_in * 1664525u + 1013904223u;
+  v.x += v.y * v.z; v.y += v.z * v.x; v.z += v.x * v.y;
+  v ^= v >> vec3u(16u);
+  v.x += v.y * v.z; v.y += v.z * v.x; v.z += v.x * v.y;
+  return v;
+}
+
 fn rand() -> f32 { return f32(pcg(&rng_state)) / 4294967295.0; }
 
-// Blue-noise-like 2D sample: R2 spatial stratification + temporal rotation
-// Each call returns a different R2 point (indexed by g_sample_idx)
+// 2D random using PCG3D: decorrelated components (no R2 correlation artifacts)
 fn rand2() -> vec2f {
-  let idx = f32(g_sample_idx);
   g_sample_idx += 1u;
-  return fract(vec2f(R2_A1 * idx, R2_A2 * idx) + g_r2_offset);
+  let h = pcg3d(vec3u(rng_state, g_sample_idx, g_sample_idx * 16807u));
+  rng_state = h.z; // advance state
+  return vec2f(f32(h.x), f32(h.y)) / 4294967295.0;
 }
 
 // ============================================================
@@ -2344,30 +2354,25 @@ fn main(@builtin(global_invocation_id) gid: vec3u) {
 
   let idx = pixel.y * res.x + pixel.x;
 
-  // RNG init: PCG state + spatio-temporal R2 offset
+  // RNG init (ignis-ac style): PCG seed + spatial decorrelation
+  // Step 1: base seed from pixel + frame
   rng_state = (pixel.x * 1973u + pixel.y * 9277u + uniforms.frame_seed * 26699u) | 1u;
   _ = pcg(&rng_state);
+
+  // Step 2: spatial decorrelation via R2 (approximates blue noise texture)
+  // This ensures neighboring pixels have decorrelated random sequences → fine noise
+  let spatial_bn = fract(R2_A1 * f32(pixel.x) + R2_A2 * f32(pixel.y));
+  rng_state += u32(spatial_bn * 4294967295.0);
+  _ = pcg(&rng_state);
+
   g_sun_dir = normalize(uniforms.sun_dir);
   g_sample_idx = 0u;
-  // R2 offset: spatial (per-pixel stratification) + temporal (per-frame rotation)
-  // Spatial R2 distributes samples across pixels with low discrepancy (blue-noise property)
-  // Temporal R2 rotates pattern each frame (Cranley-Patterson)
-  let frame_f = f32(uniforms.frame_seed);
-  let spatial_offset = fract(vec2f(
-    R2_A1 * f32(pixel.x) + R2_A2 * f32(pixel.y),
-    R2_A2 * f32(pixel.x) + R2_A1 * f32(pixel.y)
-  ));
-  // Per-pixel temporal phase: each pixel gets a unique temporal offset
-  // Prevents coherent panning of noise pattern across the image
-  let pixel_hash = f32((pixel.x * 12979u + pixel.y * 48271u) & 0xFFFFu) / 65535.0;
-  let temporal_offset = fract(vec2f(R2_A1 * (frame_f + pixel_hash), R2_A2 * (frame_f + pixel_hash)));
-  g_r2_offset = fract(spatial_offset + temporal_offset);
   // Alpha dither: IGN spatial (Jimenez 2014) + per-pixel phased golden ratio temporal
   // IGN provides blue-noise-like spatial distribution
   // Per-pixel phase offset prevents coherent movement across the screen
   let ign = fract(52.9829189 * fract(dot(vec2f(f32(pixel.x), f32(pixel.y)), vec2f(0.06711056, 0.00583715))));
   let pixel_phase = f32((pixel.x * 1973u + pixel.y * 9277u) % 256u);
-  g_alpha_dither = fract(ign + (frame_f + pixel_phase) * 0.3819660113);
+  g_alpha_dither = fract(ign + (f32(uniforms.frame_seed) + pixel_phase) * 0.3819660113);
 
   // Read G-buffer depth hint (rasterized — much faster than BVH for primary visibility)
   let nd = textureLoad(gbuf_nd, vec2i(pixel), 0);

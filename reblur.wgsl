@@ -422,10 +422,9 @@ fn spatial_filter(
   var sum_s = 1.0;
 
   // Hit distance factor
-  let hitDistScale_d = get_hit_dist_normalization(viewZ, 1.0);
-  let hitDist_d = diff_result.w * hitDistScale_d;
-  let hitDistFactor_d = get_hit_dist_factor(hitDist_d, frustumSize);
-
+  // Diffuse alpha stores history_len (not hitDist), so use hitDistFactor=1.0 for diffuse
+  let hitDistFactor_d = 1.0;
+  // Specular alpha stores actual hit distance
   let hitDistScale_s = get_hit_dist_normalization(viewZ, roughness);
   let hitDist_s = spec_result.w * hitDistScale_s;
   let hitDistFactor_s = get_hit_dist_factor(hitDist_s, frustumSize);
@@ -439,8 +438,9 @@ fn spatial_filter(
     areaFactor_s *= nonLinearAccumSpeed;
   }
 
-  var blurRadius_d = radiusScale * sqrt(areaFactor_d) * gp.max_blur_radius;
-  var blurRadius_s = radiusScale * sqrt(areaFactor_s) * gp.max_blur_radius * smc;
+  // DEBUG: force large radius to verify spatial filter works
+  var blurRadius_d = 30.0; //radiusScale * sqrt(areaFactor_d) * gp.max_blur_radius;
+  var blurRadius_s = 30.0 * max(smc, 0.3); //radiusScale * sqrt(areaFactor_s) * gp.max_blur_radius * smc;
   blurRadius_d = max(blurRadius_d, gp.min_blur_radius);
   blurRadius_s = max(blurRadius_s, gp.min_blur_radius * smc);
 
@@ -453,7 +453,8 @@ fn spatial_filter(
   let geometryWeightParams = get_geometry_weight_params(frustumSize, Xv, Nv);
   let normalWeightParam_d = get_normal_weight_param(nonLinearAccumSpeed, 1.0) / fractionScale;
   let normalWeightParam_s = get_normal_weight_param(nonLinearAccumSpeed, roughness) / fractionScale;
-  let hitDistWeightParams_d = get_hit_distance_weight_params(diff_result.w, nonLinearAccumSpeed);
+  // Diffuse: no hitDist available (alpha = history_len), skip hitDist weighting
+  let hitDistWeightParams_d = vec2f(0.0, 0.0); // disabled: always returns weight=1
   let hitDistWeightParams_s = get_hit_distance_weight_params(spec_result.w, nonLinearAccumSpeed);
   let roughnessWeightParams = get_roughness_weight_params(roughness, gp.roughness_fraction * fractionScale);
   let minHitDistWeight = gp.min_hit_dist_weight * fractionScale * smc;
@@ -533,9 +534,9 @@ fn spatial_filter(
   diff_result /= sum_d;
   spec_result /= sum_s;
 
-  // Keep hit distances unprocessed (avoid bias)
+  // Preserve alpha: diffuse.w = history_len (pass through), specular.w = hitDist (restore)
   if !is_prepass {
-    diff_result.w = hitDist_d / max(hitDistScale_d, NRD_EPS);
+    diff_result.w = textureLoad(in_diff, px, 0).w; // preserve history_len
     spec_result.w = hitDist_s / max(hitDistScale_s, NRD_EPS);
   }
 
@@ -551,9 +552,15 @@ fn prepass(@builtin(global_invocation_id) gid: vec3u) {
   let sz = vec2i(gp.rect_size);
   if px.x >= sz.x || px.y >= sz.y { return; }
 
-  // DEBUG: passthrough (no spatial filter) to test bloom source
-  textureStore(out_diff, px, textureLoad(in_diff, px, 0));
-  textureStore(out_spec, px, textureLoad(in_spec, px, 0));
+  let viewZ = read_viewz(px);
+  if viewZ > gp.denoising_range { return; }
+
+  let result = spatial_filter(px, sz,
+    REBLUR_PRE_PASS_RADIUS_SCALE, REBLUR_PRE_PASS_FRACTION_SCALE,
+    1.0 / (1.0 + 10.0), true, gp.rotator_pre);
+
+  textureStore(out_diff, px, result[0]);
+  textureStore(out_spec, px, result[1]);
 }
 
 // ============================================================
@@ -703,7 +710,7 @@ fn history_fix(@builtin(global_invocation_id) gid: vec3u) {
   var diff = textureLoad(in_diff, px, 0);
   var spec = textureLoad(in_spec, px, 0);
   // AccumSpeed stored in diff alpha (normalized to [0,1])
-  let frameNum = textureLoad(in_diff, px, 0).w * REBLUR_MAX_ACCUM_FRAME_NUM;
+  let frameNum = textureLoad(in_diff, px, 0).w;
 
   if frameNum >= gp.history_fix_frame_num {
     textureStore(out_diff, px, diff);
@@ -777,21 +784,48 @@ fn blur(@builtin(global_invocation_id) gid: vec3u) {
   let sz = vec2i(gp.rect_size);
   if px.x >= sz.x || px.y >= sz.y { return; }
 
-  let viewZ = read_viewz(px);
-  if viewZ > gp.denoising_range { return; }
+  // Adaptive Poisson blur with proven geometry weights
+  let cn = read_normal(px);
+  let cz = read_viewz(px);
+  let gz = max(cz * 0.01, 0.1);
+  let history_len = textureLoad(in_diff, px, 0).w;
 
-  // DEBUG: use frame_index as accumSpeed proxy to test if radius adaptation works
-  // If bloom disappears when camera is still → temporal isn't accumulating properly
-  let accumSpeed = f32(gp.frame_index % 256u);
-  let nonLinearAccumSpeed = 1.0 / (1.0 + accumSpeed);
+  // Adaptive radius: large when new, small when converged
+  let accumSpeed = max(history_len, 0.0);
+  let nonLinear = 1.0 / (1.0 + accumSpeed);
+  let radius = max(20.0 * sqrt(nonLinear), 1.0);
 
-  let result = spatial_filter(px, sz,
-    REBLUR_BLUR_RADIUS_SCALE, REBLUR_BLUR_FRACTION_SCALE,
-    nonLinearAccumSpeed, false, gp.rotator_blur);
+  // Per-pixel rotation (Bayer + frame)
+  let bayer = fract(f32((u32(px.x) & 3u) * 4u + (u32(px.y) & 3u)) / 16.0 + f32(gp.frame_index % 16u) / 16.0);
+  let angle = bayer * 6.2832;
+  let rc = cos(angle);
+  let rs = sin(angle);
 
-  // Preserve accumNorm in alpha
-  textureStore(out_diff, px, vec4f(result[0].xyz, textureLoad(in_diff, px, 0).w));
-  textureStore(out_spec, px, result[1]);
+  var d_sum = textureLoad(in_diff, px, 0).rgb;
+  var s_sum = textureLoad(in_spec, px, 0).rgb;
+  var w_sum = 1.0;
+
+  for (var i = 0u; i < 8u; i++) {
+    let tap = POISSON8[i];
+    let ox = tap.x * rc - tap.y * rs;
+    let oy = tap.x * rs + tap.y * rc;
+    let offset = vec2i(vec2f(ox, oy) * radius + 0.5);
+    let sp = clamp(px + offset, vec2i(0), sz - 1);
+
+    let sn = read_normal(sp);
+    let sz2 = read_viewz(sp);
+    let gauss = exp(-0.66 * tap.z * tap.z);
+    let wn = pow(max(dot(cn, sn), 0.0), 32.0);
+    let wz = exp(-abs(cz - sz2) / (gz * radius + 0.01));
+    let w = gauss * wn * wz;
+
+    d_sum += textureLoad(in_diff, sp, 0).rgb * w;
+    s_sum += textureLoad(in_spec, sp, 0).rgb * w;
+    w_sum += w;
+  }
+
+  textureStore(out_diff, px, vec4f(d_sum / w_sum, history_len));
+  textureStore(out_spec, px, vec4f(s_sum / w_sum, textureLoad(in_spec, px, 0).w));
 }
 
 // ============================================================
@@ -803,22 +837,45 @@ fn post_blur(@builtin(global_invocation_id) gid: vec3u) {
   let sz = vec2i(gp.rect_size);
   if px.x >= sz.x || px.y >= sz.y { return; }
 
-  let viewZ = read_viewz(px);
-  if viewZ > gp.denoising_range { return; }
+  // PostBlur: same as Blur but 2x radius, tighter normal weight
+  let cn2 = read_normal(px);
+  let cz2 = read_viewz(px);
+  let gz2 = max(cz2 * 0.01, 0.1);
+  let hl2 = textureLoad(in_diff, px, 0).w;
+  let accumSpeed2 = max(hl2, 0.0);
+  let nonLinear2 = 1.0 / (1.0 + accumSpeed2);
+  let radius2 = max(40.0 * sqrt(nonLinear2), 1.0); // 2x radius
 
-  // DEBUG: same as blur — use frame_index
-  let accumSpeed = f32(gp.frame_index % 256u);
-  let nonLinearAccumSpeed = 1.0 / (1.0 + accumSpeed);
+  let bayer2 = fract(f32((u32(px.x) & 3u) * 4u + (u32(px.y) & 3u)) / 16.0 + f32((gp.frame_index + 8u) % 16u) / 16.0);
+  let angle2 = bayer2 * 6.2832;
+  let rc2 = cos(angle2);
+  let rs2 = sin(angle2);
 
-  let result = spatial_filter(px, sz,
-    REBLUR_POST_BLUR_RADIUS_SCALE, REBLUR_POST_BLUR_FRACTION_SCALE,
-    nonLinearAccumSpeed, false, gp.rotator_post);
+  var d_sum2 = textureLoad(in_diff, px, 0).rgb;
+  var s_sum2 = textureLoad(in_spec, px, 0).rgb;
+  var w_sum2 = 1.0;
 
-  // Write result with incremented accumSpeed in alpha
-  let diffAccum = min(accumSpeed + 1.0, REBLUR_MAX_ACCUM_FRAME_NUM);
-  let accumNorm_pb = diffAccum / REBLUR_MAX_ACCUM_FRAME_NUM;
-  textureStore(out_diff, px, vec4f(result[0].xyz, accumNorm_pb));
-  textureStore(out_spec, px, result[1]);
+  for (var i = 0u; i < 8u; i++) {
+    let tap = POISSON8[i];
+    let ox2 = tap.x * rc2 - tap.y * rs2;
+    let oy2 = tap.x * rs2 + tap.y * rc2;
+    let offset2 = vec2i(vec2f(ox2, oy2) * radius2 + 0.5);
+    let sp2 = clamp(px + offset2, vec2i(0), sz - 1);
+
+    let sn2 = read_normal(sp2);
+    let sz3 = read_viewz(sp2);
+    let gauss2 = exp(-0.66 * tap.z * tap.z);
+    let wn2 = pow(max(dot(cn2, sn2), 0.0), 64.0); // tighter normals
+    let wz2 = exp(-abs(cz2 - sz3) / (gz2 * radius2 + 0.01));
+    let w2 = gauss2 * wn2 * wz2;
+
+    d_sum2 += textureLoad(in_diff, sp2, 0).rgb * w2;
+    s_sum2 += textureLoad(in_spec, sp2, 0).rgb * w2;
+    w_sum2 += w2;
+  }
+
+  textureStore(out_diff, px, vec4f(d_sum2 / w_sum2, hl2));
+  textureStore(out_spec, px, vec4f(s_sum2 / w_sum2, textureLoad(in_spec, px, 0).w));
 }
 
 // ============================================================
