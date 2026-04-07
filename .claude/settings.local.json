@@ -90,7 +90,11 @@
       "Bash(cargo build:*)",
       "Bash(wmic logicaldisk:*)",
       "Bash(powershell -c \"Get-PSDrive F | Select-Object Used,Free\")",
-      "Bash(RUST_LOG=info C:/Dev/ignis-native-target/release/ignis-native.exe)"
+      "Bash(RUST_LOG=info C:/Dev/ignis-native-target/release/ignis-native.exe)",
+      "Bash(du -sh F:/*/)",
+      "Bash(du -sm F:/*)",
+      "Bash(kill %1)",
+      "Bash(wait)"
     ]
   }
 }
