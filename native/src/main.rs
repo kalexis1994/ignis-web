@@ -1,3 +1,5 @@
+mod bvh;
+
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Instant;
@@ -364,6 +366,19 @@ fn main() {
         "Scene ready: {} tris, {} verts",
         scene.total_tris,
         scene.total_verts
+    );
+
+    // Build BVH
+    let bvh = bvh::build_bvh(
+        &scene.positions,
+        &scene.indices,
+        &scene.tri_mat_ids,
+        |msg| log::info!("{}", msg),
+    );
+    log::info!(
+        "BVH: {} nodes, {} sorted triangles",
+        bvh.nodes.len(),
+        bvh.sorted_tri_data.len()
     );
 
     let event_loop = EventLoop::new().unwrap();
