@@ -1,4 +1,5 @@
 mod bvh;
+mod gpu;
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -161,16 +162,22 @@ struct App {
     device: Option<wgpu::Device>,
     queue: Option<wgpu::Queue>,
     config: Option<wgpu::SurfaceConfiguration>,
+    renderer: Option<gpu::GpuRenderer>,
+    scene: Option<SceneData>,
+    bvh: Option<bvh::BVH>,
 }
 
 impl App {
-    fn new() -> Self {
+    fn new(scene: SceneData, bvh: bvh::BVH) -> Self {
         Self {
             window: None,
             surface: None,
             device: None,
             queue: None,
             config: None,
+            renderer: None,
+            scene: Some(scene),
+            bvh: Some(bvh),
         }
     }
 
@@ -266,6 +273,12 @@ impl App {
             .get_default_config(&adapter, size.width.max(1), size.height.max(1))
             .unwrap();
         surface.configure(&device, &config);
+
+        // Create GPU renderer with scene data
+        if let (Some(scene), Some(bvh)) = (self.scene.as_ref(), self.bvh.as_ref()) {
+            let renderer = gpu::GpuRenderer::new(&device, &queue, scene, bvh, config.width, config.height);
+            self.renderer = Some(renderer);
+        }
 
         self.surface = Some(surface);
         self.device = Some(device);
@@ -382,6 +395,6 @@ fn main() {
     );
 
     let event_loop = EventLoop::new().unwrap();
-    let mut app = App::new();
+    let mut app = App::new(scene, bvh);
     event_loop.run_app(&mut app).unwrap();
 }
