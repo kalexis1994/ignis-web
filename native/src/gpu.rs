@@ -42,10 +42,39 @@ struct Uniforms {
     lights: [[f32; 4]; 64],
 }
 
+const BLIT_SHADER: &str = r#"
+@group(0) @binding(0) var src: texture_2d<f32>;
+@group(0) @binding(1) var samp: sampler;
+
+struct VsOut {
+    @builtin(position) pos: vec4f,
+    @location(0) uv: vec2f,
+};
+
+@vertex fn vs(@builtin(vertex_index) vi: u32) -> VsOut {
+    // Fullscreen triangle
+    let uv = vec2f(f32((vi << 1u) & 2u), f32(vi & 2u));
+    var out: VsOut;
+    out.pos = vec4f(uv * 2.0 - 1.0, 0.0, 1.0);
+    out.uv = vec2f(uv.x, 1.0 - uv.y);
+    return out;
+}
+
+@fragment fn fs(in: VsOut) -> @location(0) vec4f {
+    let c = textureSample(src, samp, in.uv);
+    // Simple Reinhard tonemap + gamma
+    let lum = dot(c.rgb, vec3f(0.2126, 0.7152, 0.0722));
+    let mapped = c.rgb / (1.0 + lum);
+    return vec4f(pow(mapped, vec3f(1.0/2.2)), 1.0);
+}
+"#;
+
 pub struct GpuRenderer {
     pub output_texture: wgpu::Texture,
     pub output_view: wgpu::TextureView,
     pipeline: wgpu::ComputePipeline,
+    blit_pipeline: wgpu::RenderPipeline,
+    blit_bind_group: wgpu::BindGroup,
     bind_group0: wgpu::BindGroup,
     bind_group1: wgpu::BindGroup,
     bind_group2: wgpu::BindGroup,
@@ -390,12 +419,94 @@ impl GpuRenderer {
             ],
         });
 
+        // --- Blit pipeline (fullscreen triangle, tonemap) ---
+        let blit_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("blit"),
+            source: wgpu::ShaderSource::Wgsl(BLIT_SHADER.into()),
+        });
+        let blit_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+            mag_filter: wgpu::FilterMode::Linear,
+            min_filter: wgpu::FilterMode::Linear,
+            ..Default::default()
+        });
+        let blit_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("blit_bgl"),
+            entries: &[
+                wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 1,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                    count: None,
+                },
+            ],
+        });
+        let blit_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("blit_bg"),
+            layout: &blit_bgl,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::TextureView(&output_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::Sampler(&blit_sampler),
+                },
+            ],
+        });
+        let blit_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("blit_layout"),
+            bind_group_layouts: &[&blit_bgl],
+            push_constant_ranges: &[],
+        });
+        let surface_format = wgpu::TextureFormat::Bgra8Unorm; // common surface format
+        let blit_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("blit"),
+            layout: Some(&blit_layout),
+            vertex: wgpu::VertexState {
+                module: &blit_shader,
+                entry_point: Some("vs"),
+                buffers: &[],
+                compilation_options: Default::default(),
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: &blit_shader,
+                entry_point: Some("fs"),
+                targets: &[Some(wgpu::ColorTargetState {
+                    format: surface_format,
+                    blend: None,
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+                compilation_options: Default::default(),
+            }),
+            primitive: wgpu::PrimitiveState {
+                topology: wgpu::PrimitiveTopology::TriangleList,
+                ..Default::default()
+            },
+            depth_stencil: None,
+            multisample: wgpu::MultisampleState::default(),
+            multiview: None,
+            cache: None,
+        });
+
         log::info!("GPU renderer initialized in {:.1}ms", t0.elapsed().as_secs_f64() * 1000.0);
 
         Self {
             output_texture,
             output_view,
             pipeline,
+            blit_pipeline,
+            blit_bind_group,
             bind_group0,
             bind_group1,
             bind_group2,
@@ -468,5 +579,27 @@ impl GpuRenderer {
         queue.submit(Some(encoder.finish()));
 
         self.frame_index += 1;
+    }
+
+    pub fn blit_to_screen(
+        &self,
+        encoder: &mut wgpu::CommandEncoder,
+        target: &wgpu::TextureView,
+    ) {
+        let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+            label: Some("blit"),
+            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                view: target,
+                resolve_target: None,
+                ops: wgpu::Operations {
+                    load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                    store: wgpu::StoreOp::Store,
+                },
+            })],
+            ..Default::default()
+        });
+        pass.set_pipeline(&self.blit_pipeline);
+        pass.set_bind_group(0, &self.blit_bind_group, &[]);
+        pass.draw(0..3, 0..1); // fullscreen triangle
     }
 }

@@ -313,9 +313,13 @@ impl ApplicationHandler for App {
                 }
             }
             WindowEvent::RedrawRequested => {
-                if let (Some(surface), Some(device), Some(queue)) =
-                    (&self.surface, &self.device, &self.queue)
+                if let (Some(surface), Some(device), Some(queue), Some(renderer)) =
+                    (&self.surface, &self.device, &self.queue, &mut self.renderer)
                 {
+                    // 1. Run path tracer compute
+                    renderer.render(device, queue);
+
+                    // 2. Blit compute output to screen (tonemap + gamma in shader)
                     let frame = surface.get_current_texture().unwrap();
                     let view = frame
                         .texture
@@ -323,29 +327,9 @@ impl ApplicationHandler for App {
 
                     let mut encoder =
                         device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                            label: Some("render"),
+                            label: Some("blit"),
                         });
-
-                    // Clear to dark blue (placeholder)
-                    {
-                        let _pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                            label: Some("clear"),
-                            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                                view: &view,
-                                resolve_target: None,
-                                ops: wgpu::Operations {
-                                    load: wgpu::LoadOp::Clear(wgpu::Color {
-                                        r: 0.02,
-                                        g: 0.02,
-                                        b: 0.08,
-                                        a: 1.0,
-                                    }),
-                                    store: wgpu::StoreOp::Store,
-                                },
-                            })],
-                            ..Default::default()
-                        });
-                    }
+                    renderer.blit_to_screen(&mut encoder, &view);
 
                     queue.submit(Some(encoder.finish()));
                     frame.present();
