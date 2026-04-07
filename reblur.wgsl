@@ -555,12 +555,75 @@ fn prepass(@builtin(global_invocation_id) gid: vec3u) {
   let viewZ = read_viewz(px);
   if viewZ > gp.denoising_range { return; }
 
-  let result = spatial_filter(px, sz,
-    REBLUR_PRE_PASS_RADIUS_SCALE, REBLUR_PRE_PASS_FRACTION_SCALE,
-    1.0 / (1.0 + 10.0), true, gp.rotator_pre);
+  let cn = read_normal(px);
+  let cz = viewZ;
+  let gz = max(cz * 0.01, 0.1);
+  let cc = textureLoad(in_diff, px, 0);
+  let cs = textureLoad(in_spec, px, 0);
 
-  textureStore(out_diff, px, result[0]);
-  textureStore(out_spec, px, result[1]);
+  // Firefly clamp: 3×3 neighborhood statistics
+  var d_m1 = 0.0; var d_m2 = 0.0;
+  var s_m1 = 0.0; var s_m2 = 0.0;
+  for (var fy = -1; fy <= 1; fy++) {
+    for (var fx = -1; fx <= 1; fx++) {
+      let fp = clamp(px + vec2i(fx, fy), vec2i(0), sz - 1);
+      let dl = luma(textureLoad(in_diff, fp, 0).rgb);
+      d_m1 += dl; d_m2 += dl * dl;
+      let sl = luma(textureLoad(in_spec, fp, 0).rgb);
+      s_m1 += sl; s_m2 += sl * sl;
+    }
+  }
+  let d_mean = d_m1 / 9.0;
+  let d_std = sqrt(max(d_m2 / 9.0 - d_mean * d_mean, 0.0));
+  let s_mean = s_m1 / 9.0;
+  let s_std = sqrt(max(s_m2 / 9.0 - s_mean * s_mean, 0.0));
+
+  // Clamp fireflies
+  var d_out = cc.rgb;
+  let d_lum = luma(d_out);
+  let d_max = d_mean + d_std + 0.02;
+  if d_lum > d_max && d_lum > 0.005 { d_out *= d_max / d_lum; }
+  var s_out = cs.rgb;
+  let s_lum = luma(s_out);
+  let s_max = s_mean + s_std + 0.02;
+  if s_lum > s_max && s_lum > 0.005 { s_out *= s_max / s_lum; }
+
+  // Poisson pre-filter (radius = prepass blur radius, fixed nonLinear)
+  let radius = gp.diff_prepass_blur_radius;
+  let a = fract(f32((u32(px.x) & 3u) * 4u + (u32(px.y) & 3u)) / 16.0 + f32(gp.frame_index % 16u) / 16.0) * 6.2832;
+  let rc = cos(a); let rs = sin(a);
+
+  var d_sum = d_out;
+  var s_sum = s_out;
+  var w_sum = 1.0;
+
+  for (var i = 0u; i < 8u; i++) {
+    let tap = POISSON8[i];
+    let ox = tap.x * rc - tap.y * rs;
+    let oy = tap.x * rs + tap.y * rc;
+    let sp = clamp(px + vec2i(vec2f(ox, oy) * radius + 0.5), vec2i(0), sz - 1);
+    let sn = read_normal(sp);
+    let sz2 = read_viewz(sp);
+    let gauss = exp(-0.66 * tap.z * tap.z);
+    let wn = pow(max(dot(cn, sn), 0.0), 16.0); // soft for prepass
+    let wz = exp(-abs(cz - sz2) / (gz * max(radius, 1.0) + 0.01));
+    let w = gauss * wn * wz;
+
+    // Clamp neighbors too
+    var sd = textureLoad(in_diff, sp, 0).rgb;
+    let sdl = luma(sd);
+    if sdl > d_max && sdl > 0.005 { sd *= d_max / sdl; }
+    var ss = textureLoad(in_spec, sp, 0).rgb;
+    let ssl = luma(ss);
+    if ssl > s_max && ssl > 0.005 { ss *= s_max / ssl; }
+
+    d_sum += sd * w;
+    s_sum += ss * w;
+    w_sum += w;
+  }
+
+  textureStore(out_diff, px, vec4f(d_sum / w_sum, 1.0));
+  textureStore(out_spec, px, vec4f(s_sum / w_sum, cs.w));
 }
 
 // ============================================================
@@ -787,16 +850,42 @@ fn blur(@builtin(global_invocation_id) gid: vec3u) {
   let viewZ = read_viewz(px);
   if viewZ > gp.denoising_range { return; }
 
-  let accumSpeed = max(textureLoad(in_diff, px, 0).w, 0.0);
-  let nonLinearAccumSpeed = 1.0 / (1.0 + accumSpeed);
+  // Proven Poisson blur with NRD adaptive radius
+  let cn = read_normal(px);
+  let cz = viewZ;
+  let gz = max(cz * 0.01, 0.1);
+  let history_len = textureLoad(in_diff, px, 0).w;
+  let accumSpeed = max(history_len, 0.0);
+  let nonLinear = 1.0 / (1.0 + accumSpeed);
+  let radius = max(gp.max_blur_radius * sqrt(nonLinear), gp.min_blur_radius);
 
-  let result = spatial_filter(px, sz,
-    REBLUR_BLUR_RADIUS_SCALE, REBLUR_BLUR_FRACTION_SCALE,
-    nonLinearAccumSpeed, false, gp.rotator_blur);
+  // Per-pixel rotation
+  let bayer = fract(f32((u32(px.x) & 3u) * 4u + (u32(px.y) & 3u)) / 16.0 + f32(gp.frame_index % 16u) / 16.0);
+  let a = bayer * 6.2832;
+  let rc = cos(a); let rs = sin(a);
 
-  // Preserve history_len in diff alpha
-  textureStore(out_diff, px, vec4f(result[0].xyz, textureLoad(in_diff, px, 0).w));
-  textureStore(out_spec, px, result[1]);
+  var d_sum = textureLoad(in_diff, px, 0).rgb;
+  var s_sum = textureLoad(in_spec, px, 0).rgb;
+  var w_sum = 1.0;
+
+  for (var i = 0u; i < 8u; i++) {
+    let tap = POISSON8[i];
+    let ox = tap.x * rc - tap.y * rs;
+    let oy = tap.x * rs + tap.y * rc;
+    let sp = clamp(px + vec2i(vec2f(ox, oy) * radius + 0.5), vec2i(0), sz - 1);
+    let sn = read_normal(sp);
+    let sz2 = read_viewz(sp);
+    let gauss = exp(-0.66 * tap.z * tap.z);
+    let wn = pow(max(dot(cn, sn), 0.0), 32.0);
+    let wz = exp(-abs(cz - sz2) / (gz * max(radius, 1.0) + 0.01));
+    let w = gauss * wn * wz;
+    d_sum += textureLoad(in_diff, sp, 0).rgb * w;
+    s_sum += textureLoad(in_spec, sp, 0).rgb * w;
+    w_sum += w;
+  }
+
+  textureStore(out_diff, px, vec4f(d_sum / w_sum, history_len));
+  textureStore(out_spec, px, vec4f(s_sum / w_sum, textureLoad(in_spec, px, 0).w));
 }
 
 // ============================================================
@@ -811,16 +900,40 @@ fn post_blur(@builtin(global_invocation_id) gid: vec3u) {
   let viewZ = read_viewz(px);
   if viewZ > gp.denoising_range { return; }
 
-  let accumSpeed = max(textureLoad(in_diff, px, 0).w, 0.0);
-  let nonLinearAccumSpeed = 1.0 / (1.0 + accumSpeed);
+  let cn2 = read_normal(px);
+  let cz2 = viewZ;
+  let gz2 = max(cz2 * 0.01, 0.1);
+  let hl2 = textureLoad(in_diff, px, 0).w;
+  let accumSpeed2 = max(hl2, 0.0);
+  let nonLinear2 = 1.0 / (1.0 + accumSpeed2);
+  let radius2 = max(gp.max_blur_radius * REBLUR_POST_BLUR_RADIUS_SCALE * sqrt(nonLinear2), gp.min_blur_radius);
 
-  let result = spatial_filter(px, sz,
-    REBLUR_POST_BLUR_RADIUS_SCALE, REBLUR_POST_BLUR_FRACTION_SCALE,
-    nonLinearAccumSpeed, false, gp.rotator_post);
+  let bayer2 = fract(f32((u32(px.x) & 3u) * 4u + (u32(px.y) & 3u)) / 16.0 + f32((gp.frame_index + 8u) % 16u) / 16.0);
+  let a2 = bayer2 * 6.2832;
+  let rc2 = cos(a2); let rs2 = sin(a2);
 
-  // Preserve history_len in diff alpha
-  textureStore(out_diff, px, vec4f(result[0].xyz, textureLoad(in_diff, px, 0).w));
-  textureStore(out_spec, px, result[1]);
+  var d_sum2 = textureLoad(in_diff, px, 0).rgb;
+  var s_sum2 = textureLoad(in_spec, px, 0).rgb;
+  var w_sum2 = 1.0;
+
+  for (var i = 0u; i < 8u; i++) {
+    let tap = POISSON8[i];
+    let ox2 = tap.x * rc2 - tap.y * rs2;
+    let oy2 = tap.x * rs2 + tap.y * rc2;
+    let sp2 = clamp(px + vec2i(vec2f(ox2, oy2) * radius2 + 0.5), vec2i(0), sz - 1);
+    let sn2 = read_normal(sp2);
+    let sz3 = read_viewz(sp2);
+    let gauss2 = exp(-0.66 * tap.z * tap.z);
+    let wn2 = pow(max(dot(cn2, sn2), 0.0), 64.0); // tighter for postblur
+    let wz2 = exp(-abs(cz2 - sz3) / (gz2 * max(radius2, 1.0) + 0.01));
+    let w2 = gauss2 * wn2 * wz2;
+    d_sum2 += textureLoad(in_diff, sp2, 0).rgb * w2;
+    s_sum2 += textureLoad(in_spec, sp2, 0).rgb * w2;
+    w_sum2 += w2;
+  }
+
+  textureStore(out_diff, px, vec4f(d_sum2 / w_sum2, hl2));
+  textureStore(out_spec, px, vec4f(s_sum2 / w_sum2, textureLoad(in_spec, px, 0).w));
 }
 
 // ============================================================

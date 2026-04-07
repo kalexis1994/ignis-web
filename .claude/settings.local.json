@@ -83,7 +83,14 @@
       "Read(//c/tmp/NRD/**)",
       "Read(//f//**)",
       "Bash(git clone:*)",
-      "Bash(node --input-type=module -e \"import\\('./renderer.js'\\)\")"
+      "Bash(node --input-type=module -e \"import\\('./renderer.js'\\)\")",
+      "Bash(rustc --version)",
+      "Bash(cargo --version)",
+      "Bash(cargo init:*)",
+      "Bash(cargo build:*)",
+      "Bash(wmic logicaldisk:*)",
+      "Bash(powershell -c \"Get-PSDrive F | Select-Object Used,Free\")",
+      "Bash(RUST_LOG=info C:/Dev/ignis-native-target/release/ignis-native.exe)"
     ]
   }
 }

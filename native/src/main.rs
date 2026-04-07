@@ -46,15 +46,12 @@ impl App {
 
         // Check for features we want
         let features = adapter.features();
-        log::info!("Features:");
-        if features.contains(wgpu::Features::SHADER_F16) {
-            log::info!("  - shader-f16 ✓");
-        }
-        if features.contains(wgpu::Features::SUBGROUP) {
-            log::info!("  - subgroups ✓");
-        }
-        // Cooperative matrix (tensor cores) - check native Vulkan features
-        log::info!("  - Checking for cooperative matrix (tensor cores)...");
+        log::info!("Adapter features: {:?}", features);
+        log::info!("Key features:");
+        log::info!("  shader-f16: {}", features.contains(wgpu::Features::SHADER_F16));
+        log::info!("  subgroups: {}", features.contains(wgpu::Features::SUBGROUP));
+        log::info!("  timestamp-query: {}", features.contains(wgpu::Features::TIMESTAMP_QUERY));
+        log::info!("  float32-filterable: {}", features.contains(wgpu::Features::FLOAT32_FILTERABLE));
 
         let limits = adapter.limits();
         log::info!(

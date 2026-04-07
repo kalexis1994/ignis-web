@@ -156,7 +156,7 @@ fn clamp_contribution(L: vec3f, limit: f32) -> vec3f {
   let s = abs(L.x) + abs(L.y) + abs(L.z);
   return select(L, L * (limit / s), s > limit);
 }
-const MAX_FIREFLY_LUM: f32 = 32.0;
+const MAX_FIREFLY_LUM: f32 = 10.0;
 const MAT_FLAG_THIN_TRANSMISSION: u32 = 1u;
 const MAT_FLAG_DOUBLE_SIDED: u32 = 2u;
 const MAT_FLAG_UNLIT: u32 = 4u;
