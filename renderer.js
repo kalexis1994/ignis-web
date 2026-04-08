@@ -207,7 +207,8 @@ async function init() {
 
   // --- Load shaders ---
   const v = Date.now(); // cache bust
-  let [ptCode, dispCode, fsrCode, dnCode, tmpCode, gbCode, smCode, reblurCode] = await Promise.all([
+  let [ptCode, dispCode, fsrCode, dnCode, tmpCode, gbCode, smCode, reblurCode,
+       wfRayGenCode, wfTraceCode, wfShadeCode, wfAccumCode] = await Promise.all([
     fetch(`pathtracer.wgsl?v=${v}`).then(r => r.text()),
     fetch(`display.wgsl?v=${v}`).then(r => r.text()),
     fetch(`fsr.wgsl?v=${v}`).then(r => r.text()),
@@ -216,6 +217,10 @@ async function init() {
     fetch(`gbuffer.wgsl?v=${v}`).then(r => r.text()),
     fetch(`shadow-map.wgsl?v=${v}`).then(r => r.text()),
     fetch(`reblur.wgsl?v=${v}`).then(r => r.text()),
+    fetch(`wf_ray_gen.wgsl?v=${v}`).then(r => r.text()),
+    fetch(`wf_trace.wgsl?v=${v}`).then(r => r.text()),
+    fetch(`wf_shade.wgsl?v=${v}`).then(r => r.text()),
+    fetch(`wf_accumulate.wgsl?v=${v}`).then(r => r.text()),
   ]);
 
   if (hasSubgroups) rlog('Subgroups available (reserved for denoiser)');
@@ -246,6 +251,13 @@ async function init() {
   const gbModule = device.createShaderModule({ code: gbCode, ...smOpts });
   const shadowModule = device.createShaderModule({ code: smCode, ...smOpts });
   const reblurModule = device.createShaderModule({ code: reblurCode, ...smOpts });
+
+  // Wavefront modules
+  const wfRayGenModule = device.createShaderModule({ code: wfRayGenCode, ...smOpts });
+  const wfTraceModule = device.createShaderModule({ code: wfTraceCode, ...smOpts });
+  const wfShadeModule = device.createShaderModule({ code: wfShadeCode, ...smOpts });
+  const wfAccumModule = device.createShaderModule({ code: wfAccumCode, ...smOpts });
+  rlog('Wavefront shaders compiled');
   rlog('ReBLUR shader compiled: ' + (reblurModule ? 'OK' : 'FAIL'));
 
   // ReBLUR: history bind group layout (group 1)
@@ -891,6 +903,149 @@ async function init() {
     { binding: 6, resource: albedoTex.createView() },
   ]});
   rlog('ReBLUR pipelines + bind groups created');
+
+  // === WAVEFRONT PATH TRACER ===
+  const MAX_RAYS = width * height; // 1 ray per pixel max
+  const RAY_STRIDE = 3; // 3 vec4f per ray (48 bytes)
+  const ACCUM_STRIDE = 2; // 2 vec4f per pixel (32 bytes)
+
+  // Buffers
+  const wfRayBuf = device.createBuffer({ size: MAX_RAYS * RAY_STRIDE * 16, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST });
+  const wfHitBuf = device.createBuffer({ size: MAX_RAYS * 16, usage: GPUBufferUsage.STORAGE });
+  const wfShadowRayBuf = device.createBuffer({ size: MAX_RAYS * RAY_STRIDE * 16, usage: GPUBufferUsage.STORAGE });
+  const wfShadowHitBuf = device.createBuffer({ size: MAX_RAYS * 16, usage: GPUBufferUsage.STORAGE });
+  const wfBounceRayBuf = device.createBuffer({ size: MAX_RAYS * RAY_STRIDE * 16, usage: GPUBufferUsage.STORAGE });
+  const wfAccumBuf = device.createBuffer({ size: MAX_RAYS * ACCUM_STRIDE * 16, usage: GPUBufferUsage.STORAGE });
+  const wfCounterBuf = device.createBuffer({ size: 16, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST | GPUBufferUsage.COPY_SRC });
+  const wfCounterReadBuf = device.createBuffer({ size: 16, usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST });
+  const wfGenParamBuf = device.createBuffer({ size: 128, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
+  const wfTraceParamBuf = device.createBuffer({ size: 16, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
+  const wfShadeParamBuf = device.createBuffer({ size: 64, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
+  const wfAccumParamBuf = device.createBuffer({ size: 16, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
+
+  // --- Ray Gen pipeline ---
+  const wfGenLayout = device.createBindGroupLayout({ entries: [
+    { binding: 0, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'uniform' } },
+    { binding: 1, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } },
+    { binding: 2, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } },
+    { binding: 3, visibility: GPUShaderStage.COMPUTE, texture: { sampleType: 'float' } },
+  ]});
+  const wfGenPipeline = device.createComputePipeline({
+    layout: device.createPipelineLayout({ bindGroupLayouts: [wfGenLayout] }),
+    compute: { module: wfRayGenModule, entryPoint: 'main' },
+  });
+  const wfGenBG = device.createBindGroup({ layout: wfGenLayout, entries: [
+    { binding: 0, resource: { buffer: wfGenParamBuf } },
+    { binding: 1, resource: { buffer: wfRayBuf } },
+    { binding: 2, resource: { buffer: wfCounterBuf } },
+    { binding: 3, resource: ndTex.createView() },
+  ]});
+
+  // --- Trace pipeline (shared by closest + shadow) ---
+  const wfTraceLayout0 = device.createBindGroupLayout({ entries: [
+    { binding: 0, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'uniform' } },
+    { binding: 1, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } },
+    { binding: 2, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } },
+  ]});
+  // Group 1: scene data (same as pathtracer group 1, first 4 bindings)
+  const wfTraceLayout1 = device.createBindGroupLayout({ entries: [
+    { binding: 0, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } },
+    { binding: 1, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } },
+    { binding: 2, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } },
+    { binding: 3, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } },
+  ]});
+  const wfTracePipelineLayout = device.createPipelineLayout({ bindGroupLayouts: [wfTraceLayout0, wfTraceLayout1] });
+
+  const wfTraceClosestPipeline = device.createComputePipeline({
+    layout: wfTracePipelineLayout,
+    compute: { module: wfTraceModule, entryPoint: 'trace_closest' },
+  });
+  const wfTraceShadowPipeline = device.createComputePipeline({
+    layout: wfTracePipelineLayout,
+    compute: { module: wfTraceModule, entryPoint: 'trace_shadow' },
+  });
+
+  const wfTraceSceneBG = device.createBindGroup({ layout: wfTraceLayout1, entries: [
+    { binding: 0, resource: { buffer: vtxBuf } },
+    { binding: 1, resource: { buffer: nrmBuf } },
+    { binding: 2, resource: { buffer: triBuf } },
+    { binding: 3, resource: { buffer: bvhBuf } },
+  ]});
+  const wfTraceClosestBG = device.createBindGroup({ layout: wfTraceLayout0, entries: [
+    { binding: 0, resource: { buffer: wfTraceParamBuf } },
+    { binding: 1, resource: { buffer: wfRayBuf } },
+    { binding: 2, resource: { buffer: wfHitBuf } },
+  ]});
+  const wfTraceShadowBG = device.createBindGroup({ layout: wfTraceLayout0, entries: [
+    { binding: 0, resource: { buffer: wfTraceParamBuf } },
+    { binding: 1, resource: { buffer: wfShadowRayBuf } },
+    { binding: 2, resource: { buffer: wfShadowHitBuf } },
+  ]});
+
+  // --- Shade pipeline ---
+  const wfShadeLayout0 = device.createBindGroupLayout({ entries: [
+    { binding: 0, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'uniform' } },
+    { binding: 1, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } },
+    { binding: 2, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } },
+    { binding: 3, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } },
+    { binding: 4, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } },
+    { binding: 5, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } },
+    { binding: 6, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } },
+  ]});
+  const wfShadeLayout1 = device.createBindGroupLayout({ entries: [
+    { binding: 0, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } },
+    { binding: 1, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } },
+    { binding: 2, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } },
+    { binding: 3, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } },
+  ]});
+  const wfShadePipeline = device.createComputePipeline({
+    layout: device.createPipelineLayout({ bindGroupLayouts: [wfShadeLayout0, wfShadeLayout1] }),
+    compute: { module: wfShadeModule, entryPoint: 'main' },
+  });
+  const wfShadeBG0 = device.createBindGroup({ layout: wfShadeLayout0, entries: [
+    { binding: 0, resource: { buffer: wfShadeParamBuf } },
+    { binding: 1, resource: { buffer: wfRayBuf } },
+    { binding: 2, resource: { buffer: wfHitBuf } },
+    { binding: 3, resource: { buffer: wfShadowRayBuf } },
+    { binding: 4, resource: { buffer: wfBounceRayBuf } },
+    { binding: 5, resource: { buffer: wfAccumBuf } },
+    { binding: 6, resource: { buffer: wfCounterBuf } },
+  ]});
+  const wfShadeBG1 = device.createBindGroup({ layout: wfShadeLayout1, entries: [
+    { binding: 0, resource: { buffer: vtxBuf } },
+    { binding: 1, resource: { buffer: nrmBuf } },
+    { binding: 2, resource: { buffer: triBuf } },
+    { binding: 3, resource: { buffer: matBuf } },
+  ]});
+
+  // --- Accumulate pipeline ---
+  const wfAccumLayout = device.createBindGroupLayout({ entries: [
+    { binding: 0, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'uniform' } },
+    { binding: 1, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } },
+    { binding: 2, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } },
+    { binding: 3, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } },
+    { binding: 4, visibility: GPUShaderStage.COMPUTE, storageTexture: { access: 'write-only', format: 'rgba16float' } },
+    { binding: 5, visibility: GPUShaderStage.COMPUTE, storageTexture: { access: 'write-only', format: 'rgba16float' } },
+  ]});
+  const wfAccumShadowPipeline = device.createComputePipeline({
+    layout: device.createPipelineLayout({ bindGroupLayouts: [wfAccumLayout] }),
+    compute: { module: wfAccumModule, entryPoint: 'accumulate_shadows' },
+  });
+  const wfAccumWritePipeline = device.createComputePipeline({
+    layout: device.createPipelineLayout({ bindGroupLayouts: [wfAccumLayout] }),
+    compute: { module: wfAccumModule, entryPoint: 'write_output' },
+  });
+  const wfAccumBG = device.createBindGroup({ layout: wfAccumLayout, entries: [
+    { binding: 0, resource: { buffer: wfAccumParamBuf } },
+    { binding: 1, resource: { buffer: wfShadowRayBuf } },
+    { binding: 2, resource: { buffer: wfShadowHitBuf } },
+    { binding: 3, resource: { buffer: wfAccumBuf } },
+    { binding: 4, resource: noisyTex.createView() },
+    { binding: 5, resource: specNoisyTex.createView() },
+  ]});
+
+  rlog(`Wavefront PT initialized: ${MAX_RAYS} max rays, ${(MAX_RAYS * RAY_STRIDE * 16 / 1024 / 1024).toFixed(1)}MB ray buffer`);
+
   // Shared-memory tiled atrous for step=1 (first pass): 99 textureLoad → ~5 per thread
   const dnAtrousSMPipeline = device.createComputePipeline({
     layout: device.createPipelineLayout({ bindGroupLayouts: [dnAtrousLayout] }),
@@ -2111,14 +2266,81 @@ async function init() {
           u32[3] = frameIndex; // update seed for different noise pattern
           device.queue.writeBuffer(uniformBuffer, 0, ud);
         }
-        const ptPass = encoder.beginComputePass();
-        ptPass.setPipeline(computePipeline);
-        ptPass.setBindGroup(0, bg0);
-        ptPass.setBindGroup(1, bg1);
-        ptPass.setBindGroup(2, restirFrame === 0 ? bg2_A : bg2_B);
-        ptPass.setBindGroup(3, bg3);
-        ptPass.dispatchWorkgroups(Math.ceil(width/16), Math.ceil(height/16));
-        ptPass.end();
+        if (false /* TODO: useWavefront */) {
+          // === WAVEFRONT PATH TRACER ===
+          const wg256 = (n) => Math.ceil(n / 256);
+          const wg16 = [Math.ceil(width/16), Math.ceil(height/16)];
+          const sun = getSunDir();
+
+          // Reset counters
+          device.queue.writeBuffer(wfCounterBuf, 0, new Uint32Array([0, 0, 0, 0]));
+
+          // Ray Gen params
+          const gp = new Float32Array([
+            width, height, frameIndex, 0,
+            camera.pos[0], camera.pos[1], camera.pos[2], 0,
+            forward[0], forward[1], forward[2], 0,
+            right[0], right[1], right[2], 0,
+            up[0], up[1], up[2], fovFactor,
+          ]);
+          device.queue.writeBuffer(wfGenParamBuf, 0, gp);
+
+          // Stage 1: Ray Generation
+          { const p = encoder.beginComputePass(); p.setPipeline(wfGenPipeline); p.setBindGroup(0, wfGenBG); p.dispatchWorkgroups(...wg16); p.end(); }
+
+          let activeRays = width * height;
+          const maxBounces = 3;
+
+          for (let bounce = 0; bounce < maxBounces; bounce++) {
+            // Stage 2: BVH Trace (closest hit)
+            device.queue.writeBuffer(wfTraceParamBuf, 0, new Uint32Array([activeRays, 0, 0, 0]));
+            { const p = encoder.beginComputePass(); p.setPipeline(wfTraceClosestPipeline); p.setBindGroup(0, wfTraceClosestBG); p.setBindGroup(1, wfTraceSceneBG); p.dispatchWorkgroups(wg256(activeRays)); p.end(); }
+
+            // Reset shadow/bounce counters (keep active_rays)
+            device.queue.writeBuffer(wfCounterBuf, 0, new Uint32Array([0, 0, 0, 0]));
+
+            // Stage 3: Shade (generate shadow + bounce rays)
+            const sp = new Float32Array(16);
+            const spu = new Uint32Array(sp.buffer);
+            spu[0] = activeRays; spu[1] = frameIndex; spu[2] = maxBounces; spu[3] = 1; // sun_enabled
+            sp[4] = sun[0]; sp[5] = sun[1]; sp[6] = sun[2]; spu[7] = stats.emissiveTris;
+            sp[8] = width; sp[9] = height;
+            device.queue.writeBuffer(wfShadeParamBuf, 0, sp);
+            { const p = encoder.beginComputePass(); p.setPipeline(wfShadePipeline); p.setBindGroup(0, wfShadeBG0); p.setBindGroup(1, wfShadeBG1); p.dispatchWorkgroups(wg256(activeRays)); p.end(); }
+
+            // Stage 4: Shadow Trace
+            // TODO: read shadow counter from GPU (needs readback or indirect dispatch)
+            // For now, dispatch for all possible shadow rays
+            device.queue.writeBuffer(wfTraceParamBuf, 0, new Uint32Array([activeRays, 1, 0, 0]));
+            { const p = encoder.beginComputePass(); p.setPipeline(wfTraceShadowPipeline); p.setBindGroup(0, wfTraceShadowBG); p.setBindGroup(1, wfTraceSceneBG); p.dispatchWorkgroups(wg256(activeRays)); p.end(); }
+
+            // Stage 5: Accumulate shadow results
+            const ap = new Float32Array(4);
+            const apu = new Uint32Array(ap.buffer);
+            apu[0] = activeRays; ap[1] = width; ap[2] = height;
+            device.queue.writeBuffer(wfAccumParamBuf, 0, ap);
+            { const p = encoder.beginComputePass(); p.setPipeline(wfAccumShadowPipeline); p.setBindGroup(0, wfAccumBG); p.dispatchWorkgroups(wg256(activeRays)); p.end(); }
+
+            // TODO: for next bounce, swap bounce_rays → rays and read bounce counter
+            // For now, reduce activeRays by estimate (50% survive per bounce)
+            activeRays = Math.ceil(activeRays * 0.5);
+          }
+
+          // Write output textures from accumulator
+          device.queue.writeBuffer(wfAccumParamBuf, 0, new Float32Array([0, width, height, 0]));
+          { const p = encoder.beginComputePass(); p.setPipeline(wfAccumWritePipeline); p.setBindGroup(0, wfAccumBG); p.dispatchWorkgroups(...wg16); p.end(); }
+
+        } else {
+          // === MEGA-KERNEL PATH TRACER (existing) ===
+          const ptPass = encoder.beginComputePass();
+          ptPass.setPipeline(computePipeline);
+          ptPass.setBindGroup(0, bg0);
+          ptPass.setBindGroup(1, bg1);
+          ptPass.setBindGroup(2, restirFrame === 0 ? bg2_A : bg2_B);
+          ptPass.setBindGroup(3, bg3);
+          ptPass.dispatchWorkgroups(Math.ceil(width/16), Math.ceil(height/16));
+          ptPass.end();
+        }
       }
 
       // SHaRC resolve

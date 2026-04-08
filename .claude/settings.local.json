@@ -94,7 +94,10 @@
       "Bash(du -sh F:/*/)",
       "Bash(du -sm F:/*)",
       "Bash(kill %1)",
-      "Bash(wait)"
+      "Bash(wait)",
+      "Bash(RUST_LOG=info build/release/ignis-native.exe)",
+      "Bash(RUST_LOG=info,naga=warn build/release/ignis-native.exe)",
+      "Bash(RUST_LOG=error build/release/ignis-native.exe)"
     ]
   }
 }

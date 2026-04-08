@@ -11,3 +11,4 @@ client.log
 __pycache__/
 .DS_Store
 node_modules/
+native/build/

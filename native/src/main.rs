@@ -276,7 +276,7 @@ impl App {
 
         // Create GPU renderer with scene data
         if let (Some(scene), Some(bvh)) = (self.scene.as_ref(), self.bvh.as_ref()) {
-            let renderer = gpu::GpuRenderer::new(&device, &queue, scene, bvh, config.width, config.height);
+            let renderer = gpu::GpuRenderer::new(&device, &queue, scene, bvh, config.width, config.height, config.format);
             self.renderer = Some(renderer);
         }
 

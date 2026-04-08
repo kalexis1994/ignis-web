@@ -102,6 +102,7 @@ impl GpuRenderer {
         bvh: &BVH,
         width: u32,
         height: u32,
+        surface_format: wgpu::TextureFormat,
     ) -> Self {
         let t0 = Instant::now();
 
@@ -269,9 +270,15 @@ impl GpuRenderer {
             mapped_at_creation: false,
         });
 
-        // SHaRC dummy buffers
-        let sharc_dummy = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("sharc_dummy"),
+        // SHaRC dummy buffers (separate for RW and RO to avoid usage conflict)
+        let sharc_rw = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("sharc_rw"),
+            size: 256,
+            usage: wgpu::BufferUsages::STORAGE,
+            mapped_at_creation: false,
+        });
+        let sharc_ro = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("sharc_ro"),
             size: 256,
             usage: wgpu::BufferUsages::STORAGE,
             mapped_at_creation: false,
@@ -283,9 +290,15 @@ impl GpuRenderer {
             mapped_at_creation: false,
         });
 
-        // ReSTIR dummy buffers
-        let restir_dummy = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("restir_dummy"),
+        // ReSTIR dummy buffers (separate for RW and RO)
+        let restir_rw = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("restir_rw"),
+            size: 256,
+            usage: wgpu::BufferUsages::STORAGE,
+            mapped_at_creation: false,
+        });
+        let restir_ro = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("restir_ro"),
             size: 256,
             usage: wgpu::BufferUsages::STORAGE,
             mapped_at_creation: false,
@@ -403,10 +416,10 @@ impl GpuRenderer {
             layout: &bg2_layout,
             entries: &[
                 wgpu::BindGroupEntry { binding: 0, resource: sharc_params_buf.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 1, resource: sharc_dummy.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 2, resource: sharc_dummy.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 3, resource: restir_dummy.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 4, resource: restir_dummy.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 1, resource: sharc_rw.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 2, resource: sharc_ro.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 3, resource: restir_rw.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 4, resource: restir_ro.as_entire_binding() },
             ],
         });
 
@@ -469,7 +482,7 @@ impl GpuRenderer {
             bind_group_layouts: &[&blit_bgl],
             push_constant_ranges: &[],
         });
-        let surface_format = wgpu::TextureFormat::Bgra8Unorm; // common surface format
+        // Use actual surface format passed from init
         let blit_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
             label: Some("blit"),
             layout: Some(&blit_layout),
@@ -526,11 +539,11 @@ impl GpuRenderer {
             resolution: [self.width as f32, self.height as f32],
             sample_count: 1,
             frame_seed: self.frame_index,
-            camera_pos: [0.0, 5.0, 0.0],
+            camera_pos: [0.0, 6.0, 0.0],
             _pad0: 0.0,
-            camera_forward: [0.0, 0.0, -1.0],
+            camera_forward: [1.0, 0.0, 0.0],
             _pad1: 0.0,
-            camera_right: [1.0, 0.0, 0.0],
+            camera_right: [0.0, 0.0, 1.0],
             _pad2: 0.0,
             camera_up: [0.0, 1.0, 0.0],
             fov_factor,
