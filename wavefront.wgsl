@@ -55,6 +55,21 @@ struct Material {
 @group(1) @binding(3) var<storage, read> bvh_nodes: array<BVHNode>;
 @group(1) @binding(4) var<storage, read> material_buf: array<Material>;
 
+// Ray compaction queues — ping-pong between bounces. Each bounce reads
+// from one and pushes survivors to the other via atomicAdd on counts.
+// dispatch_args is updated by prep_dispatch between bounces to size the
+// indirect dispatch to just the active ray count.
+@group(2) @binding(0) var<storage, read_write> queue_a: array<u32>;
+@group(2) @binding(1) var<storage, read_write> queue_b: array<u32>;
+@group(2) @binding(2) var<storage, read_write> counts: array<atomic<u32>, 2>;
+@group(2) @binding(3) var<storage, read_write> dispatch_args: array<u32, 3>;
+
+// Pipeline specialization constants — set at pipeline creation so the
+// same WGSL source compiles to an a→b or b→a bounce (and a prep that
+// reads either queue_a's count or queue_b's count) without a uniform.
+override SRC_QUEUE: u32 = 0u;   // bounce: 0 reads queue_a, 1 reads queue_b
+override READ_IDX: u32 = 0u;    // prep: which count feeds the next bounce
+
 const PI: f32 = 3.14159265359;
 const TWO_PI: f32 = 6.28318530718;
 const INV_PI: f32 = 0.31830988618;
@@ -348,6 +363,11 @@ fn generate(@builtin(global_invocation_id) gid: vec3u) {
   rs.hit_t = 1e4;
   store_ray_state(idx, rs);
 
+  // Initialize queue_a with all pixel indices — every primary ray starts
+  // alive, so the first bounce reads count_a = W*H (set by JS) and sees
+  // every pixel in queue_a[idx] = idx.
+  queue_a[idx] = idx;
+
   // Default albedo (white) — overwritten by bounce kernel on first hit
   textureStore(albedo_out, vec2i(pixel), vec4f(1.0, 1.0, 1.0, 1.0));
   textureStore(denoise_nd_out, vec2i(pixel), vec4f(0.0, 1.0, 0.0, 1e4));
@@ -358,19 +378,27 @@ fn generate(@builtin(global_invocation_id) gid: vec3u) {
 // Reads ray_state, traces, shades with NEE sun, samples cosine
 // hemisphere for next ray, updates state.
 // ============================================================
-@compute @workgroup_size(8, 8)
+@compute @workgroup_size(64)
 fn bounce(@builtin(global_invocation_id) gid: vec3u) {
-  let pixel = vec2u(gid.xy);
-  let res = vec2u(uniforms.resolution);
-  if pixel.x >= res.x || pixel.y >= res.y { return; }
-  let idx = pixel.y * res.x + pixel.x;
+  let qi = gid.x;
+  let src_count = atomicLoad(&counts[SRC_QUEUE]);
+  if qi >= src_count { return; }
 
-  // Clear shadow request upfront — any of the early-exit paths below
-  // (dead ray, miss-to-sky, unlit, back-hemisphere BSDF sample) will
-  // leave it zero so shadow_trace skips this pixel this bounce.
+  // Read pixel index from the source queue
+  var idx: u32;
+  if SRC_QUEUE == 0u { idx = queue_a[qi]; } else { idx = queue_b[qi]; }
+
+  let res = vec2u(uniforms.resolution);
+  let pixel = vec2u(idx % res.x, idx / res.x);
+
+  // Clear shadow request upfront — early-exit paths (miss, unlit, back-
+  // hemisphere BSDF sample) leave it zero so shadow_trace skips this
+  // pixel this bounce.
   shadow_req[idx * 3u] = vec4f(0.0);
 
   var rs = load_ray_state(idx);
+  // Rays only get into the queue when alive, so this guard is redundant
+  // but harmless — cheaper than hoping optimiser strips it.
   if (rs.flags & FLAG_ALIVE) == 0u { return; }
 
   var rng = rs.rng_state;
@@ -485,6 +513,32 @@ fn bounce(@builtin(global_invocation_id) gid: vec3u) {
 
   rs.rng_state = rng;
   store_ray_state(idx, rs);
+
+  // If still alive, push pixel index onto the destination queue so the
+  // next bounce only touches this pixel. Dead rays (miss/unlit/RR/max-
+  // bounces) skip this and are naturally compacted out.
+  if (rs.flags & FLAG_ALIVE) != 0u {
+    let ni = atomicAdd(&counts[1u - SRC_QUEUE], 1u);
+    if SRC_QUEUE == 0u { queue_b[ni] = idx; } else { queue_a[ni] = idx; }
+  }
+}
+
+// ============================================================
+// Kernel: PREP_DISPATCH — 1-thread kernel that runs between bounces.
+// Reads the count that the next bounce will consume, writes it into
+// dispatch_args (rounded up to workgroups), and zeroes the count that
+// the next bounce will *fill*. READ_IDX is a pipeline specialization
+// constant: 0 = next bounce reads queue_a, 1 = next reads queue_b.
+// ============================================================
+@compute @workgroup_size(1)
+fn prep_dispatch() {
+  let count = atomicLoad(&counts[READ_IDX]);
+  let wg = (count + 63u) / 64u;
+  dispatch_args[0] = wg;
+  dispatch_args[1] = 1u;
+  dispatch_args[2] = 1u;
+  // Zero the OTHER count so the upcoming bounce can fill it from zero
+  atomicStore(&counts[1u - READ_IDX], 0u);
 }
 
 // ============================================================
@@ -510,9 +564,14 @@ fn shadow_trace(@builtin(global_invocation_id) gid: vec3u) {
   let dir    = shadow_req[sbase + 1u].xyz;
   let contrib = shadow_req[sbase + 2u].xyz;
 
+  // Consume the request — mark invalid so a later bounce that skips this
+  // pixel (because it was compacted out of the queue) doesn't re-process
+  // stale data. Compaction means the bounce kernel no longer touches
+  // every pixel each iteration, so clearing upfront there isn't enough.
+  shadow_req[sbase] = vec4f(0.0);
+
   if trace_shadow(origin, dir, INF) { return; } // sun occluded
 
-  // Add contribution to radiance slot (ray_state[idx*4 + 3].xyz)
   let rbase = idx * 4u + 3u;
   let cur = ray_state[rbase];
   ray_state[rbase] = vec4f(cur.xyz + contrib, cur.w);

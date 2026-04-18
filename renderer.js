@@ -114,6 +114,20 @@ async function init() {
     usage: GPUBufferUsage.STORAGE,
   });
 
+  // Compaction queues — ping-pong u32 pixel indices per bounce. counts
+  // holds the two atomic counters; dispatch_args is the indirect args
+  // buffer that prep_dispatch updates between bounces.
+  const queueABuf = device.createBuffer({ size: rw * rh * 4, usage: GPUBufferUsage.STORAGE });
+  const queueBBuf = device.createBuffer({ size: rw * rh * 4, usage: GPUBufferUsage.STORAGE });
+  const countsBuf = device.createBuffer({
+    size: 8, // 2 atomic u32
+    usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
+  });
+  const dispatchArgsBuf = device.createBuffer({
+    size: 16, // 3 u32 + padding (16-byte alignment for indirect args in some drivers)
+    usage: GPUBufferUsage.STORAGE | GPUBufferUsage.INDIRECT | GPUBufferUsage.COPY_DST,
+  });
+
   // Uniforms — 96 bytes, matches Uniforms struct in wavefront.wgsl.
   const uniformBuf = device.createBuffer({
     size: 96, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
@@ -146,12 +160,23 @@ async function init() {
       { binding: 4, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } },
     ],
   });
-  const pipelineLayout = device.createPipelineLayout({ bindGroupLayouts: [bgl0, bgl1] });
+  const bgl2 = device.createBindGroupLayout({
+    entries: [
+      { binding: 0, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } }, // queue_a
+      { binding: 1, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } }, // queue_b
+      { binding: 2, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } }, // counts (atomic)
+      { binding: 3, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } }, // dispatch_args
+    ],
+  });
+  const pipelineLayout = device.createPipelineLayout({ bindGroupLayouts: [bgl0, bgl1, bgl2] });
 
-  const genPipeline    = device.createComputePipeline({ layout: pipelineLayout, compute: { module: wavefrontModule, entryPoint: 'generate'     } });
-  const bouncePipeline = device.createComputePipeline({ layout: pipelineLayout, compute: { module: wavefrontModule, entryPoint: 'bounce'       } });
-  const shadowPipeline = device.createComputePipeline({ layout: pipelineLayout, compute: { module: wavefrontModule, entryPoint: 'shadow_trace' } });
-  const finPipeline    = device.createComputePipeline({ layout: pipelineLayout, compute: { module: wavefrontModule, entryPoint: 'finalize'     } });
+  const genPipeline     = device.createComputePipeline({ layout: pipelineLayout, compute: { module: wavefrontModule, entryPoint: 'generate'     } });
+  const bouncePipelineA = device.createComputePipeline({ layout: pipelineLayout, compute: { module: wavefrontModule, entryPoint: 'bounce', constants: { SRC_QUEUE: 0 } } });
+  const bouncePipelineB = device.createComputePipeline({ layout: pipelineLayout, compute: { module: wavefrontModule, entryPoint: 'bounce', constants: { SRC_QUEUE: 1 } } });
+  const prepPipelineA   = device.createComputePipeline({ layout: pipelineLayout, compute: { module: wavefrontModule, entryPoint: 'prep_dispatch', constants: { READ_IDX: 0 } } });
+  const prepPipelineB   = device.createComputePipeline({ layout: pipelineLayout, compute: { module: wavefrontModule, entryPoint: 'prep_dispatch', constants: { READ_IDX: 1 } } });
+  const shadowPipeline  = device.createComputePipeline({ layout: pipelineLayout, compute: { module: wavefrontModule, entryPoint: 'shadow_trace' } });
+  const finPipeline     = device.createComputePipeline({ layout: pipelineLayout, compute: { module: wavefrontModule, entryPoint: 'finalize'     } });
 
   const bg0 = device.createBindGroup({
     layout: bgl0,
@@ -172,6 +197,15 @@ async function init() {
       { binding: 2, resource: { buffer: triBuf } },
       { binding: 3, resource: { buffer: bvhBuf } },
       { binding: 4, resource: { buffer: matBuf } },
+    ],
+  });
+  const bg2 = device.createBindGroup({
+    layout: bgl2,
+    entries: [
+      { binding: 0, resource: { buffer: queueABuf } },
+      { binding: 1, resource: { buffer: queueBBuf } },
+      { binding: 2, resource: { buffer: countsBuf } },
+      { binding: 3, resource: { buffer: dispatchArgsBuf } },
     ],
   });
 
@@ -363,32 +397,55 @@ async function init() {
     frameIdx++;
     writeUniforms();
 
+    // Reset queue state for the frame: all pixels start alive in queue_a
+    // (generate writes queue_a[idx]=idx), so count_a=W*H, count_b=0.
+    // dispatch_args seeds the first bounce's indirect dispatch.
+    const pixelCount = rw * rh;
+    device.queue.writeBuffer(countsBuf, 0, new Uint32Array([pixelCount, 0]));
+    device.queue.writeBuffer(dispatchArgsBuf, 0, new Uint32Array([Math.ceil(pixelCount / 64), 1, 1, 0]));
+
     const enc = device.createCommandEncoder();
     {
       const p = enc.beginComputePass();
       p.setPipeline(genPipeline);
       p.setBindGroup(0, bg0);
       p.setBindGroup(1, bg1);
+      p.setBindGroup(2, bg2);
       p.dispatchWorkgroups(Math.ceil(rw/8), Math.ceil(rh/8));
       p.end();
     }
     for (let b = 0; b < maxBounces; b++) {
-      // bounce: trace + shade + enqueue shadow request
+      const srcIsA = (b % 2) === 0;
+      // bounce — indirect dispatch, 1D
       {
         const p = enc.beginComputePass();
-        p.setPipeline(bouncePipeline);
+        p.setPipeline(srcIsA ? bouncePipelineA : bouncePipelineB);
         p.setBindGroup(0, bg0);
         p.setBindGroup(1, bg1);
-        p.dispatchWorkgroups(Math.ceil(rw/8), Math.ceil(rh/8));
+        p.setBindGroup(2, bg2);
+        p.dispatchWorkgroupsIndirect(dispatchArgsBuf, 0);
         p.end();
       }
-      // shadow_trace: consume shadow requests, accumulate unblocked contrib
+      // shadow_trace — still 2D over all pixels (consume flagged requests)
       {
         const p = enc.beginComputePass();
         p.setPipeline(shadowPipeline);
         p.setBindGroup(0, bg0);
         p.setBindGroup(1, bg1);
+        p.setBindGroup(2, bg2);
         p.dispatchWorkgroups(Math.ceil(rw/8), Math.ceil(rh/8));
+        p.end();
+      }
+      // prep_dispatch: update args + zero next-dst count for the NEXT
+      // bounce. Skip after the final bounce.
+      if (b < maxBounces - 1) {
+        const nextReadsA = ((b + 1) % 2) === 0;
+        const p = enc.beginComputePass();
+        p.setPipeline(nextReadsA ? prepPipelineA : prepPipelineB);
+        p.setBindGroup(0, bg0);
+        p.setBindGroup(1, bg1);
+        p.setBindGroup(2, bg2);
+        p.dispatchWorkgroups(1);
         p.end();
       }
     }
@@ -397,6 +454,7 @@ async function init() {
       p.setPipeline(finPipeline);
       p.setBindGroup(0, bg0);
       p.setBindGroup(1, bg1);
+      p.setBindGroup(2, bg2);
       p.dispatchWorkgroups(Math.ceil(rw/8), Math.ceil(rh/8));
       p.end();
     }
