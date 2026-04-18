@@ -197,14 +197,13 @@ async function init() {
   function camVectors() {
     const cy = Math.cos(camera.yaw), sy = Math.sin(camera.yaw);
     const cp = Math.cos(camera.pitch), sp = Math.sin(camera.pitch);
+    // Legacy convention (post "X-flip fix" commit 22a04c3): negated right
+    // vector cancels the horizontal mirror you get otherwise from glTF's
+    // right-handed coords + our +Z forward camera. up is computed directly
+    // from pitch/yaw (not via cross) to stay consistent with this handedness.
     const forward = [cp*sy, sp, cp*cy];
-    const right   = [cy, 0, -sy];
-    // up = forward × right (right-handed, gives world +Y when looking along +Z)
-    const up = [
-      forward[1]*right[2] - forward[2]*right[1],
-      forward[2]*right[0] - forward[0]*right[2],
-      forward[0]*right[1] - forward[1]*right[0],
-    ];
+    const right   = [-cy, 0, sy];
+    const up      = [-sp*sy, cp, -sp*cy];
     return { forward, right, up };
   }
 
