@@ -239,13 +239,14 @@ fn trace_shadow(origin: vec3f, dir: vec3f, max_t: f32) -> bool {
 // ============================================================
 // Sky — simple analytic gradient (v1). Sun is NOT drawn here because
 // it's accounted for via NEE as a delta light — drawing the disk too
-// would double-count. Env CDF comes back later.
+// would double-count. Brightness tuned high enough for indoor scenes
+// (Sponza) to pick up visible indirect via skylight. Env CDF later.
 // ============================================================
 fn sky_color(dir: vec3f) -> vec3f {
   let t = clamp(dir.y * 0.5 + 0.5, 0.0, 1.0);
   let horizon = vec3f(0.9, 0.85, 0.75);
-  let zenith = vec3f(0.3, 0.55, 1.0);
-  return mix(horizon, zenith, t) * 0.6;
+  let zenith = vec3f(0.4, 0.6, 1.0);
+  return mix(horizon, zenith, t) * 3.0;
 }
 
 // ============================================================
