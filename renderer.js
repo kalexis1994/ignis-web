@@ -199,10 +199,11 @@ async function init() {
     const cp = Math.cos(camera.pitch), sp = Math.sin(camera.pitch);
     const forward = [cp*sy, sp, cp*cy];
     const right   = [cy, 0, -sy];
+    // up = forward × right (right-handed, gives world +Y when looking along +Z)
     const up = [
-      right[1]*forward[2] - right[2]*forward[1],
-      right[2]*forward[0] - right[0]*forward[2],
-      right[0]*forward[1] - right[1]*forward[0],
+      forward[1]*right[2] - forward[2]*right[1],
+      forward[2]*right[0] - forward[0]*right[2],
+      forward[0]*right[1] - forward[1]*right[0],
     ];
     return { forward, right, up };
   }
