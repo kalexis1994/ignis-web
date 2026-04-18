@@ -237,17 +237,15 @@ fn trace_shadow(origin: vec3f, dir: vec3f, max_t: f32) -> bool {
 }
 
 // ============================================================
-// Sky — simple analytic gradient (v1). Env CDF comes back later.
+// Sky — simple analytic gradient (v1). Sun is NOT drawn here because
+// it's accounted for via NEE as a delta light — drawing the disk too
+// would double-count. Env CDF comes back later.
 // ============================================================
 fn sky_color(dir: vec3f) -> vec3f {
   let t = clamp(dir.y * 0.5 + 0.5, 0.0, 1.0);
   let horizon = vec3f(0.9, 0.85, 0.75);
   let zenith = vec3f(0.3, 0.55, 1.0);
-  let base = mix(horizon, zenith, t);
-  // analytic sun disk
-  let sun_c = dot(dir, uniforms.sun_dir);
-  let sun = SUN_RADIANCE * smoothstep(SUN_COS_HALF - 0.0002, SUN_COS_HALF, sun_c);
-  return base * 0.6 + sun;
+  return mix(horizon, zenith, t) * 0.6;
 }
 
 // ============================================================
@@ -417,15 +415,15 @@ fn bounce(@builtin(global_invocation_id) gid: vec3u) {
   // Lambertian BSDF color (v1)
   let albedo = mat_base_color(mat) * (1.0 - mat_metallic(mat)) * INV_PI;
 
-  // NEE to sun (cone sample)
-  let u_sun = rand2(&rng);
-  let sun_dir = sample_cone(uniforms.sun_dir, SUN_COS_HALF, u_sun);
-  let nsl = dot(normal, sun_dir);
+  // NEE sun — delta light (directional). No cone sampling, no MIS.
+  // SUN_RADIANCE treated as effective incoming irradiance * (1/cos) so
+  // that multiplying by cos gives correct shading. Simpler than proper
+  // solid-angle NEE and less noisy at 1 spp.
+  let nsl = dot(normal, uniforms.sun_dir);
   if nsl > 0.0 {
     let sun_origin = ray_offset(hit_pos, geo_normal);
-    if !trace_shadow(sun_origin, sun_dir, INF) {
+    if !trace_shadow(sun_origin, uniforms.sun_dir, INF) {
       var direct = rs.throughput * albedo * SUN_RADIANCE * nsl;
-      // Clamp indirect fireflies
       if b > 0u {
         let s = abs(direct.x) + abs(direct.y) + abs(direct.z);
         if s > CLAMP_INDIRECT { direct *= CLAMP_INDIRECT / s; }
