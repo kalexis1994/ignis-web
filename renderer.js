@@ -192,7 +192,7 @@ async function init() {
       (bb.sceneMin[1] + bb.sceneMax[1]) * 0.5,
       (bb.sceneMin[2] + bb.sceneMax[2]) * 0.5,
     ],
-    yaw: 0, pitch: 0, fov: 70,
+    yaw: 0, pitch: 0, fov: 90,
   };
   function camVectors() {
     const cy = Math.cos(camera.yaw), sy = Math.sin(camera.yaw);
