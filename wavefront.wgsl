@@ -43,6 +43,11 @@ struct Material {
 @group(0) @binding(2) var denoise_nd_out: texture_storage_2d<rgba16float, write>;
 @group(0) @binding(3) var albedo_out: texture_storage_2d<rgba8unorm, write>;
 @group(0) @binding(4) var<storage, read_write> ray_state: array<vec4f>;
+// Shadow request buffer: 3 vec4f per pixel, overwritten each bounce.
+//   [0] = (origin.xyz, valid_flag: 1.0 = trace it, 0.0 = skip)
+//   [1] = (dir.xyz, _pad)
+//   [2] = (contribution.xyz, _pad) — added to radiance if shadow ray unblocked
+@group(0) @binding(5) var<storage, read_write> shadow_req: array<vec4f>;
 
 @group(1) @binding(0) var<storage, read> vertices: array<vec4f>;
 @group(1) @binding(1) var<storage, read> vert_normals: array<vec4f>;
@@ -360,6 +365,11 @@ fn bounce(@builtin(global_invocation_id) gid: vec3u) {
   if pixel.x >= res.x || pixel.y >= res.y { return; }
   let idx = pixel.y * res.x + pixel.x;
 
+  // Clear shadow request upfront — any of the early-exit paths below
+  // (dead ray, miss-to-sky, unlit, back-hemisphere BSDF sample) will
+  // leave it zero so shadow_trace skips this pixel this bounce.
+  shadow_req[idx * 3u] = vec4f(0.0);
+
   var rs = load_ray_state(idx);
   if (rs.flags & FLAG_ALIVE) == 0u { return; }
 
@@ -423,19 +433,23 @@ fn bounce(@builtin(global_invocation_id) gid: vec3u) {
   let base = mat_base_color(mat);
   let albedo = base * INV_PI;
 
-  // NEE sun — delta light (directional). No cone sampling, no MIS.
+  // NEE sun — delta light (directional). Queue shadow request for the
+  // dedicated shadow_trace kernel instead of tracing inline. Smaller
+  // bounce kernel → less register pressure → more occupancy on Adreno.
   let nsl = dot(normal, uniforms.sun_dir);
   if nsl > 0.0 {
-    let sun_origin = ray_offset(hit_pos, geo_normal);
-    if !trace_shadow(sun_origin, uniforms.sun_dir, INF) {
-      var direct = rs.throughput * albedo * SUN_RADIANCE * nsl;
-      if b > 0u {
-        let s = abs(direct.x) + abs(direct.y) + abs(direct.z);
-        if s > CLAMP_INDIRECT { direct *= CLAMP_INDIRECT / s; }
-      }
-      rs.radiance += direct;
+    var contribution = rs.throughput * albedo * SUN_RADIANCE * nsl;
+    if b > 0u {
+      let s = abs(contribution.x) + abs(contribution.y) + abs(contribution.z);
+      if s > CLAMP_INDIRECT { contribution *= CLAMP_INDIRECT / s; }
     }
+    let sun_origin = ray_offset(hit_pos, geo_normal);
+    let sbase = idx * 3u;
+    shadow_req[sbase]      = vec4f(sun_origin,         1.0);
+    shadow_req[sbase + 1u] = vec4f(uniforms.sun_dir,   0.0);
+    shadow_req[sbase + 2u] = vec4f(contribution,       0.0);
   }
+  // else: upfront clear leaves shadow_req with valid=0 → skipped
 
   // Sample next direction: cosine hemisphere
   let u_bsdf = rand2(&rng);
@@ -471,6 +485,37 @@ fn bounce(@builtin(global_invocation_id) gid: vec3u) {
 
   rs.rng_state = rng;
   store_ray_state(idx, rs);
+}
+
+// ============================================================
+// Kernel: SHADOW_TRACE — dedicated shadow ray kernel. Reads each
+// pixel's queued NEE request (origin + dir + contribution) and traces
+// an any-hit BVH. Unblocked → accumulate contribution into radiance.
+// One thread per pixel; each pixel has at most one request per bounce
+// so the non-atomic read-modify-write on ray_state radiance is safe.
+// Work is uniform (pure BVH, no material eval) → good cache behavior.
+// ============================================================
+@compute @workgroup_size(8, 8)
+fn shadow_trace(@builtin(global_invocation_id) gid: vec3u) {
+  let pixel = vec2u(gid.xy);
+  let res = vec2u(uniforms.resolution);
+  if pixel.x >= res.x || pixel.y >= res.y { return; }
+  let idx = pixel.y * res.x + pixel.x;
+
+  let sbase = idx * 3u;
+  let r0 = shadow_req[sbase];
+  if r0.w < 0.5 { return; } // no request this bounce
+
+  let origin = r0.xyz;
+  let dir    = shadow_req[sbase + 1u].xyz;
+  let contrib = shadow_req[sbase + 2u].xyz;
+
+  if trace_shadow(origin, dir, INF) { return; } // sun occluded
+
+  // Add contribution to radiance slot (ray_state[idx*4 + 3].xyz)
+  let rbase = idx * 4u + 3u;
+  let cur = ray_state[rbase];
+  ray_state[rbase] = vec4f(cur.xyz + contrib, cur.w);
 }
 
 // ============================================================

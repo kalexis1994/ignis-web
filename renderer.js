@@ -107,6 +107,12 @@ async function init() {
     size: rw * rh * 64,
     usage: GPUBufferUsage.STORAGE,
   });
+  // Shadow request buffer: 3 vec4f per pixel = 48 bytes. Written by
+  // bounce (NEE request) and consumed by shadow_trace.
+  const shadowReqBuf = device.createBuffer({
+    size: rw * rh * 48,
+    usage: GPUBufferUsage.STORAGE,
+  });
 
   // Uniforms — 96 bytes, matches Uniforms struct in wavefront.wgsl.
   const uniformBuf = device.createBuffer({
@@ -119,7 +125,7 @@ async function init() {
   const displaySrc = await fetch('display.wgsl').then(r => r.text());
   const displayModule = device.createShaderModule({ code: displaySrc });
 
-  // Explicit bind group layouts — shared across all 3 kernels so we can
+  // Explicit bind group layouts — shared across all kernels so we can
   // bind the same resources regardless of which bindings each kernel uses.
   const bgl0 = device.createBindGroupLayout({
     entries: [
@@ -128,6 +134,7 @@ async function init() {
       { binding: 2, visibility: GPUShaderStage.COMPUTE, storageTexture:{ access: 'write-only', format: 'rgba16float' } },
       { binding: 3, visibility: GPUShaderStage.COMPUTE, storageTexture:{ access: 'write-only', format: 'rgba8unorm'  } },
       { binding: 4, visibility: GPUShaderStage.COMPUTE, buffer:        { type: 'storage' } },
+      { binding: 5, visibility: GPUShaderStage.COMPUTE, buffer:        { type: 'storage' } },
     ],
   });
   const bgl1 = device.createBindGroupLayout({
@@ -141,9 +148,10 @@ async function init() {
   });
   const pipelineLayout = device.createPipelineLayout({ bindGroupLayouts: [bgl0, bgl1] });
 
-  const genPipeline    = device.createComputePipeline({ layout: pipelineLayout, compute: { module: wavefrontModule, entryPoint: 'generate' } });
-  const bouncePipeline = device.createComputePipeline({ layout: pipelineLayout, compute: { module: wavefrontModule, entryPoint: 'bounce'   } });
-  const finPipeline    = device.createComputePipeline({ layout: pipelineLayout, compute: { module: wavefrontModule, entryPoint: 'finalize' } });
+  const genPipeline    = device.createComputePipeline({ layout: pipelineLayout, compute: { module: wavefrontModule, entryPoint: 'generate'     } });
+  const bouncePipeline = device.createComputePipeline({ layout: pipelineLayout, compute: { module: wavefrontModule, entryPoint: 'bounce'       } });
+  const shadowPipeline = device.createComputePipeline({ layout: pipelineLayout, compute: { module: wavefrontModule, entryPoint: 'shadow_trace' } });
+  const finPipeline    = device.createComputePipeline({ layout: pipelineLayout, compute: { module: wavefrontModule, entryPoint: 'finalize'     } });
 
   const bg0 = device.createBindGroup({
     layout: bgl0,
@@ -153,6 +161,7 @@ async function init() {
       { binding: 2, resource: ndTex.createView() },
       { binding: 3, resource: albTex.createView() },
       { binding: 4, resource: { buffer: rayStateBuf } },
+      { binding: 5, resource: { buffer: shadowReqBuf } },
     ],
   });
   const bg1 = device.createBindGroup({
@@ -364,12 +373,24 @@ async function init() {
       p.end();
     }
     for (let b = 0; b < maxBounces; b++) {
-      const p = enc.beginComputePass();
-      p.setPipeline(bouncePipeline);
-      p.setBindGroup(0, bg0);
-      p.setBindGroup(1, bg1);
-      p.dispatchWorkgroups(Math.ceil(rw/8), Math.ceil(rh/8));
-      p.end();
+      // bounce: trace + shade + enqueue shadow request
+      {
+        const p = enc.beginComputePass();
+        p.setPipeline(bouncePipeline);
+        p.setBindGroup(0, bg0);
+        p.setBindGroup(1, bg1);
+        p.dispatchWorkgroups(Math.ceil(rw/8), Math.ceil(rh/8));
+        p.end();
+      }
+      // shadow_trace: consume shadow requests, accumulate unblocked contrib
+      {
+        const p = enc.beginComputePass();
+        p.setPipeline(shadowPipeline);
+        p.setBindGroup(0, bg0);
+        p.setBindGroup(1, bg1);
+        p.dispatchWorkgroups(Math.ceil(rw/8), Math.ceil(rh/8));
+        p.end();
+      }
     }
     {
       const p = enc.beginComputePass();
