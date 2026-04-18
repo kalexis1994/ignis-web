@@ -16,7 +16,7 @@ struct Uniforms {
   camera_forward: vec3f, _pad1: f32,
   camera_right: vec3f, _pad2: f32,
   camera_up: vec3f,    fov_factor: f32,
-  sun_dir: vec3f,      _pad3: f32,
+  sun_dir: vec3f,      frames_still: u32,
 };
 
 struct BVHNode { aabb_min: vec3f, left_first: u32, aabb_max: vec3f, tri_count: u32, };
@@ -69,6 +69,13 @@ struct Material {
 // reads either queue_a's count or queue_b's count) without a uniform.
 override SRC_QUEUE: u32 = 0u;   // bounce: 0 reads queue_a, 1 reads queue_b
 override READ_IDX: u32 = 0u;    // prep: which count feeds the next bounce
+
+// Temporal accumulation textures (group 3, ping-pong per frame).
+// Separate from group 0 so only the composite kernel needs this group;
+// gen/bounce/etc. use a leaner pipeline layout without it.
+@group(3) @binding(0) var noisy_read: texture_2d<f32>;    // curr frame's finalize output
+@group(3) @binding(1) var accum_prev: texture_2d<f32>;    // previous frame's accumulator
+@group(3) @binding(2) var accum_new:  texture_storage_2d<rgba16float, write>;
 
 const PI: f32 = 3.14159265359;
 const TWO_PI: f32 = 6.28318530718;
@@ -575,6 +582,27 @@ fn shadow_trace(@builtin(global_invocation_id) gid: vec3u) {
   let rbase = idx * 4u + 3u;
   let cur = ray_state[rbase];
   ray_state[rbase] = vec4f(cur.xyz + contrib, cur.w);
+}
+
+// ============================================================
+// Kernel: COMPOSITE — temporal accumulation. Reads the current frame's
+// noisy output and the previous accumulator; writes the blend to the
+// new accumulator. When the camera is still, frames_still grows and
+// alpha shrinks, so the history dominates and noise averages out.
+// On camera move, JS resets frames_still to 0, alpha=1, and the new
+// accumulator fully replaces history in one frame.
+// ============================================================
+@compute @workgroup_size(8, 8)
+fn composite(@builtin(global_invocation_id) gid: vec3u) {
+  let pixel = vec2u(gid.xy);
+  let res = vec2u(uniforms.resolution);
+  if pixel.x >= res.x || pixel.y >= res.y { return; }
+
+  let curr = textureLoad(noisy_read, vec2i(pixel), 0).rgb;
+  let prev = textureLoad(accum_prev, vec2i(pixel), 0).rgb;
+  let alpha = 1.0 / f32(uniforms.frames_still + 1u);
+  let mixed = mix(prev, curr, alpha);
+  textureStore(accum_new, vec2i(pixel), vec4f(mixed, 1.0));
 }
 
 // ============================================================

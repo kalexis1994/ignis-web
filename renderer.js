@@ -101,6 +101,12 @@ async function init() {
     size: [rw, rh], format: 'rgba8unorm',
     usage: GPUTextureUsage.STORAGE_BINDING,
   });
+  // Temporal accumulation ping-pong textures. Each frame reads from one
+  // and writes to the other; display samples whichever was just written.
+  const accumTex = [0, 1].map(() => device.createTexture({
+    size: [rw, rh], format: 'rgba16float',
+    usage: GPUTextureUsage.STORAGE_BINDING | GPUTextureUsage.TEXTURE_BINDING,
+  }));
 
   // Ray state buffer: 4 vec4f per ray = 64 bytes
   const rayStateBuf = device.createBuffer({
@@ -170,13 +176,24 @@ async function init() {
   });
   const pipelineLayout = device.createPipelineLayout({ bindGroupLayouts: [bgl0, bgl1, bgl2] });
 
+  // Group 3 is only for the composite kernel (temporal accumulation)
+  const bgl3 = device.createBindGroupLayout({
+    entries: [
+      { binding: 0, visibility: GPUShaderStage.COMPUTE, texture: { sampleType: 'unfilterable-float' } }, // noisy_read
+      { binding: 1, visibility: GPUShaderStage.COMPUTE, texture: { sampleType: 'unfilterable-float' } }, // accum_prev
+      { binding: 2, visibility: GPUShaderStage.COMPUTE, storageTexture: { access: 'write-only', format: 'rgba16float' } }, // accum_new
+    ],
+  });
+  const compositeLayout = device.createPipelineLayout({ bindGroupLayouts: [bgl0, bgl1, bgl2, bgl3] });
+
   const genPipeline     = device.createComputePipeline({ layout: pipelineLayout, compute: { module: wavefrontModule, entryPoint: 'generate'     } });
   const bouncePipelineA = device.createComputePipeline({ layout: pipelineLayout, compute: { module: wavefrontModule, entryPoint: 'bounce', constants: { SRC_QUEUE: 0 } } });
   const bouncePipelineB = device.createComputePipeline({ layout: pipelineLayout, compute: { module: wavefrontModule, entryPoint: 'bounce', constants: { SRC_QUEUE: 1 } } });
   const prepPipelineA   = device.createComputePipeline({ layout: pipelineLayout, compute: { module: wavefrontModule, entryPoint: 'prep_dispatch', constants: { READ_IDX: 0 } } });
   const prepPipelineB   = device.createComputePipeline({ layout: pipelineLayout, compute: { module: wavefrontModule, entryPoint: 'prep_dispatch', constants: { READ_IDX: 1 } } });
-  const shadowPipeline  = device.createComputePipeline({ layout: pipelineLayout, compute: { module: wavefrontModule, entryPoint: 'shadow_trace' } });
-  const finPipeline     = device.createComputePipeline({ layout: pipelineLayout, compute: { module: wavefrontModule, entryPoint: 'finalize'     } });
+  const shadowPipeline    = device.createComputePipeline({ layout: pipelineLayout,  compute: { module: wavefrontModule, entryPoint: 'shadow_trace' } });
+  const finPipeline       = device.createComputePipeline({ layout: pipelineLayout,  compute: { module: wavefrontModule, entryPoint: 'finalize'     } });
+  const compositePipeline = device.createComputePipeline({ layout: compositeLayout, compute: { module: wavefrontModule, entryPoint: 'composite'    } });
 
   const bg0 = device.createBindGroup({
     layout: bgl0,
@@ -208,6 +225,16 @@ async function init() {
       { binding: 3, resource: { buffer: dispatchArgsBuf } },
     ],
   });
+  // Ping-pong bind groups for composite: index `i` reads prev = accumTex[1-i]
+  // and writes new = accumTex[i]. JS alternates `i` each frame.
+  const bg3 = [0, 1].map(i => device.createBindGroup({
+    layout: bgl3,
+    entries: [
+      { binding: 0, resource: noisyTex.createView() },
+      { binding: 1, resource: accumTex[1 - i].createView() },
+      { binding: 2, resource: accumTex[i].createView() },
+    ],
+  }));
 
   // Display pipeline: fullscreen blit noisy → canvas (linear upscale)
   const displaySampler = device.createSampler({ magFilter: 'linear', minFilter: 'linear' });
@@ -217,13 +244,15 @@ async function init() {
     fragment: { module: displayModule, entryPoint: 'fs_main', targets: [{ format: canvasFormat }] },
     primitive: { topology: 'triangle-list' },
   });
-  const displayBG = device.createBindGroup({
+  // Display reads from whichever accumulator composite just wrote to.
+  // Ping-pong per frame alongside bg3.
+  const displayBG = [0, 1].map(i => device.createBindGroup({
     layout: displayPipeline.getBindGroupLayout(0),
     entries: [
-      { binding: 0, resource: noisyTex.createView() },
+      { binding: 0, resource: accumTex[i].createView() },
       { binding: 1, resource: displaySampler },
     ],
-  });
+  }));
 
   // Camera
   const cfg = window.IGNIS_CONFIG || {};
@@ -335,6 +364,9 @@ async function init() {
 
   // Frame loop
   let frameIdx = 0, lastTime = performance.now(), fps = 0, fpsAccum = 0, fpsCount = 0;
+  // Temporal accumulation state
+  let framesStill = 0, accumFrame = 0;
+  let prevPos = [...camera.pos], prevYaw = camera.yaw, prevPitch = camera.pitch;
 
   function updateCamera(dt) {
     const { forward, right } = camVectors();
@@ -379,7 +411,23 @@ async function init() {
     f[12] = right[0];      f[13] = right[1];      f[14] = right[2];
     f[16] = up[0];         f[17] = up[1];         f[18] = up[2];        f[19] = fovFactor;
     f[20] = sunDir[0];     f[21] = sunDir[1];     f[22] = sunDir[2];
+    u[23] = framesStill;   // replaces former _pad3
     device.queue.writeBuffer(uniformBuf, 0, buf);
+  }
+
+  function cameraMoved() {
+    const moved =
+      camera.pos[0] !== prevPos[0] ||
+      camera.pos[1] !== prevPos[1] ||
+      camera.pos[2] !== prevPos[2] ||
+      camera.yaw !== prevYaw ||
+      camera.pitch !== prevPitch;
+    if (moved) {
+      prevPos = [...camera.pos];
+      prevYaw = camera.yaw;
+      prevPitch = camera.pitch;
+    }
+    return moved;
   }
 
   function frame() {
@@ -394,6 +442,8 @@ async function init() {
     }
 
     updateCamera(dt);
+    if (cameraMoved()) { framesStill = 0; accumFrame = 0; }
+    else { framesStill++; }
     frameIdx++;
     writeUniforms();
 
@@ -458,16 +508,29 @@ async function init() {
       p.dispatchWorkgroups(Math.ceil(rw/8), Math.ceil(rh/8));
       p.end();
     }
+    // composite: blend current noisy with previous accumulator → new accum
+    {
+      const p = enc.beginComputePass();
+      p.setPipeline(compositePipeline);
+      p.setBindGroup(0, bg0);
+      p.setBindGroup(1, bg1);
+      p.setBindGroup(2, bg2);
+      p.setBindGroup(3, bg3[accumFrame]);
+      p.dispatchWorkgroups(Math.ceil(rw/8), Math.ceil(rh/8));
+      p.end();
+    }
     {
       const view = ctx.getCurrentTexture().createView();
       const rp = enc.beginRenderPass({
         colorAttachments: [{ view, loadOp: 'clear', storeOp: 'store', clearValue: { r:0, g:0, b:0, a:1 } }],
       });
       rp.setPipeline(displayPipeline);
-      rp.setBindGroup(0, displayBG);
+      rp.setBindGroup(0, displayBG[accumFrame]);
       rp.draw(3);
       rp.end();
     }
+    // Swap ping-pong: next frame reads what we just wrote, writes the other
+    accumFrame = 1 - accumFrame;
     device.queue.submit([enc.finish()]);
 
     info.innerHTML =
