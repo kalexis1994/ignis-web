@@ -442,8 +442,11 @@ async function init() {
     }
 
     updateCamera(dt);
+    // framesStill = "samples prior to THIS frame". On the first frame ever,
+    // or immediately after any camera motion, it's 0 → alpha=1 → composite
+    // overwrites history entirely (so an uninitialized or stale accumulator
+    // can't leak through). Incremented AFTER dispatches, below.
     if (cameraMoved()) { framesStill = 0; accumFrame = 0; }
-    else { framesStill++; }
     frameIdx++;
     writeUniforms();
 
@@ -531,6 +534,8 @@ async function init() {
     }
     // Swap ping-pong: next frame reads what we just wrote, writes the other
     accumFrame = 1 - accumFrame;
+    // We just added one sample to the accumulator
+    framesStill++;
     device.queue.submit([enc.finish()]);
 
     info.innerHTML =
