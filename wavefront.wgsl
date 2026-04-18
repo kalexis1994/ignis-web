@@ -413,13 +413,17 @@ fn bounce(@builtin(global_invocation_id) gid: vec3u) {
     return;
   }
 
-  // Lambertian BSDF color (v1)
-  let albedo = mat_base_color(mat) * (1.0 - mat_metallic(mat)) * INV_PI;
+  // v1 treats every non-unlit material as pure Lambertian diffuse with
+  // the glTF baseColorFactor as albedo. Metallic is *ignored*: scene-loader
+  // defaults metallicFactor to 1.0 per glTF spec when the material expects
+  // a metallic-roughness texture to drive it; with no texture sampling
+  // that value is meaningless and taking (1 - metallic) would zero the
+  // albedo on every Sponza material (→ indirect black). Textures + real
+  // metallic handling come back in the next commit.
+  let base = mat_base_color(mat);
+  let albedo = base * INV_PI;
 
   // NEE sun — delta light (directional). No cone sampling, no MIS.
-  // SUN_RADIANCE treated as effective incoming irradiance * (1/cos) so
-  // that multiplying by cos gives correct shading. Simpler than proper
-  // solid-angle NEE and less noisy at 1 spp.
   let nsl = dot(normal, uniforms.sun_dir);
   if nsl > 0.0 {
     let sun_origin = ray_offset(hit_pos, geo_normal);
@@ -443,7 +447,8 @@ fn bounce(@builtin(global_invocation_id) gid: vec3u) {
     return;
   }
 
-  rs.throughput *= mat_base_color(mat) * (1.0 - mat_metallic(mat));
+  // Lambertian throughput update (cosine-weighted sampling → pdf cancels)
+  rs.throughput *= base;
   rs.origin = ray_offset(hit_pos, geo_normal);
   rs.dir = new_dir;
   rs.last_bsdf_pdf = max(dot(normal, new_dir), 0.0) * INV_PI;
