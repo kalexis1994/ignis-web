@@ -208,14 +208,14 @@ async function init() {
     return { forward, right, up };
   }
 
-  // Input: keyboard + pointer drag
+  // Input: keyboard + mouse drag (desktop) + virtual joysticks (touch)
   const keys = {};
   window.addEventListener('keydown', e => { keys[e.code] = true; });
   window.addEventListener('keyup',   e => { keys[e.code] = false; });
   let dragging = false, lastX = 0, lastY = 0;
-  canvas.addEventListener('pointerdown', e => { dragging = true; lastX = e.clientX; lastY = e.clientY; canvas.setPointerCapture(e.pointerId); });
-  canvas.addEventListener('pointerup',   e => { dragging = false; try { canvas.releasePointerCapture(e.pointerId); } catch(_) {} });
-  canvas.addEventListener('pointermove', e => {
+  canvas.addEventListener('mousedown', e => { dragging = true; lastX = e.clientX; lastY = e.clientY; });
+  canvas.addEventListener('mouseup',   () => { dragging = false; });
+  canvas.addEventListener('mousemove', e => {
     if (!dragging) return;
     const dx = e.clientX - lastX, dy = e.clientY - lastY;
     lastX = e.clientX; lastY = e.clientY;
@@ -223,6 +223,66 @@ async function init() {
     camera.pitch -= dy * 0.003;
     camera.pitch = Math.max(-Math.PI*0.49, Math.min(Math.PI*0.49, camera.pitch));
   });
+
+  // Virtual joysticks: touch anywhere in left half → move stick at that
+  // point; right half → rotate stick. dx/dy in each stick are normalized
+  // [-1, 1] after clamping to KNOB_MAX pixels from the spawn point.
+  const stickLeft  = { el: document.getElementById('stick-left'),  knob: document.getElementById('knob-left'),  touchId: null, cx:0, cy:0, dx:0, dy:0 };
+  const stickRight = { el: document.getElementById('stick-right'), knob: document.getElementById('knob-right'), touchId: null, cx:0, cy:0, dx:0, dy:0 };
+  const KNOB_MAX = 50;
+  const halfW = () => window.innerWidth / 2;
+  function clampStick(dx, dy) { const l = Math.hypot(dx, dy); if (l > KNOB_MAX) { dx = dx/l*KNOB_MAX; dy = dy/l*KNOB_MAX; } return { dx, dy }; }
+  function showStick(s, x, y) {
+    if (!s.el) return;
+    s.el.style.display = 'block';
+    s.el.style.left = (x - 70) + 'px';
+    s.el.style.top  = (y - 70) + 'px';
+    s.el.style.bottom = 'auto';
+    s.el.style.right = 'auto';
+    s.knob.style.transform = 'translate(-50%, -50%)';
+    s.knob.classList.remove('active');
+  }
+  function hideStick(s) {
+    s.touchId = null; s.dx = 0; s.dy = 0;
+    if (!s.el) return;
+    s.el.style.display = 'none';
+    s.knob.style.transform = 'translate(-50%, -50%)';
+    s.knob.classList.remove('active');
+  }
+  function moveKnob(s, tx, ty) {
+    const r = clampStick(tx - s.cx, ty - s.cy);
+    s.knob.style.transform = `translate(calc(-50% + ${r.dx}px), calc(-50% + ${r.dy}px))`;
+    s.knob.classList.toggle('active', r.dx !== 0 || r.dy !== 0);
+    s.dx = r.dx / KNOB_MAX;
+    s.dy = r.dy / KNOB_MAX;
+  }
+  if (stickLeft.el)  stickLeft.el.style.display  = 'none';
+  if (stickRight.el) stickRight.el.style.display = 'none';
+
+  document.addEventListener('touchstart', e => {
+    for (const t of e.changedTouches) {
+      const stick = (t.clientX < halfW()) ? stickLeft : stickRight;
+      if (stick.touchId !== null) continue;
+      stick.touchId = t.identifier;
+      stick.cx = t.clientX; stick.cy = t.clientY;
+      showStick(stick, t.clientX, t.clientY);
+      e.preventDefault();
+    }
+  }, { passive: false });
+  document.addEventListener('touchmove', e => {
+    for (const t of e.changedTouches) {
+      if (t.identifier === stickLeft.touchId)  { moveKnob(stickLeft,  t.clientX, t.clientY); e.preventDefault(); }
+      else if (t.identifier === stickRight.touchId) { moveKnob(stickRight, t.clientX, t.clientY); e.preventDefault(); }
+    }
+  }, { passive: false });
+  function onTouchEnd(e) {
+    for (const t of e.changedTouches) {
+      if (t.identifier === stickLeft.touchId)  hideStick(stickLeft);
+      if (t.identifier === stickRight.touchId) hideStick(stickRight);
+    }
+  }
+  document.addEventListener('touchend',    onTouchEnd);
+  document.addEventListener('touchcancel', onTouchEnd);
 
   // Sun direction (constant for v1)
   const sunDir = (() => {
@@ -243,6 +303,25 @@ async function init() {
     if (keys['KeyD']) for (let i=0;i<3;i++) camera.pos[i] += right[i]   * speed;
     if (keys['KeyE']) camera.pos[1] += speed;
     if (keys['KeyQ']) camera.pos[1] -= speed;
+
+    // Virtual joysticks (touch): left = move (XZ planar + strafe),
+    // right = rotate (yaw/pitch). Deadzone 0.12, matches old renderer.
+    const DZ = 0.12;
+    const lx = Math.abs(stickLeft.dx)  > DZ ? stickLeft.dx  : 0;
+    const ly = Math.abs(stickLeft.dy)  > DZ ? stickLeft.dy  : 0;
+    if (lx || ly) {
+      camera.pos[0] += forward[0] * (-ly) * speed + right[0] * lx * speed;
+      camera.pos[1] += forward[1] * (-ly) * speed;
+      camera.pos[2] += forward[2] * (-ly) * speed + right[2] * lx * speed;
+    }
+    const rx = Math.abs(stickRight.dx) > DZ ? stickRight.dx : 0;
+    const ry = Math.abs(stickRight.dy) > DZ ? stickRight.dy : 0;
+    if (rx || ry) {
+      const rotSpeed = 2.5 * dt;
+      camera.yaw   -= rx * rotSpeed;
+      camera.pitch -= ry * rotSpeed;
+      camera.pitch = Math.max(-Math.PI*0.49, Math.min(Math.PI*0.49, camera.pitch));
+    }
   }
 
   function writeUniforms() {
