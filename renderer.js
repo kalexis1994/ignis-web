@@ -37,7 +37,25 @@ async function init() {
   const adapter = await navigator.gpu.requestAdapter({ powerPreference: 'high-performance' });
   if (!adapter) { showError('Failed to get GPU adapter.'); return; }
 
-  const device = await adapter.requestDevice();
+  // Wavefront + shadow queue + compaction needs 11 storage buffers in
+  // the compute stage (default limit is 8). Adreno 7xx exposes ≥16.
+  // shader-f16: FP16 has 2× ALU throughput on Adreno.
+  // subgroups: wave-level primitives (ballot, exclusiveAdd, broadcast)
+  // used to replace per-lane atomicAdd in queue compaction with one
+  // atomicAdd per wave. Huge win for atomic-heavy kernels on mobile.
+  const hasF16 = adapter.features.has('shader-f16');
+  const hasSubgroups = adapter.features.has('subgroups');
+  if (!hasF16) rlog('WARN: shader-f16 not available; FP16 paths will fail to compile.');
+  if (!hasSubgroups) rlog('WARN: subgroups not available; wave-level compaction will fail to compile.');
+  const device = await adapter.requestDevice({
+    requiredFeatures: [
+      ...(hasF16 ? ['shader-f16'] : []),
+      ...(hasSubgroups ? ['subgroups'] : []),
+    ],
+    requiredLimits: {
+      maxStorageBuffersPerShaderStage: Math.min(adapter.limits.maxStorageBuffersPerShaderStage, 16),
+    },
+  });
   device.onuncapturederror = (e) => rlog('GPU_ERROR: ' + e.error.message);
   device.lost.then(i => rlog('DEVICE_LOST: ' + i.message));
 
@@ -86,6 +104,7 @@ async function init() {
   const nrmBuf = createGPUBuffer(device, scene.gpuNormals,   GPUBufferUsage.STORAGE);
   const triBuf = createGPUBuffer(device, scene.gpuTriData,   GPUBufferUsage.STORAGE);
   const bvhBuf = createGPUBuffer(device, scene.gpuBVHNodes,  GPUBufferUsage.STORAGE);
+  const bvhScene = scene.bvhScene; // { origin: [x,y,z], scale: [x,y,z] } for uint16 dequant
   const matBuf = createGPUBuffer(device, scene.gpuMaterials, GPUBufferUsage.STORAGE);
 
   // Output textures
@@ -135,8 +154,9 @@ async function init() {
   });
 
   // Uniforms — 96 bytes, matches Uniforms struct in wavefront.wgsl.
+  // 128 bytes: base 96 + 32 for scene_origin/scene_scale (BVH dequant).
   const uniformBuf = device.createBuffer({
-    size: 96, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+    size: 128, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
   });
 
   // Shader modules
@@ -166,15 +186,29 @@ async function init() {
       { binding: 4, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } },
     ],
   });
-  const bgl2 = device.createBindGroupLayout({
+  // bgl2_main: queue_a, queue_b, counts. NO dispatch_args — so when a
+  // bounce kernel dispatches indirectly off dispatchArgsBuf the buffer
+  // isn't also bound as storage in the same pass (WebGPU forbids
+  // writable + indirect in the same sync scope).
+  const bgl2_main = device.createBindGroupLayout({
     entries: [
-      { binding: 0, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } }, // queue_a
-      { binding: 1, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } }, // queue_b
-      { binding: 2, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } }, // counts (atomic)
+      { binding: 0, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } },
+      { binding: 1, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } },
+      { binding: 2, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } },
+    ],
+  });
+  // bgl2_prep: same + dispatch_args. Used only by prep_dispatch which
+  // doesn't dispatch anything (writes args for the NEXT pass).
+  const bgl2_prep = device.createBindGroupLayout({
+    entries: [
+      { binding: 0, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } },
+      { binding: 1, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } },
+      { binding: 2, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } },
       { binding: 3, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } }, // dispatch_args
     ],
   });
-  const pipelineLayout = device.createPipelineLayout({ bindGroupLayouts: [bgl0, bgl1, bgl2] });
+  const pipelineLayout = device.createPipelineLayout({ bindGroupLayouts: [bgl0, bgl1, bgl2_main] });
+  const prepPipeLayout = device.createPipelineLayout({ bindGroupLayouts: [bgl0, bgl1, bgl2_prep] });
 
   // Group 3 is only for the composite kernel (temporal accumulation)
   const bgl3 = device.createBindGroupLayout({
@@ -184,13 +218,23 @@ async function init() {
       { binding: 2, visibility: GPUShaderStage.COMPUTE, storageTexture: { access: 'write-only', format: 'rgba16float' } }, // accum_new
     ],
   });
-  const compositeLayout = device.createPipelineLayout({ bindGroupLayouts: [bgl0, bgl1, bgl2, bgl3] });
+  // composite reads noisyTex as texture_2d via bg3, but bgl0 has noisyTex
+  // as write-only storage — binding the same texture with both usages in a
+  // single pass is a sync-scope violation. Give composite a minimal bgl0
+  // with just uniforms, and skip bgl1/bgl2 (composite doesn't use them).
+  const bgl0_composite = device.createBindGroupLayout({
+    entries: [{ binding: 0, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'uniform' } }],
+  });
+  const compositeLayout = device.createPipelineLayout({ bindGroupLayouts: [bgl0_composite, null, null, bgl3] });
 
   const genPipeline     = device.createComputePipeline({ layout: pipelineLayout, compute: { module: wavefrontModule, entryPoint: 'generate'     } });
-  const bouncePipelineA = device.createComputePipeline({ layout: pipelineLayout, compute: { module: wavefrontModule, entryPoint: 'bounce', constants: { SRC_QUEUE: 0 } } });
-  const bouncePipelineB = device.createComputePipeline({ layout: pipelineLayout, compute: { module: wavefrontModule, entryPoint: 'bounce', constants: { SRC_QUEUE: 1 } } });
-  const prepPipelineA   = device.createComputePipeline({ layout: pipelineLayout, compute: { module: wavefrontModule, entryPoint: 'prep_dispatch', constants: { READ_IDX: 0 } } });
-  const prepPipelineB   = device.createComputePipeline({ layout: pipelineLayout, compute: { module: wavefrontModule, entryPoint: 'prep_dispatch', constants: { READ_IDX: 1 } } });
+  // bounce pipelines: FIRST variant reads gid.x directly (no queue load, used
+  // only for bounce 0 where every ray is alive). A/B alternate for bounces 1+.
+  const bouncePipelineFirst = device.createComputePipeline({ layout: pipelineLayout, compute: { module: wavefrontModule, entryPoint: 'bounce', constants: { FIRST_BOUNCE: 1, SRC_QUEUE: 0 } } });
+  const bouncePipelineA     = device.createComputePipeline({ layout: pipelineLayout, compute: { module: wavefrontModule, entryPoint: 'bounce', constants: { FIRST_BOUNCE: 0, SRC_QUEUE: 0 } } });
+  const bouncePipelineB     = device.createComputePipeline({ layout: pipelineLayout, compute: { module: wavefrontModule, entryPoint: 'bounce', constants: { FIRST_BOUNCE: 0, SRC_QUEUE: 1 } } });
+  const prepPipelineA   = device.createComputePipeline({ layout: prepPipeLayout, compute: { module: wavefrontModule, entryPoint: 'prep_dispatch', constants: { READ_IDX: 0 } } });
+  const prepPipelineB   = device.createComputePipeline({ layout: prepPipeLayout, compute: { module: wavefrontModule, entryPoint: 'prep_dispatch', constants: { READ_IDX: 1 } } });
   const shadowPipeline    = device.createComputePipeline({ layout: pipelineLayout,  compute: { module: wavefrontModule, entryPoint: 'shadow_trace' } });
   const finPipeline       = device.createComputePipeline({ layout: pipelineLayout,  compute: { module: wavefrontModule, entryPoint: 'finalize'     } });
   const compositePipeline = device.createComputePipeline({ layout: compositeLayout, compute: { module: wavefrontModule, entryPoint: 'composite'    } });
@@ -216,8 +260,16 @@ async function init() {
       { binding: 4, resource: { buffer: matBuf } },
     ],
   });
-  const bg2 = device.createBindGroup({
-    layout: bgl2,
+  const bg2_main = device.createBindGroup({
+    layout: bgl2_main,
+    entries: [
+      { binding: 0, resource: { buffer: queueABuf } },
+      { binding: 1, resource: { buffer: queueBBuf } },
+      { binding: 2, resource: { buffer: countsBuf } },
+    ],
+  });
+  const bg2_prep = device.createBindGroup({
+    layout: bgl2_prep,
     entries: [
       { binding: 0, resource: { buffer: queueABuf } },
       { binding: 1, resource: { buffer: queueBBuf } },
@@ -235,6 +287,12 @@ async function init() {
       { binding: 2, resource: accumTex[i].createView() },
     ],
   }));
+  // Minimal bg0 for composite (uniforms only — no storage textures to
+  // collide with noisyTex bound as texture in bg3).
+  const bg0_composite = device.createBindGroup({
+    layout: bgl0_composite,
+    entries: [{ binding: 0, resource: { buffer: uniformBuf } }],
+  });
 
   // Display pipeline: fullscreen blit noisy → canvas (linear upscale)
   const displaySampler = device.createSampler({ magFilter: 'linear', minFilter: 'linear' });
@@ -264,7 +322,7 @@ async function init() {
       (bb.sceneMin[1] + bb.sceneMax[1]) * 0.5,
       (bb.sceneMin[2] + bb.sceneMax[2]) * 0.5,
     ],
-    yaw: 0, pitch: 0, fov: 90,
+    yaw: 0, pitch: 0, fov: 75,  // applied to the narrow axis (see writeUniforms)
   };
   function camVectors() {
     const cy = Math.cos(camera.yaw), sy = Math.sin(camera.yaw);
@@ -400,8 +458,17 @@ async function init() {
 
   function writeUniforms() {
     const { forward, right, up } = camVectors();
-    const fovFactor = Math.tan((camera.fov * Math.PI / 180) * 0.5);
-    const buf = new ArrayBuffer(96);
+    // camera.fov is applied to the NARROW axis. The shader computes
+    //   tan(H/2) = aspect * fovFactor   and   tan(V/2) = fovFactor
+    // where aspect = width/height. So:
+    //   portrait (aspect<1, narrow=horizontal): want tan(H/2)=tan(fov/2)
+    //     → fovFactor = tan(fov/2)/aspect
+    //   landscape (aspect>=1, narrow=vertical): want tan(V/2)=tan(fov/2)
+    //     → fovFactor = tan(fov/2)
+    const tanHalfFov = Math.tan((camera.fov * Math.PI / 180) * 0.5);
+    const aspect = rw / rh;
+    const fovFactor = (aspect < 1.0) ? (tanHalfFov / aspect) : tanHalfFov;
+    const buf = new ArrayBuffer(128);
     const f = new Float32Array(buf);
     const u = new Uint32Array(buf);
     f[0] = rw; f[1] = rh;
@@ -412,6 +479,9 @@ async function init() {
     f[16] = up[0];         f[17] = up[1];         f[18] = up[2];        f[19] = fovFactor;
     f[20] = sunDir[0];     f[21] = sunDir[1];     f[22] = sunDir[2];
     u[23] = framesStill;   // replaces former _pad3
+    // BVH dequantization: scene_origin (vec3f + pad) and scene_scale (vec3f + pad)
+    f[24] = bvhScene.origin[0]; f[25] = bvhScene.origin[1]; f[26] = bvhScene.origin[2];
+    f[28] = bvhScene.scale[0];  f[29] = bvhScene.scale[1];  f[30] = bvhScene.scale[2];
     device.queue.writeBuffer(uniformBuf, 0, buf);
   }
 
@@ -463,19 +533,23 @@ async function init() {
       p.setPipeline(genPipeline);
       p.setBindGroup(0, bg0);
       p.setBindGroup(1, bg1);
-      p.setBindGroup(2, bg2);
+      p.setBindGroup(2, bg2_main);
       p.dispatchWorkgroups(Math.ceil(rw/8), Math.ceil(rh/8));
       p.end();
     }
     for (let b = 0; b < maxBounces; b++) {
       const srcIsA = (b % 2) === 0;
-      // bounce — indirect dispatch, 1D
+      // bounce — indirect dispatch, 1D; bg2_main does NOT include
+      // dispatchArgsBuf so the same buffer can be read as INDIRECT here
+      // without a writable-usage sync conflict.
+      // First bounce uses bounceFirst (skips queue read — every ray alive).
       {
         const p = enc.beginComputePass();
-        p.setPipeline(srcIsA ? bouncePipelineA : bouncePipelineB);
+        const pipe = (b === 0) ? bouncePipelineFirst : (srcIsA ? bouncePipelineA : bouncePipelineB);
+        p.setPipeline(pipe);
         p.setBindGroup(0, bg0);
         p.setBindGroup(1, bg1);
-        p.setBindGroup(2, bg2);
+        p.setBindGroup(2, bg2_main);
         p.dispatchWorkgroupsIndirect(dispatchArgsBuf, 0);
         p.end();
       }
@@ -485,19 +559,20 @@ async function init() {
         p.setPipeline(shadowPipeline);
         p.setBindGroup(0, bg0);
         p.setBindGroup(1, bg1);
-        p.setBindGroup(2, bg2);
+        p.setBindGroup(2, bg2_main);
         p.dispatchWorkgroups(Math.ceil(rw/8), Math.ceil(rh/8));
         p.end();
       }
       // prep_dispatch: update args + zero next-dst count for the NEXT
-      // bounce. Skip after the final bounce.
+      // bounce. Uses bg2_prep which DOES have dispatch_args as storage
+      // (only place that writes it). Skip after the final bounce.
       if (b < maxBounces - 1) {
         const nextReadsA = ((b + 1) % 2) === 0;
         const p = enc.beginComputePass();
         p.setPipeline(nextReadsA ? prepPipelineA : prepPipelineB);
         p.setBindGroup(0, bg0);
         p.setBindGroup(1, bg1);
-        p.setBindGroup(2, bg2);
+        p.setBindGroup(2, bg2_prep);
         p.dispatchWorkgroups(1);
         p.end();
       }
@@ -507,17 +582,17 @@ async function init() {
       p.setPipeline(finPipeline);
       p.setBindGroup(0, bg0);
       p.setBindGroup(1, bg1);
-      p.setBindGroup(2, bg2);
+      p.setBindGroup(2, bg2_main);
       p.dispatchWorkgroups(Math.ceil(rw/8), Math.ceil(rh/8));
       p.end();
     }
-    // composite: blend current noisy with previous accumulator → new accum
+    // composite: blend current noisy with previous accumulator → new accum.
+    // Uses minimal bg0_composite (uniforms only) + bg3. Groups 1 and 2 are
+    // null in the composite pipeline layout so they're not set here.
     {
       const p = enc.beginComputePass();
       p.setPipeline(compositePipeline);
-      p.setBindGroup(0, bg0);
-      p.setBindGroup(1, bg1);
-      p.setBindGroup(2, bg2);
+      p.setBindGroup(0, bg0_composite);
       p.setBindGroup(3, bg3[accumFrame]);
       p.dispatchWorkgroups(Math.ceil(rw/8), Math.ceil(rh/8));
       p.end();

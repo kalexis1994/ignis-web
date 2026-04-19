@@ -7,6 +7,16 @@
 // shadow ray + MIS against simple gradient sky. No textures, no normal maps,
 // no GGX spec, no env CDF, no SHaRC/ReSTIR/glass. Those come back in later
 // commits once the wavefront architecture is proven stable.
+//
+// FP16: Adreno has 2× ALU throughput for FP16. Color/radiance/throughput
+// operations run in f16 (vec3h); positions/directions/t/PDFs stay f32
+// because their magnitudes or precision needs exceed f16 range/precision.
+enable f16;
+
+// subgroups: wave-level primitives. Used in the bounce kernel to compact
+// survivors with ONE atomicAdd per wave instead of one per surviving
+// lane, and to early-out NEE when no lane in the wave needs a shadow.
+enable subgroups;
 
 struct Uniforms {
   resolution: vec2f,
@@ -17,21 +27,42 @@ struct Uniforms {
   camera_right: vec3f, _pad2: f32,
   camera_up: vec3f,    fov_factor: f32,
   sun_dir: vec3f,      frames_still: u32,
+  scene_origin: vec3f, _pad3: f32, // BVH AABB dequantization offset (scene min)
+  scene_scale: vec3f,  _pad4: f32, // BVH AABB dequantization scale (extent / 65535)
 };
 
-struct BVHNode { aabb_min: vec3f, left_first: u32, aabb_max: vec3f, tri_count: u32, };
-// Material: keep same 20-vec4f layout as legacy PT so scene-loader.js is untouched.
-// v1 only reads d0 (albedo + mat_type), d1 (emission + roughness), d2.x (metallic).
-struct Material {
-  d0: vec4f, d1: vec4f, d2: vec4f, d3: vec4f, d4: vec4f,
-  d5: vec4f, d6: vec4f, d7: vec4f, d8: vec4f, d9: vec4f,
-  d10: vec4f, d11: vec4f, d12: vec4f, d13: vec4f, d14: vec4f,
-  d15: vec4f, d16: vec4f, d17: vec4f, d18: vec4f, d19: vec4f,
+// BVH node with uint16-quantized AABB relative to scene bounds (20 B vs
+// previous 32 B). 6 uint16 packed into 3 u32 for the AABB, plus 2 u32
+// for left_first + tri_count. Dequantization uses uniforms.scene_origin
+// and uniforms.scene_scale (precomputed = extent / 65535).
+struct BVHNode {
+  aabb0: u32, // min.x (u16) | min.y (u16)
+  aabb1: u32, // min.z (u16) | max.x (u16)
+  aabb2: u32, // max.y (u16) | max.z (u16)
+  left_first: u32,
+  tri_count: u32,
 };
+struct AABB { mn: vec3f, mx: vec3f, };
+fn node_aabb(n: BVHNode) -> AABB {
+  let mnx = f32(n.aabb0 & 0xFFFFu);
+  let mny = f32(n.aabb0 >> 16u);
+  let mnz = f32(n.aabb1 & 0xFFFFu);
+  let mxx = f32(n.aabb1 >> 16u);
+  let mxy = f32(n.aabb2 & 0xFFFFu);
+  let mxz = f32(n.aabb2 >> 16u);
+  var out: AABB;
+  out.mn = uniforms.scene_origin + vec3f(mnx, mny, mnz) * uniforms.scene_scale;
+  out.mx = uniforms.scene_origin + vec3f(mxx, mxy, mxz) * uniforms.scene_scale;
+  return out;
+}
+// Material v2: 2 vec4f = 32 bytes (vs 320 before). 10× less per-hit bandwidth.
+//   d0 = (albedo.r, albedo.g, albedo.b, unlit_flag)
+//   d1 = (emission.r * strength, emission.g * strength, emission.b * strength, 0)
+struct Material { d0: vec4f, d1: vec4f, };
 
 // Per-ray state, 64 bytes, stored as 4 vec4f per pixel in ray_state_buf.
 // Packing:
-//   ray_state[4i+0] = vec4f(origin.xyz,       bitcast(rng_state))
+//   ray_state[4i+0] = vec4f(origin.xyz,       bitcast(sampler_dim))
 //   ray_state[4i+1] = vec4f(dir.xyz,          bitcast(flags))
 //                        flags: bit 0 = alive, bit 1 = diffuse_path
 //                               bits 8..15 = bounce count
@@ -69,6 +100,7 @@ struct Material {
 // reads either queue_a's count or queue_b's count) without a uniform.
 override SRC_QUEUE: u32 = 0u;   // bounce: 0 reads queue_a, 1 reads queue_b
 override READ_IDX: u32 = 0u;    // prep: which count feeds the next bounce
+override FIRST_BOUNCE: u32 = 0u; // bounce: 1 = skip queue read, use gid.x directly
 
 // Temporal accumulation textures (group 3, ping-pong per frame).
 // Separate from group 0 so only the composite kernel needs this group;
@@ -90,30 +122,90 @@ const FLAG_ALIVE: u32 = 1u;
 const FLAG_DIFFUSE_PATH: u32 = 2u;
 
 // ============================================================
-// RNG — PCG + PCG3D for decorrelated vec2 sampling
+// Sampler — Owen-scrambled low-discrepancy sequences.
+// Based on open academic publications:
+//   Burley 2020 — "Practical Hash-Based Owen Scrambling" (JCGT 9(4))
+//   Heitz 2021 — extension used by NVIDIA RTXPT
+// Algorithm: for sample i / dim d / per-pixel seed, apply Owen scramble
+// to a bit-reversed counter (Van der Corput for dim 0). Produces near-
+// blue-noise spatial distribution → fine-grained noise instead of the
+// "clumpy" white noise of unstratified PCG.
 // ============================================================
-fn pcg(state: ptr<function, u32>) -> u32 {
-  let s = *state;
-  *state = s * 747796405u + 2891336453u;
-  let word = ((s >> ((s >> 28u) + 4u)) ^ s) * 277803737u;
-  return (word >> 22u) ^ word;
+fn hash_u32(x_in: u32) -> u32 {
+  // PCG32 single-step hash (Jarzynski-Olano 2020, good avalanche)
+  var h = x_in * 747796405u + 2891336453u;
+  let w = ((h >> ((h >> 28u) + 4u)) ^ h) * 277803737u;
+  return (w >> 22u) ^ w;
 }
 
-fn pcg3d(v_in: vec3u) -> vec3u {
-  var v = v_in * 1664525u + 1013904223u;
-  v.x += v.y * v.z; v.y += v.z * v.x; v.z += v.x * v.y;
-  v ^= v >> vec3u(16u);
-  v.x += v.y * v.z; v.y += v.z * v.x; v.z += v.x * v.y;
-  return v;
+fn reverse_bits_u32(x_in: u32) -> u32 {
+  var x = x_in;
+  x = ((x >> 1u) & 0x55555555u) | ((x & 0x55555555u) << 1u);
+  x = ((x >> 2u) & 0x33333333u) | ((x & 0x33333333u) << 2u);
+  x = ((x >> 4u) & 0x0F0F0F0Fu) | ((x & 0x0F0F0F0Fu) << 4u);
+  x = ((x >> 8u) & 0x00FF00FFu) | ((x & 0x00FF00FFu) << 8u);
+  x = (x >> 16u) | (x << 16u);
+  return x;
 }
 
-fn rand1(s: ptr<function, u32>) -> f32 {
-  return f32(pcg(s)) / 4294967295.0;
+// Laine-Karras hash-based Owen scramble, 4-round variant (Burley 2020 JCGT).
+// The magic multipliers are the ones published in that paper, tuned so that
+// each nested-uniform scrambling tree node gets an independently random flip.
+fn owen_scramble(x_in: u32, seed: u32) -> u32 {
+  var x = reverse_bits_u32(x_in);
+  x = x + seed;
+  x = x ^ (x * 0x6c50b47cu);
+  x = x ^ (x * 0xb82f1e52u);
+  x = x ^ (x * 0xc7afe638u);
+  x = x ^ (x * 0x8d22f6e6u);
+  return reverse_bits_u32(x);
 }
-fn rand2(s: ptr<function, u32>) -> vec2f {
-  let h = pcg3d(vec3u(*s, pcg(s), pcg(s)));
-  *s = h.z;
-  return vec2f(f32(h.x), f32(h.y)) / 4294967295.0;
+
+// Sampler state: per-pixel base seed + temporal sample index + dimension
+// counter. Lives in private/function memory per lane; persisted across
+// bounces via ray_state (only `dim` needs storing; pixel_hash and sample
+// are recomputed from pixel_idx and uniforms.frame_seed each kernel).
+struct Sampler {
+  pixel_hash: u32,
+  sample: u32,
+  dim: u32,
+};
+
+fn sampler_init(idx: u32, frame: u32, start_dim: u32) -> Sampler {
+  var s: Sampler;
+  // Mezclar frame dentro del pixel_hash. Las multiplicadores LK de
+  // Burley 2020 son todos pares → 0x80000000*K ≡ 0 mod 2^32, con lo
+  // que la diferencia entre samples adyacentes (bit 31 tras reverse)
+  // se propaga como XOR puro y termina en bit 0 del output, que luego
+  // cae en el `>> 8u`. Mezclando frame acá, shuffle_seed/dim_seed
+  // varían per-frame y no dependemos del Owen para la dimensión temporal.
+  s.pixel_hash = hash_u32(idx * 0x9E3779B1u + frame * 0x85EBCA77u + 0x165667B1u);
+  s.sample = frame;                // sigue usándose para Owen (Sobol vdc)
+  s.dim = start_dim;
+  return s;
+}
+
+// Sample next 1D value in [0,1). Advances dim counter.
+fn sampler_1d(s: ptr<function, Sampler>) -> f32 {
+  let dim = (*s).dim;
+  let shuffle_seed = hash_u32((*s).pixel_hash + (dim * 0x9E3779B9u));
+  let dim_seed     = hash_u32((*s).pixel_hash + (dim * 0x85EBCA77u) + 0x1u);
+  let shuffled = owen_scramble((*s).sample, shuffle_seed);
+  // For dim 0 just bit-reverse (Van der Corput / Sobol d=0); higher dims
+  // would need true Sobol direction matrices — we approximate via Owen-
+  // scrambling the shuffled index again with a per-dim seed, which gives
+  // a full set of blue-noise-distributed 1D samples (the approach used in
+  // Andrew Helmer's shadertoy demo referenced by RTXPT).
+  let x = owen_scramble(shuffled, dim_seed);
+  (*s).dim = dim + 1u;
+  // Top 24 bits have best distribution; convert to float in [0,1).
+  return f32(x >> 8u) / 16777216.0;
+}
+
+fn sampler_2d(s: ptr<function, Sampler>) -> vec2f {
+  let x = sampler_1d(s);
+  let y = sampler_1d(s);
+  return vec2f(x, y);
 }
 
 // ============================================================
@@ -199,9 +291,9 @@ fn intersect_tri(origin: vec3f, dir: vec3f, a: vec3f, b: vec3f, c: vec3f, max_t:
 fn trace_bvh(origin: vec3f, dir: vec3f) -> HitInfo {
   var hit: HitInfo; hit.t = INF; hit.hit = false;
   let inv_dir = 1.0 / dir;
-  var stk: array<u32, 16>; var sp = 0u; var cur = 0u;
-  let root = bvh_nodes[0u];
-  if intersect_aabb(origin, inv_dir, root.aabb_min, root.aabb_max, INF) >= INF { return hit; }
+  var stk: array<u32, 12>; var sp = 0u; var cur = 0u;
+  let root_ab = node_aabb(bvh_nodes[0u]);
+  if intersect_aabb(origin, inv_dir, root_ab.mn, root_ab.mx, INF) >= INF { return hit; }
   loop {
     let nd = bvh_nodes[cur];
     if nd.tri_count > 0u {
@@ -218,13 +310,15 @@ fn trace_bvh(origin: vec3f, dir: vec3f) -> HitInfo {
       if sp == 0u { break; } sp--; cur = stk[sp]; continue;
     }
     let l = nd.left_first; let r = l + 1u;
-    let tl = intersect_aabb(origin, inv_dir, bvh_nodes[l].aabb_min, bvh_nodes[l].aabb_max, hit.t);
-    let tr = intersect_aabb(origin, inv_dir, bvh_nodes[r].aabb_min, bvh_nodes[r].aabb_max, hit.t);
+    let lab = node_aabb(bvh_nodes[l]);
+    let rab = node_aabb(bvh_nodes[r]);
+    let tl = intersect_aabb(origin, inv_dir, lab.mn, lab.mx, hit.t);
+    let tr = intersect_aabb(origin, inv_dir, rab.mn, rab.mx, hit.t);
     if tl < tr {
-      if tr < hit.t && sp < 16u { stk[sp] = r; sp++; }
+      if tr < hit.t && sp < 12u { stk[sp] = r; sp++; }
       if tl < hit.t { cur = l; } else { if sp == 0u { break; } sp--; cur = stk[sp]; }
     } else {
-      if tl < hit.t && sp < 16u { stk[sp] = l; sp++; }
+      if tl < hit.t && sp < 12u { stk[sp] = l; sp++; }
       if tr < hit.t { cur = r; } else { if sp == 0u { break; } sp--; cur = stk[sp]; }
     }
   }
@@ -234,9 +328,9 @@ fn trace_bvh(origin: vec3f, dir: vec3f) -> HitInfo {
 // BVH any-hit for shadows (returns true if blocked before max_t)
 fn trace_shadow(origin: vec3f, dir: vec3f, max_t: f32) -> bool {
   let inv_dir = 1.0 / dir;
-  var stk: array<u32, 16>; var sp = 0u; var cur = 0u;
-  let root = bvh_nodes[0u];
-  if intersect_aabb(origin, inv_dir, root.aabb_min, root.aabb_max, max_t) >= max_t { return false; }
+  var stk: array<u32, 12>; var sp = 0u; var cur = 0u;
+  let root_ab = node_aabb(bvh_nodes[0u]);
+  if intersect_aabb(origin, inv_dir, root_ab.mn, root_ab.mx, max_t) >= max_t { return false; }
   loop {
     let nd = bvh_nodes[cur];
     if nd.tri_count > 0u {
@@ -250,13 +344,15 @@ fn trace_shadow(origin: vec3f, dir: vec3f, max_t: f32) -> bool {
       if sp == 0u { break; } sp--; cur = stk[sp]; continue;
     }
     let l = nd.left_first; let r = l + 1u;
-    let tl = intersect_aabb(origin, inv_dir, bvh_nodes[l].aabb_min, bvh_nodes[l].aabb_max, max_t);
-    let tr = intersect_aabb(origin, inv_dir, bvh_nodes[r].aabb_min, bvh_nodes[r].aabb_max, max_t);
+    let lab = node_aabb(bvh_nodes[l]);
+    let rab = node_aabb(bvh_nodes[r]);
+    let tl = intersect_aabb(origin, inv_dir, lab.mn, lab.mx, max_t);
+    let tr = intersect_aabb(origin, inv_dir, rab.mn, rab.mx, max_t);
     if tl < tr {
-      if tr < max_t && sp < 16u { stk[sp] = r; sp++; }
+      if tr < max_t && sp < 12u { stk[sp] = r; sp++; }
       if tl < max_t { cur = l; } else { if sp == 0u { break; } sp--; cur = stk[sp]; }
     } else {
-      if tl < max_t && sp < 16u { stk[sp] = l; sp++; }
+      if tl < max_t && sp < 12u { stk[sp] = l; sp++; }
       if tr < max_t { cur = r; } else { if sp == 0u { break; } sp--; cur = stk[sp]; }
     }
   }
@@ -284,7 +380,7 @@ struct RayState {
   dir: vec3f,
   throughput: vec3f,
   radiance: vec3f,
-  rng_state: u32,
+  sampler_dim: u32,
   flags: u32,
   last_bsdf_pdf: f32,
   hit_t: f32,
@@ -298,7 +394,7 @@ fn load_ray_state(idx: u32) -> RayState {
   let r3 = ray_state[base + 3u];
   var rs: RayState;
   rs.origin = r0.xyz;
-  rs.rng_state = bitcast<u32>(r0.w);
+  rs.sampler_dim = bitcast<u32>(r0.w);
   rs.dir = r1.xyz;
   rs.flags = bitcast<u32>(r1.w);
   rs.throughput = r2.xyz;
@@ -310,7 +406,7 @@ fn load_ray_state(idx: u32) -> RayState {
 
 fn store_ray_state(idx: u32, rs: RayState) {
   let base = idx * 4u;
-  ray_state[base]       = vec4f(rs.origin,    bitcast<f32>(rs.rng_state));
+  ray_state[base]       = vec4f(rs.origin,    bitcast<f32>(rs.sampler_dim));
   ray_state[base + 1u]  = vec4f(rs.dir,       bitcast<f32>(rs.flags));
   ray_state[base + 2u]  = vec4f(rs.throughput, rs.last_bsdf_pdf);
   ray_state[base + 3u]  = vec4f(rs.radiance,  rs.hit_t);
@@ -322,12 +418,10 @@ fn set_bounce(flags: u32, b: u32) -> u32 { return (flags & 0xFFFF00FFu) | ((b & 
 // ============================================================
 // Material access helpers (v1: core fields only)
 // ============================================================
+// Material v2 accessors — only the fields v1 actually uses.
 fn mat_base_color(m: Material) -> vec3f { return m.d0.xyz; }
-fn mat_mat_type(m: Material) -> u32 { return u32(m.d0.w + 0.5); }
-fn mat_emission(m: Material) -> vec3f { return m.d1.xyz * max(m.d3.w, 0.0); }
-fn mat_roughness(m: Material) -> f32 { return max(m.d1.w, 0.04); }
-fn mat_metallic(m: Material) -> f32 { return clamp(m.d2.x, 0.0, 1.0); }
-fn mat_is_unlit(m: Material) -> bool { return (u32(m.d4.w + 0.5) & 4u) != 0u; }
+fn mat_emission(m: Material) -> vec3f { return m.d1.xyz; } // already premultiplied with strength by scene-loader
+fn mat_is_unlit(m: Material) -> bool { return m.d0.w > 0.5; }
 
 fn triangle_geo_normal(td: vec4u) -> vec3f {
   let a = vertices[td.x].xyz; let b = vertices[td.y].xyz; let c = vertices[td.z].xyz;
@@ -344,12 +438,13 @@ fn generate(@builtin(global_invocation_id) gid: vec3u) {
   if pixel.x >= res.x || pixel.y >= res.y { return; }
   let idx = pixel.y * res.x + pixel.x;
 
-  // PCG3D-seeded RNG per-pixel per-frame
-  let seed = pcg3d(vec3u(pixel.x, pixel.y, uniforms.frame_seed | 1u));
-  var rng = seed.x | 1u;
+  // Owen-scrambled Sobol sampler: per-pixel seed + temporal sample index.
+  // Dim 0/1 = sub-pixel jitter; subsequent bounces continue the dim
+  // sequence (stored as s.dim across bounces via ray_state).
+  var s = sampler_init(idx, uniforms.frame_seed, 0u);
 
-  // Sub-pixel jitter
-  let j = rand2(&rng);
+  // Sub-pixel jitter (consumes sampler dims 0-1)
+  let j = sampler_2d(&s);
   let uv_px = (vec2f(f32(pixel.x), f32(pixel.y)) + j) / uniforms.resolution;
   let ndc = uv_px * 2.0 - 1.0;
   let aspect = uniforms.resolution.x / uniforms.resolution.y;
@@ -364,20 +459,19 @@ fn generate(@builtin(global_invocation_id) gid: vec3u) {
   rs.dir = dir;
   rs.throughput = vec3f(1.0);
   rs.radiance = vec3f(0.0);
-  rs.rng_state = rng;
+  rs.sampler_dim = s.dim; // = 2 after jitter consumed dims 0,1
   rs.flags = FLAG_ALIVE | FLAG_DIFFUSE_PATH;
   rs.last_bsdf_pdf = 0.0;
   rs.hit_t = 1e4;
   store_ray_state(idx, rs);
 
-  // Initialize queue_a with all pixel indices — every primary ray starts
-  // alive, so the first bounce reads count_a = W*H (set by JS) and sees
-  // every pixel in queue_a[idx] = idx.
-  queue_a[idx] = idx;
-
-  // Default albedo (white) — overwritten by bounce kernel on first hit
-  textureStore(albedo_out, vec2i(pixel), vec4f(1.0, 1.0, 1.0, 1.0));
-  textureStore(denoise_nd_out, vec2i(pixel), vec4f(0.0, 1.0, 0.0, 1e4));
+  // NO queue_a[idx] = idx init — the first bounce pipeline is compiled with
+  // FIRST_BOUNCE=1 and reads gid.x directly. Subsequent bounces write
+  // their own survivors, so queue_a only gets populated from bounce 1 on.
+  //
+  // NO albedo_out / denoise_nd_out writes — those textures are orphaned
+  // since the legacy denoiser was removed. Reintroduced when textures +
+  // GGX + denoiser come back.
 }
 
 // ============================================================
@@ -386,147 +480,165 @@ fn generate(@builtin(global_invocation_id) gid: vec3u) {
 // hemisphere for next ray, updates state.
 // ============================================================
 @compute @workgroup_size(64)
-fn bounce(@builtin(global_invocation_id) gid: vec3u) {
+fn bounce(
+  @builtin(global_invocation_id) gid: vec3u,
+  @builtin(subgroup_invocation_id) sgid: u32,
+) {
+  // No early `return`s in this kernel — the wave-level compaction at the
+  // bottom uses subgroup ops that require subgroup-uniform control flow
+  // (all lanes must reach them). Instead, each lane carries a `processing`
+  // flag; lanes that bail out keep running but skip work blocks, and
+  // divergent "bail" inside the processing block uses `loop{break}` as a
+  // goto-forward so all lanes still rejoin at the function's single exit.
+
   let qi = gid.x;
-  let src_count = atomicLoad(&counts[SRC_QUEUE]);
-  if qi >= src_count { return; }
-
-  // Read pixel index from the source queue
-  var idx: u32;
-  if SRC_QUEUE == 0u { idx = queue_a[qi]; } else { idx = queue_b[qi]; }
-
   let res = vec2u(uniforms.resolution);
-  let pixel = vec2u(idx % res.x, idx / res.x);
 
-  // Clear shadow request upfront — early-exit paths (miss, unlit, back-
-  // hemisphere BSDF sample) leave it zero so shadow_trace skips this
-  // pixel this bounce.
-  shadow_req[idx * 3u] = vec4f(0.0);
+  var idx: u32 = 0u;
+  var processing = true;
 
-  var rs = load_ray_state(idx);
-  // Rays only get into the queue when alive, so this guard is redundant
-  // but harmless — cheaper than hoping optimiser strips it.
-  if (rs.flags & FLAG_ALIVE) == 0u { return; }
-
-  var rng = rs.rng_state;
-  let b = bounce_of(rs.flags);
-
-  let hit = trace_bvh(rs.origin, rs.dir);
-  if !hit.hit {
-    // Miss: add sky weighted by throughput, kill ray.
-    rs.radiance += rs.throughput * sky_color(rs.dir);
-    rs.flags &= ~FLAG_ALIVE;
-    rs.rng_state = rng;
-    store_ray_state(idx, rs);
-    return;
-  }
-
-  let td = tri_data[hit.tri_idx];
-  let mat = material_buf[td.w];
-  let hit_pos = rs.origin + rs.dir * hit.t;
-  let geo_normal_raw = triangle_geo_normal(td);
-  let front_face = dot(rs.dir, geo_normal_raw) < 0.0;
-  let geo_normal = select(-geo_normal_raw, geo_normal_raw, front_face);
-  let bw = 1.0 - hit.u - hit.v;
-  var normal = normalize(
-    bw * vert_normals[td.x].xyz
-    + hit.u * vert_normals[td.y].xyz
-    + hit.v * vert_normals[td.z].xyz
-  );
-  if !front_face { normal = -normal; }
-  if dot(normal, -rs.dir) < 0.01 { normal = geo_normal; } // fallback
-
-  // Emission — add only on first hit or after specular bounce (v1 all diffuse)
-  let em = mat_emission(mat);
-  if b == 0u && dot(em, vec3f(1.0)) > 1e-6 {
-    rs.radiance += rs.throughput * em;
-  }
-
-  if b == 0u {
-    // Capture first-hit gbuffer for denoiser (future use)
-    textureStore(albedo_out, vec2i(pixel), vec4f(mat_base_color(mat), 1.0));
-    textureStore(denoise_nd_out, vec2i(pixel), vec4f(normal, hit.t));
-  }
-  if b == 1u { rs.hit_t = hit.t; } // second-bounce distance for denoiser
-
-  // Unlit: just emit base color and terminate
-  if mat_is_unlit(mat) {
-    rs.radiance += rs.throughput * mat_base_color(mat);
-    rs.flags &= ~FLAG_ALIVE;
-    rs.rng_state = rng;
-    store_ray_state(idx, rs);
-    return;
-  }
-
-  // v1 treats every non-unlit material as pure Lambertian diffuse with
-  // the glTF baseColorFactor as albedo. Metallic is *ignored*: scene-loader
-  // defaults metallicFactor to 1.0 per glTF spec when the material expects
-  // a metallic-roughness texture to drive it; with no texture sampling
-  // that value is meaningless and taking (1 - metallic) would zero the
-  // albedo on every Sponza material (→ indirect black). Textures + real
-  // metallic handling come back in the next commit.
-  let base = mat_base_color(mat);
-  let albedo = base * INV_PI;
-
-  // NEE sun — delta light (directional). Queue shadow request for the
-  // dedicated shadow_trace kernel instead of tracing inline. Smaller
-  // bounce kernel → less register pressure → more occupancy on Adreno.
-  let nsl = dot(normal, uniforms.sun_dir);
-  if nsl > 0.0 {
-    var contribution = rs.throughput * albedo * SUN_RADIANCE * nsl;
-    if b > 0u {
-      let s = abs(contribution.x) + abs(contribution.y) + abs(contribution.z);
-      if s > CLAMP_INDIRECT { contribution *= CLAMP_INDIRECT / s; }
-    }
-    let sun_origin = ray_offset(hit_pos, geo_normal);
-    let sbase = idx * 3u;
-    shadow_req[sbase]      = vec4f(sun_origin,         1.0);
-    shadow_req[sbase + 1u] = vec4f(uniforms.sun_dir,   0.0);
-    shadow_req[sbase + 2u] = vec4f(contribution,       0.0);
-  }
-  // else: upfront clear leaves shadow_req with valid=0 → skipped
-
-  // Sample next direction: cosine hemisphere
-  let u_bsdf = rand2(&rng);
-  let new_dir = cosine_sample_hemisphere(normal, u_bsdf);
-  if dot(normal, new_dir) <= 0.0 {
-    rs.flags &= ~FLAG_ALIVE;
-    rs.rng_state = rng;
-    store_ray_state(idx, rs);
-    return;
-  }
-
-  // Lambertian throughput update (cosine-weighted sampling → pdf cancels)
-  rs.throughput *= base;
-  rs.origin = ray_offset(hit_pos, geo_normal);
-  rs.dir = new_dir;
-  rs.last_bsdf_pdf = max(dot(normal, new_dir), 0.0) * INV_PI;
-  rs.flags = set_bounce(rs.flags, b + 1u);
-
-  // Russian roulette after bounce 1
-  if b >= 1u {
-    let p = clamp(sqrt(max(max(rs.throughput.x, rs.throughput.y), rs.throughput.z)), 0.05, 0.9);
-    if rand1(&rng) > p {
-      rs.flags &= ~FLAG_ALIVE;
+  // First bounce: every primary ray is alive, so pixel_idx == gid.x and
+  // we skip the queue-read indirection entirely. Subsequent bounces: read
+  // pixel_idx from the source queue.
+  if FIRST_BOUNCE == 1u {
+    if qi >= res.x * res.y { processing = false; }
+    idx = qi;
+  } else {
+    let src_count = atomicLoad(&counts[SRC_QUEUE]);
+    if qi >= src_count {
+      processing = false;
     } else {
-      rs.throughput /= p;
+      if SRC_QUEUE == 0u { idx = queue_a[qi]; } else { idx = queue_b[qi]; }
     }
   }
 
-  // Terminate if over max bounces
-  if (b + 1u) >= uniforms.max_bounces {
-    rs.flags &= ~FLAG_ALIVE;
+  var rs: RayState;
+  if processing {
+    // Clear shadow request upfront — any "bail" inside the work loop below
+    // leaves it zero so shadow_trace skips this pixel this bounce.
+    shadow_req[idx * 3u] = vec4f(0.0);
+    rs = load_ray_state(idx);
+    if (rs.flags & FLAG_ALIVE) == 0u { processing = false; }
   }
 
-  rs.rng_state = rng;
-  store_ray_state(idx, rs);
+  if processing {
+    // Resume the sampler from where the previous bounce left off.
+    var s = sampler_init(idx, uniforms.frame_seed, rs.sampler_dim);
+    let b = bounce_of(rs.flags);
+    // Single-iter loop = forward-goto. `break` = "done with this lane's
+    // work for this bounce, skip to the store + compaction at the end".
+    loop {
+      let hit = trace_bvh(rs.origin, rs.dir);
+      if !hit.hit {
+        // Miss: add sky weighted by throughput, kill ray.
+        let sky_h = vec3h(sky_color(rs.dir));
+        let tp_h  = vec3h(rs.throughput);
+        rs.radiance += vec3f(tp_h * sky_h);
+        rs.flags &= ~FLAG_ALIVE;
+        break;
+      }
 
-  // If still alive, push pixel index onto the destination queue so the
-  // next bounce only touches this pixel. Dead rays (miss/unlit/RR/max-
-  // bounces) skip this and are naturally compacted out.
-  if (rs.flags & FLAG_ALIVE) != 0u {
-    let ni = atomicAdd(&counts[1u - SRC_QUEUE], 1u);
-    if SRC_QUEUE == 0u { queue_b[ni] = idx; } else { queue_a[ni] = idx; }
+      let td = tri_data[hit.tri_idx];
+      let mat = material_buf[td.w];
+      let hit_pos = rs.origin + rs.dir * hit.t;
+      let geo_normal_raw = triangle_geo_normal(td);
+      let front_face = dot(rs.dir, geo_normal_raw) < 0.0;
+      let geo_normal = select(-geo_normal_raw, geo_normal_raw, front_face);
+      let bw = 1.0 - hit.u - hit.v;
+      var normal = normalize(
+        bw * vert_normals[td.x].xyz
+        + hit.u * vert_normals[td.y].xyz
+        + hit.v * vert_normals[td.z].xyz
+      );
+      if !front_face { normal = -normal; }
+      if dot(normal, -rs.dir) < 0.01 { normal = geo_normal; } // fallback
+
+      // Emission (first hit only for v1 all-diffuse)
+      let em = mat_emission(mat);
+      if b == 0u && dot(em, vec3f(1.0)) > 1e-6 {
+        rs.radiance += rs.throughput * em;
+      }
+      if b == 1u { rs.hit_t = hit.t; }
+
+      if mat_is_unlit(mat) {
+        rs.radiance += rs.throughput * mat_base_color(mat);
+        rs.flags &= ~FLAG_ALIVE;
+        break;
+      }
+
+      // Lambertian path — scene-loader defaults metallic to 1.0 per glTF
+      // spec when the material expects a texture, so we ignore metallic.
+      let base_h   = vec3h(mat_base_color(mat));
+      let albedo_h = base_h * f16(INV_PI);
+      let throughput_h = vec3h(rs.throughput);
+
+      // NEE sun (delta). f16 color math; widen to f32 only at storage.
+      let nsl = dot(normal, uniforms.sun_dir);
+      if nsl > 0.0 {
+        var contribution = throughput_h * albedo_h * vec3h(SUN_RADIANCE) * f16(nsl);
+        if b > 0u {
+          let s = abs(contribution.x) + abs(contribution.y) + abs(contribution.z);
+          if s > f16(CLAMP_INDIRECT) { contribution *= f16(CLAMP_INDIRECT) / s; }
+        }
+        let sun_origin = ray_offset(hit_pos, geo_normal);
+        let sbase = idx * 3u;
+        shadow_req[sbase]      = vec4f(sun_origin,           1.0);
+        shadow_req[sbase + 1u] = vec4f(uniforms.sun_dir,     0.0);
+        shadow_req[sbase + 2u] = vec4f(vec3f(contribution),  0.0);
+      }
+
+      // Sample next direction: cosine hemisphere
+      let u_bsdf = sampler_2d(&s);
+      let new_dir = cosine_sample_hemisphere(normal, u_bsdf);
+      if dot(normal, new_dir) <= 0.0 {
+        rs.flags &= ~FLAG_ALIVE;
+        break;
+      }
+
+      // Lambertian throughput update (cosine-weighted sampling → pdf cancels).
+      rs.throughput = vec3f(vec3h(rs.throughput) * base_h);
+      rs.origin = ray_offset(hit_pos, geo_normal);
+      rs.dir = new_dir;
+      rs.last_bsdf_pdf = max(dot(normal, new_dir), 0.0) * INV_PI;
+      rs.flags = set_bounce(rs.flags, b + 1u);
+
+      // Russian roulette after bounce 1
+      if b >= 1u {
+        let p = clamp(sqrt(max(max(rs.throughput.x, rs.throughput.y), rs.throughput.z)), 0.05, 0.9);
+        if sampler_1d(&s) > p {
+          rs.flags &= ~FLAG_ALIVE;
+        } else {
+          rs.throughput /= p;
+        }
+      }
+
+      // Terminate if over max bounces
+      if (b + 1u) >= uniforms.max_bounces {
+        rs.flags &= ~FLAG_ALIVE;
+      }
+      break;
+    }
+    rs.sampler_dim = s.dim;
+    store_ray_state(idx, rs);
+  }
+
+  // ---- Uniform control flow reaches here ----
+  // Wave-level compaction: ONE atomicAdd per wave (instead of one per
+  // surviving lane), each alive lane writes to wave_base + exclusive_rank.
+  let alive = processing && ((rs.flags & FLAG_ALIVE) != 0u);
+  let alive_i: u32 = select(0u, 1u, alive);
+  let my_offset  = subgroupExclusiveAdd(alive_i);
+  let wave_total = subgroupAdd(alive_i);
+
+  var wave_base: u32 = 0u;
+  if sgid == 0u {
+    wave_base = atomicAdd(&counts[1u - SRC_QUEUE], wave_total);
+  }
+  wave_base = subgroupBroadcastFirst(wave_base);
+
+  if alive {
+    let slot = wave_base + my_offset;
+    if SRC_QUEUE == 0u { queue_b[slot] = idx; } else { queue_a[slot] = idx; }
   }
 }
 
@@ -598,6 +710,8 @@ fn composite(@builtin(global_invocation_id) gid: vec3u) {
   let res = vec2u(uniforms.resolution);
   if pixel.x >= res.x || pixel.y >= res.y { return; }
 
+  // Running-mean en f32. alpha = 1/(n+1) converge a la media insesgada;
+  // reseteado a 1 cuando JS detecta movimiento de cámara (frames_still=0).
   let curr = textureLoad(noisy_read, vec2i(pixel), 0).rgb;
   let prev = textureLoad(accum_prev, vec2i(pixel), 0).rgb;
   let alpha = 1.0 / f32(uniforms.frames_still + 1u);

@@ -791,7 +791,7 @@ export async function loadScene(basePath, onProgress) {
     const gltfSig = `${sceneLabel}-${gltfText.length}-${(gltfHash >>> 0).toString(16)}`;
     // Fast key: use buffer sizes instead of content hash (instant, no buffer iteration)
     const bufferSizes = buffers.map((buf, i) => `${i}:${buf.byteLength}`).join('.');
-    cacheKey = 'scene-v7-' + gltfSig + '-' + bufferSizes;
+    cacheKey = 'scene-v9-' + gltfSig + '-' + bufferSizes;
     cached = await dbGet(db, cacheKey);
   } catch(e) { /* IndexedDB not available, proceed without cache */ }
 
@@ -959,97 +959,27 @@ export async function loadScene(basePath, onProgress) {
     gpuUVExtra[v*6+5] = allUV3[v*2+1];
   }
 
-  // Materials -> GPU format (320 bytes / 80 floats per material)
+  // Materials -> GPU format (v2: trimmed to 32 bytes / 8 floats per material).
+  // Wavefront v1 path tracer only consumes albedo, emission (premultiplied
+  // with strength), and the unlit flag. Textures, PBR closures beyond
+  // Lambertian, transmission, clearcoat etc. are dropped until the shader
+  // needs them — brings per-hit material bandwidth down 10×.
+  const MAT_FLAG_UNLIT_BIT = 4; // matches MAT_FLAG_UNLIT used in extraction
   const materials = extractMaterials(gltf);
-  const gpuMaterials = new Float32Array(materials.length * 80);
+  const gpuMaterials = new Float32Array(materials.length * 8);
   let maxMaterialTexCoord = 0;
   for (let i = 0; i < materials.length; i++) {
-    const m = materials[i], o = i * 80;
-    gpuMaterials[o]    = m.albedo[0];
-    gpuMaterials[o+1]  = m.albedo[1];
-    gpuMaterials[o+2]  = m.albedo[2];
-    gpuMaterials[o+3]  = m.type;
-    gpuMaterials[o+4]  = m.emission[0];
-    gpuMaterials[o+5]  = m.emission[1];
-    gpuMaterials[o+6]  = m.emission[2];
-    gpuMaterials[o+7]  = m.roughness;
-    gpuMaterials[o+8]  = m.metallic;
-    gpuMaterials[o+9]  = m.baseTex;
-    gpuMaterials[o+10] = m.mrTex;
-    gpuMaterials[o+11] = m.normalTex;
-    gpuMaterials[o+12] = m.alphaMode;
-    gpuMaterials[o+13] = m.alphaCutoff;
-    gpuMaterials[o+14] = m.ior;
-    gpuMaterials[o+15] = m.emissionStrength || 1.0;
-    gpuMaterials[o+16] = m.transmission || 0.0;
-    gpuMaterials[o+17] = m.transmissionTex ?? -1;
-    gpuMaterials[o+18] = m.thickness || 0.0;
-    gpuMaterials[o+19] = m.flags || 0;
-    gpuMaterials[o+20] = m.baseAlpha ?? 1.0;
-    gpuMaterials[o+21] = m.baseTexCoord ?? 0;
-    gpuMaterials[o+22] = m.mrTexCoord ?? 0;
-    gpuMaterials[o+23] = m.normalTexCoord ?? 0;
-    gpuMaterials[o+24] = m.normalScale ?? 1.0;
-    gpuMaterials[o+25] = m.emissiveTex ?? -1;
-    gpuMaterials[o+26] = m.occlusionTex ?? -1;
-    gpuMaterials[o+27] = m.thicknessTex ?? -1;
-    gpuMaterials[o+28] = m.transmissionTexCoord ?? 0;
-    gpuMaterials[o+29] = m.emissiveTexCoord ?? 0;
-    gpuMaterials[o+30] = m.occlusionTexCoord ?? 0;
-    gpuMaterials[o+31] = m.thicknessTexCoord ?? 0;
-    gpuMaterials[o+32] = m.occlusionStrength ?? 1.0;
-    gpuMaterials[o+33] = m.attenuationDistance ?? 1e30;
-    gpuMaterials[o+34] = m.attenuationColor?.[0] ?? 1.0;
-    gpuMaterials[o+35] = m.attenuationColor?.[1] ?? 1.0;
-    gpuMaterials[o+36] = m.attenuationColor?.[2] ?? 1.0;
-    gpuMaterials[o+37] = 0.0;
-    gpuMaterials[o+38] = 0.0;
-    gpuMaterials[o+39] = 0.0;
-
-    gpuMaterials[o+40] = m.specularFactor ?? 1.0;
-    gpuMaterials[o+41] = m.specularTex ?? -1;
-    gpuMaterials[o+42] = m.specularColorTex ?? -1;
-    gpuMaterials[o+43] = m.specularColor?.[0] ?? 1.0;
-    gpuMaterials[o+44] = m.specularColor?.[1] ?? 1.0;
-    gpuMaterials[o+45] = m.specularColor?.[2] ?? 1.0;
-    gpuMaterials[o+46] = m.specularTexCoord ?? 0;
-    gpuMaterials[o+47] = m.specularColorTexCoord ?? 0;
-
-    gpuMaterials[o+48] = m.clearcoatFactor ?? 0.0;
-    gpuMaterials[o+49] = m.clearcoatTex ?? -1;
-    gpuMaterials[o+50] = m.clearcoatRoughness ?? 0.0;
-    gpuMaterials[o+51] = m.clearcoatRoughnessTex ?? -1;
-    gpuMaterials[o+52] = m.clearcoatTexCoord ?? 0;
-    gpuMaterials[o+53] = m.clearcoatRoughnessTexCoord ?? 0;
-    gpuMaterials[o+54] = m.clearcoatNormalTex ?? -1;
-    gpuMaterials[o+55] = m.clearcoatNormalTexCoord ?? 0;
-
-    gpuMaterials[o+56] = m.clearcoatNormalScale ?? 1.0;
-    gpuMaterials[o+57] = m.sheenColor?.[0] ?? 0.0;
-    gpuMaterials[o+58] = m.sheenColor?.[1] ?? 0.0;
-    gpuMaterials[o+59] = m.sheenColor?.[2] ?? 0.0;
-    gpuMaterials[o+60] = m.sheenRoughness ?? 0.0;
-    gpuMaterials[o+61] = m.sheenColorTex ?? -1;
-    gpuMaterials[o+62] = m.sheenRoughnessTex ?? -1;
-    gpuMaterials[o+63] = m.sheenColorTexCoord ?? 0;
-
-    gpuMaterials[o+64] = m.sheenRoughnessTexCoord ?? 0;
-    gpuMaterials[o+65] = m.anisotropyStrength ?? 0.0;
-    gpuMaterials[o+66] = m.anisotropyRotation ?? 0.0;
-    gpuMaterials[o+67] = m.anisotropyTex ?? -1;
-    gpuMaterials[o+68] = m.anisotropyTexCoord ?? 0;
-    gpuMaterials[o+69] = m.iridescenceFactor ?? 0.0;
-    gpuMaterials[o+70] = m.iridescenceTex ?? -1;
-    gpuMaterials[o+71] = m.iridescenceIor ?? 1.3;
-
-    gpuMaterials[o+72] = m.iridescenceThicknessMin ?? 100.0;
-    gpuMaterials[o+73] = m.iridescenceThicknessMax ?? 400.0;
-    gpuMaterials[o+74] = m.iridescenceThicknessTex ?? -1;
-    gpuMaterials[o+75] = m.iridescenceTexCoord ?? 0;
-    gpuMaterials[o+76] = m.iridescenceThicknessTexCoord ?? 0;
-    gpuMaterials[o+77] = m.dispersion ?? 0.0;
-    gpuMaterials[o+78] = 0.0;
-    gpuMaterials[o+79] = 0.0;
+    const m = materials[i], o = i * 8;
+    const unlit = ((m.flags || 0) & MAT_FLAG_UNLIT_BIT) ? 1.0 : 0.0;
+    const estr  = m.emissionStrength || 1.0;
+    gpuMaterials[o]   = m.albedo[0];
+    gpuMaterials[o+1] = m.albedo[1];
+    gpuMaterials[o+2] = m.albedo[2];
+    gpuMaterials[o+3] = unlit;
+    gpuMaterials[o+4] = m.emission[0] * estr;
+    gpuMaterials[o+5] = m.emission[1] * estr;
+    gpuMaterials[o+6] = m.emission[2] * estr;
+    gpuMaterials[o+7] = 0.0;
 
     maxMaterialTexCoord = Math.max(
       maxMaterialTexCoord,
@@ -1211,15 +1141,49 @@ export async function loadScene(basePath, onProgress) {
     vertMatIds[td[i*4+2]] = matIdx;
   }
 
+  // Quantize BVH AABBs: uint16 per axis relative to scene bounds (root
+  // node's AABB). Node goes from 32 B (2 vec3f + 2 u32) to 20 B (3 u32
+  // packing 6 uint16 + 2 u32). Precision = scene_extent / 65535 ≈ 0.5 mm
+  // for Sponza-sized scenes. Conservative rounding: min floors, max ceils
+  // so dequantized AABB always contains the exact geometry AABB.
+  const rf = bvh.nodesF32, ru = bvh.nodesU32, nc = bvh.nodeCount;
+  const sMinX = rf[0], sMinY = rf[1], sMinZ = rf[2];
+  const sMaxX = rf[4], sMaxY = rf[5], sMaxZ = rf[6];
+  const sScaleX = (sMaxX - sMinX) / 65535;
+  const sScaleY = (sMaxY - sMinY) / 65535;
+  const sScaleZ = (sMaxZ - sMinZ) / 65535;
+  const clampU16 = (v) => Math.max(0, Math.min(65535, v | 0));
+  const bvhQuantized = new Uint32Array(nc * 5);
+  for (let i = 0; i < nc; i++) {
+    const o = i * 8;
+    const qMinX = clampU16(Math.floor((rf[o  ] - sMinX) / sScaleX));
+    const qMinY = clampU16(Math.floor((rf[o+1] - sMinY) / sScaleY));
+    const qMinZ = clampU16(Math.floor((rf[o+2] - sMinZ) / sScaleZ));
+    const qMaxX = clampU16(Math.ceil ((rf[o+4] - sMinX) / sScaleX));
+    const qMaxY = clampU16(Math.ceil ((rf[o+5] - sMinY) / sScaleY));
+    const qMaxZ = clampU16(Math.ceil ((rf[o+6] - sMinZ) / sScaleZ));
+    const off = i * 5;
+    bvhQuantized[off]   = qMinX | (qMinY << 16);
+    bvhQuantized[off+1] = qMinZ | (qMaxX << 16);
+    bvhQuantized[off+2] = qMaxY | (qMaxZ << 16);
+    bvhQuantized[off+3] = ru[o+3]; // left_first
+    bvhQuantized[off+4] = ru[o+7]; // tri_count
+  }
+  const bvhScene = {
+    origin: [sMinX, sMinY, sMinZ],
+    scale:  [sScaleX, sScaleY, sScaleZ],
+  };
+
   const result = {
     gpuPositions,
     gpuNormals,
     gpuUVExtra,
     gpuTriData: bvh.sortedTriData,
     gpuTriFlat,
-    gpuBVHNodes: bvh.nodesF32,
+    gpuBVHNodes: bvhQuantized,
+    bvhScene,
     gpuMaterials,
-    materialStride: 80,
+    materialStride: 8,
     gpuEmissiveTris,
     punctualLights,
     rasterIndices,
