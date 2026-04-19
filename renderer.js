@@ -318,6 +318,9 @@ async function init() {
   // ReSTIR GI temporal — WRS merge with motion reprojection + jacobian +
   // visibility validation. Uses temporalLayout (includes bgl1 for BVH).
   const temporalPipeline  = device.createComputePipeline({ layout: temporalLayout,  compute: { module: wavefrontModule, entryPoint: 'restir_temporal' } });
+  // ReSTIR GI spatial — k random neighbors' reservoirs merged with jacobian
+  // + visibility shadow ray. Shares temporalLayout (same bgl signatures).
+  const spatialPipeline   = device.createComputePipeline({ layout: temporalLayout,  compute: { module: wavefrontModule, entryPoint: 'restir_spatial' } });
 
   const bg0 = device.createBindGroup({
     layout: bgl0,
@@ -340,9 +343,20 @@ async function init() {
       { binding: 4, resource: { buffer: matBuf } },
     ],
   });
-  // Two bg2 variants per layout: `currIdx` picks which ping-pong buffer
-  // is "curr" (read/write) and which is "prev" (read). JS alternates
-  // between them each frame so last frame's curr becomes this frame's prev.
+  // Reservoir role-fixed across frames, gbuf ping-pongs.
+  //   reservoirBuf[0] = temporal stage output (read by spatial as "prev",
+  //                     read by next frame's temporal as "curr dest")
+  //   reservoirBuf[1] = spatial stage output (read by shade this frame,
+  //                     read by next frame's temporal as "prev")
+  // A single ping-pong on reservoirs can't accommodate all three stages
+  // (temporal, spatial, shade) + frame-to-frame carryover without either
+  // a 3rd buffer or role-fixing the two. Role-fixing is simpler and the
+  // gbuf still ping-pongs via currIdx for temporal reprojection.
+  //
+  // bg2_main: used by bounce / shadow / generate / prep / temporal —
+  //           reservoir_curr (5) = temporal out, reservoir_prev (6) = spatial out
+  // bg2_spatial: used by spatial / shade —
+  //           reservoir_curr (5) = spatial out, reservoir_prev (6) = temporal out
   const bg2_main = [0, 1].map(curr => device.createBindGroup({
     layout: bgl2_main,
     entries: [
@@ -350,8 +364,21 @@ async function init() {
       { binding: 1, resource: { buffer: queueBBuf } },
       { binding: 2, resource: { buffer: countsBuf } },
       { binding: 4, resource: { buffer: candidateBuf } },
-      { binding: 5, resource: { buffer: reservoirBuf[curr] } },
-      { binding: 6, resource: { buffer: reservoirBuf[1 - curr] } },
+      { binding: 5, resource: { buffer: reservoirBuf[0] } },
+      { binding: 6, resource: { buffer: reservoirBuf[1] } },
+      { binding: 7, resource: { buffer: gbufBuf[curr] } },
+      { binding: 8, resource: { buffer: gbufBuf[1 - curr] } },
+    ],
+  }));
+  const bg2_spatial = [0, 1].map(curr => device.createBindGroup({
+    layout: bgl2_main,
+    entries: [
+      { binding: 0, resource: { buffer: queueABuf } },
+      { binding: 1, resource: { buffer: queueBBuf } },
+      { binding: 2, resource: { buffer: countsBuf } },
+      { binding: 4, resource: { buffer: candidateBuf } },
+      { binding: 5, resource: { buffer: reservoirBuf[1] } },
+      { binding: 6, resource: { buffer: reservoirBuf[0] } },
       { binding: 7, resource: { buffer: gbufBuf[curr] } },
       { binding: 8, resource: { buffer: gbufBuf[1 - curr] } },
     ],
@@ -364,8 +391,8 @@ async function init() {
       { binding: 2, resource: { buffer: countsBuf } },
       { binding: 3, resource: { buffer: dispatchArgsBuf } },
       { binding: 4, resource: { buffer: candidateBuf } },
-      { binding: 5, resource: { buffer: reservoirBuf[curr] } },
-      { binding: 6, resource: { buffer: reservoirBuf[1 - curr] } },
+      { binding: 5, resource: { buffer: reservoirBuf[0] } },
+      { binding: 6, resource: { buffer: reservoirBuf[1] } },
       { binding: 7, resource: { buffer: gbufBuf[curr] } },
       { binding: 8, resource: { buffer: gbufBuf[1 - curr] } },
     ],
@@ -711,7 +738,7 @@ async function init() {
     // NDC, validates history via normal + plane-distance + visibility
     // shadow ray, then WRS-merges the prev reservoir (with reconnection-
     // shift jacobian) against the current candidate. bg1 bound for the
-    // shadow ray's BVH traversal.
+    // shadow ray's BVH traversal. Writes to reservoirBuf[0] (temporal-out).
     {
       const p = enc.beginComputePass();
       p.setPipeline(temporalPipeline);
@@ -722,12 +749,26 @@ async function init() {
       p.dispatchWorkgroups(Math.ceil(rw/8), Math.ceil(rh/8));
       p.end();
     }
-    // restir_shade: direct + albedo * source_pdf * Lo * W from reservoir.
+    // restir_spatial: k random neighbors merged with jacobian + visibility.
+    // Under bg2_spatial mapping: reads reservoirBuf[0] (temporal-out) as
+    // "prev", writes reservoirBuf[1] (spatial-out) as "curr".
+    {
+      const p = enc.beginComputePass();
+      p.setPipeline(spatialPipeline);
+      p.setBindGroup(0, bg0_shade);
+      p.setBindGroup(1, bg1);
+      p.setBindGroup(2, bg2_spatial[currIdx]);
+      p.setBindGroup(3, bg3_shade);
+      p.dispatchWorkgroups(Math.ceil(rw/8), Math.ceil(rh/8));
+      p.end();
+    }
+    // restir_shade: reads reservoirBuf[1] (spatial-out, via bg2_spatial).
+    // final = direct + albedo * source_pdf_sel * Lo * W.
     {
       const p = enc.beginComputePass();
       p.setPipeline(shadePipeline);
       p.setBindGroup(0, bg0_shade);
-      p.setBindGroup(2, bg2_main[currIdx]);
+      p.setBindGroup(2, bg2_spatial[currIdx]);
       p.setBindGroup(3, bg3_shade);
       p.dispatchWorkgroups(Math.ceil(rw/8), Math.ceil(rh/8));
       p.end();

@@ -374,14 +374,17 @@ fn restir_temporal(@builtin(global_invocation_id) gid: vec3u) {
             // Reconnection-shift jacobian: transforms prev's reservoir from
             // g_prev.x_v's hemisphere to g_curr.x_v's hemisphere around the
             // same sample point prev.x_s. Clamped for numerical safety.
-            let v_to_s_curr = g_curr.x_v - prev.x_s;
-            let v_to_s_prev = g_prev.x_v - prev.x_s;
-            let d_curr_sq = max(dot(v_to_s_curr, v_to_s_curr), 1e-10);
-            let d_prev_sq = max(dot(v_to_s_prev, v_to_s_prev), 1e-10);
+            // s_to_v vector = x_v - x_s. cos θ at the sample point is
+            // dot(n_s, s_to_v/d) — positive for surfaces facing the
+            // visible point, which is the typical valid case.
+            let s_to_v_curr = g_curr.x_v - prev.x_s;
+            let s_to_v_prev = g_prev.x_v - prev.x_s;
+            let d_curr_sq = max(dot(s_to_v_curr, s_to_v_curr), 1e-10);
+            let d_prev_sq = max(dot(s_to_v_prev, s_to_v_prev), 1e-10);
             let d_curr_inv = inverseSqrt(d_curr_sq);
             let d_prev_inv = inverseSqrt(d_prev_sq);
-            let cos_curr = max(dot(prev.n_s, -v_to_s_curr * d_curr_inv), 0.0);
-            let cos_prev = max(dot(prev.n_s, -v_to_s_prev * d_prev_inv), 0.0);
+            let cos_curr = max(dot(prev.n_s, s_to_v_curr * d_curr_inv), 0.0);
+            let cos_prev = max(dot(prev.n_s, s_to_v_prev * d_prev_inv), 0.0);
 
             if cos_curr > 1e-4 && cos_prev > 1e-4 {
               let jacobian = clamp((cos_curr / cos_prev) * (d_prev_sq / d_curr_sq),
@@ -404,6 +407,116 @@ fn restir_temporal(@builtin(global_invocation_id) gid: vec3u) {
   let p_hat_sel = target_pdf_at(albedo, r.Lo);
   reservoir_finalize(&r, p_hat_sel);
 
+  store_reservoir_curr(idx, r);
+}
+
+// ============================================================
+// restir_spatial — Phase 1c spatial reuse.
+// Runs after restir_temporal. Reads from reservoir_prev binding (which
+// under the bg2_spatial mapping is the temporal-out slot), merges the
+// pixel's own temporal reservoir plus k random neighbors' temporal
+// reservoirs, writes to reservoir_curr (spatial-out slot).
+//
+// For each neighbor q:
+//   1. Validate surface (normal dot > 0.9, depth rel err < 10 %).
+//   2. Load neighbor's temporal reservoir.
+//   3. Shadow ray v_r → prev_q.x_s for visibility.
+//   4. Reconnection-shift jacobian from q's visible point to r's.
+//   5. WRS merge with weight w = p̂_r(Lo_q) × M_q × W_q × J.
+// ============================================================
+const SPATIAL_K: u32 = 5u;          // neighbors per pixel
+const SPATIAL_RADIUS: f32 = 16.0;   // disk radius in pixels
+
+@compute @workgroup_size(8, 8)
+fn restir_spatial(@builtin(global_invocation_id) gid: vec3u) {
+  let pixel = vec2u(gid.xy);
+  let res = vec2u(uniforms.resolution);
+  if pixel.x >= res.x || pixel.y >= res.y { return; }
+  let idx = pixel.y * res.x + pixel.x;
+
+  let g_r = gbuf_curr_load(idx);
+  let albedo_r = textureLoad(albedo_read, vec2i(pixel), 0).rgb;
+
+  var s = sampler_init(idx, uniforms.frame_seed ^ 0xC6BC279Fu, 0u);
+  var r = reservoir_empty();
+
+  // (1) Own (this-pixel) temporal reservoir — read via reservoir_prev
+  // under bg2_spatial mapping = reservoirBuf[0] = temporal out.
+  let own = load_reservoir_prev(idx);
+  if own.M > 0.0 {
+    let p_hat = target_pdf_at(albedo_r, own.Lo);
+    if p_hat > 0.0 {
+      let w = p_hat * own.M * own.W;
+      let xi = sampler_1d(&s);
+      reservoir_combine(&r, own.x_s, own.n_s, own.Lo, own.source_pdf,
+                        w, own.M, xi);
+    }
+  }
+
+  // (2) Spatial neighbors — only meaningful if this pixel has a valid
+  // primary hit (otherwise there's nothing to connect from).
+  if g_r.valid > 0.5 {
+    for (var k = 0u; k < SPATIAL_K; k = k + 1u) {
+      let u = sampler_2d(&s);
+      // Uniform sample in a disk of pixel radius SPATIAL_RADIUS.
+      let theta = u.x * TWO_PI;
+      let radius = sqrt(u.y) * SPATIAL_RADIUS;
+      let off_x = i32(round(radius * cos(theta)));
+      let off_y = i32(round(radius * sin(theta)));
+      let px_q = vec2i(pixel) + vec2i(off_x, off_y);
+      if px_q.x < 0 || px_q.y < 0
+         || px_q.x >= i32(res.x) || px_q.y >= i32(res.y) { continue; }
+      let pq = vec2u(px_q);
+      let idx_q = pq.y * res.x + pq.x;
+      if idx_q == idx { continue; }
+
+      let g_q = gbuf_curr_load(idx_q);
+      if g_q.valid < 0.5 { continue; }
+
+      let depth_rel_err = abs(g_r.depth_view - g_q.depth_view)
+                          / max(g_r.depth_view, 0.1);
+      let normal_dot = dot(g_r.n_v, g_q.n_v);
+      if depth_rel_err > DEPTH_VALID_RELERR || normal_dot < NORMAL_VALID_COS {
+        continue;
+      }
+
+      let prev_q = load_reservoir_prev(idx_q);
+      if prev_q.M <= 0.0 { continue; }
+
+      // Visibility: shadow ray from our visible point to neighbor's x_s.
+      let seg = prev_q.x_s - g_r.x_v;
+      let seg_len = length(seg);
+      let seg_dir = seg / max(seg_len, 1e-10);
+      let ray_org = ray_offset(g_r.x_v, g_r.n_v);
+      if trace_shadow(ray_org, seg_dir, seg_len * 0.999) { continue; }
+
+      // Reconnection-shift jacobian from q's visible point to ours.
+      // s_to_v vector: cos θ at sample point is dot(n_s, s→v direction),
+      // positive for surfaces facing the visible point.
+      let s_to_v_curr = g_r.x_v - prev_q.x_s;
+      let s_to_v_nb   = g_q.x_v - prev_q.x_s;
+      let d_curr_sq = max(dot(s_to_v_curr, s_to_v_curr), 1e-10);
+      let d_nb_sq   = max(dot(s_to_v_nb,   s_to_v_nb),   1e-10);
+      let d_curr_inv = inverseSqrt(d_curr_sq);
+      let d_nb_inv   = inverseSqrt(d_nb_sq);
+      let cos_curr = max(dot(prev_q.n_s, s_to_v_curr * d_curr_inv), 0.0);
+      let cos_nb   = max(dot(prev_q.n_s, s_to_v_nb   * d_nb_inv),   0.0);
+      if cos_curr < 1e-4 || cos_nb < 1e-4 { continue; }
+      let jacobian = clamp((cos_curr / cos_nb) * (d_nb_sq / d_curr_sq),
+                           0.0, 10.0);
+
+      let p_hat = target_pdf_at(albedo_r, prev_q.Lo);
+      if p_hat <= 0.0 { continue; }
+      let M_q = min(prev_q.M, M_CLAMP);
+      let w = p_hat * M_q * prev_q.W * jacobian;
+      let xi = sampler_1d(&s);
+      reservoir_combine(&r, prev_q.x_s, prev_q.n_s, prev_q.Lo, prev_q.source_pdf,
+                        w, M_q, xi);
+    }
+  }
+
+  let p_hat_sel = target_pdf_at(albedo_r, r.Lo);
+  reservoir_finalize(&r, p_hat_sel);
   store_reservoir_curr(idx, r);
 }
 
