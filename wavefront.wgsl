@@ -465,13 +465,13 @@ fn generate(@builtin(global_invocation_id) gid: vec3u) {
   rs.hit_t = 1e4;
   store_ray_state(idx, rs);
 
+  // Reset ReSTIR GI candidate for this pixel at frame start. All fields
+  // zero → valid=0 → shade treats indirect as 0 unless bounce captures.
+  cand_reset(idx);
+
   // NO queue_a[idx] = idx init — the first bounce pipeline is compiled with
   // FIRST_BOUNCE=1 and reads gid.x directly. Subsequent bounces write
   // their own survivors, so queue_a only gets populated from bounce 1 on.
-  //
-  // NO albedo_out / denoise_nd_out writes — those textures are orphaned
-  // since the legacy denoiser was removed. Reintroduced when textures +
-  // GGX + denoiser come back.
 }
 
 // ============================================================
@@ -527,13 +527,31 @@ fn bounce(
     let b = bounce_of(rs.flags);
     // Single-iter loop = forward-goto. `break` = "done with this lane's
     // work for this bounce, skip to the store + compaction at the end".
+    // ReSTIR GI note: this kernel splits radiance into "direct" (primary
+    // hit emission + sun NEE at primary) and "Lo" (indirect from the
+    // captured sample point x_s onwards). rs.throughput is re-purposed
+    // as the SAMPLE-FRAME throughput: stays 1.0 across bounce-0's BSDF
+    // sample (we enter bounce 1 with throughput=1 at x_s) and compounds
+    // with base_color only at b >= 1. The BRDF*cos/pdf cancel at the
+    // primary hit is applied in restir_shade as "base_primary * Lo", so
+    // direct + base_primary * Lo == old rs.radiance for M=1 no-reuse.
     loop {
       let hit = trace_bvh(rs.origin, rs.dir);
       if !hit.hit {
-        // Miss: add sky weighted by throughput, kill ray.
-        let sky_h = vec3h(sky_color(rs.dir));
-        let tp_h  = vec3h(rs.throughput);
-        rs.radiance += vec3f(tp_h * sky_h);
+        // Miss
+        if b == 0u {
+          // Primary miss → sky is direct (no visible point, valid stays 0)
+          cand_add_direct(idx, sky_color(rs.dir));
+        } else {
+          // Indirect miss → sky into Lo via sample-frame throughput, plus
+          // a synthetic "far" sample so shade uses Lo (valid=1). Lo lives
+          // in candidate_buf (not ray_state) so restir_shade can read it.
+          let sky_h = vec3h(sky_color(rs.dir));
+          let tp_h  = vec3h(rs.throughput);
+          cand_add_Lo(idx, vec3f(tp_h * sky_h));
+          let far_pos = rs.origin + rs.dir * 1e5;
+          cand_set_sample(idx, far_pos, -rs.dir);
+        }
         rs.flags &= ~FLAG_ALIVE;
         break;
       }
@@ -553,20 +571,30 @@ fn bounce(
       if !front_face { normal = -normal; }
       if dot(normal, -rs.dir) < 0.01 { normal = geo_normal; } // fallback
 
-      // Emission en todos los rebotes: emisivos de escena (teas Sponza)
-      // iluminan indirectamente a través del random walk. Antes solo
-      // contaban en b==0, lo que mataba toda la contribución indirecta
-      // de luces locales. Sin NEE a emisivos, este es el único canal
-      // por el que el path tracer los "descubre" — ReSTIR GI después
-      // reusará esos paths para bajar varianza.
+      // Capture sample point at bounce 1 hit (visible-from-primary surface).
+      if b == 1u {
+        cand_set_sample(idx, hit_pos, normal);
+      }
+
+      // Emission — direct at b==0, into Lo (with sample-frame throughput)
+      // at b >= 1. Emissive tri hits at bounce ≥1 are the only channel
+      // for scene-emissive GI without NEE-to-emissives.
       let em = mat_emission(mat);
       if dot(em, vec3f(1.0)) > 1e-6 {
-        rs.radiance += rs.throughput * em;
+        if b == 0u {
+          cand_add_direct(idx, em);
+        } else {
+          cand_add_Lo(idx, rs.throughput * em);
+        }
       }
-      if b == 1u { rs.hit_t = hit.t; }
 
       if mat_is_unlit(mat) {
-        rs.radiance += rs.throughput * mat_base_color(mat);
+        let unlit_c = mat_base_color(mat);
+        if b == 0u {
+          cand_add_direct(idx, unlit_c);
+        } else {
+          cand_add_Lo(idx, rs.throughput * unlit_c);
+        }
         rs.flags &= ~FLAG_ALIVE;
         break;
       }
@@ -577,22 +605,25 @@ fn bounce(
       let albedo_h = base_h * f16(INV_PI);
       let throughput_h = vec3h(rs.throughput);
 
-      // NEE sun (delta). f16 color math; widen to f32 only at storage.
+      // NEE sun (delta). Flag 1.0 = direct (b==0), 2.0 = indirect (b>=1),
+      // decoded by shadow_trace to route contribution to candidate.direct
+      // vs. rs.radiance (Lo).
       let nsl = dot(normal, uniforms.sun_dir);
       if nsl > 0.0 {
         var contribution = throughput_h * albedo_h * vec3h(SUN_RADIANCE) * f16(nsl);
         if b > 0u {
-          let s = abs(contribution.x) + abs(contribution.y) + abs(contribution.z);
-          if s > f16(CLAMP_INDIRECT) { contribution *= f16(CLAMP_INDIRECT) / s; }
+          let sabs = abs(contribution.x) + abs(contribution.y) + abs(contribution.z);
+          if sabs > f16(CLAMP_INDIRECT) { contribution *= f16(CLAMP_INDIRECT) / sabs; }
         }
         let sun_origin = ray_offset(hit_pos, geo_normal);
         let sbase = idx * 3u;
-        shadow_req[sbase]      = vec4f(sun_origin,           1.0);
+        let nee_flag = select(2.0, 1.0, b == 0u);
+        shadow_req[sbase]      = vec4f(sun_origin,           nee_flag);
         shadow_req[sbase + 1u] = vec4f(uniforms.sun_dir,     0.0);
         shadow_req[sbase + 2u] = vec4f(vec3f(contribution),  0.0);
       }
 
-      // Sample next direction: cosine hemisphere
+      // BSDF sample — cosine hemisphere
       let u_bsdf = sampler_2d(&s);
       let new_dir = cosine_sample_hemisphere(normal, u_bsdf);
       if dot(normal, new_dir) <= 0.0 {
@@ -600,14 +631,25 @@ fn bounce(
         break;
       }
 
-      // Lambertian throughput update (cosine-weighted sampling → pdf cancels).
-      rs.throughput = vec3f(vec3h(rs.throughput) * base_h);
+      // Sample-frame throughput: multiply by base only at b >= 1. At b==0
+      // the BRDF*cos/pdf cancel is deferred to shade time (base_primary
+      // * Lo), so throughput stays 1.0 entering bounce 1 = the x_s frame.
+      if b == 0u {
+        // Persist source pdf for ReSTIR merge in later phases
+        cand_set_source_pdf(idx, max(dot(normal, new_dir), 0.0) * INV_PI);
+        // G-buffer: primary albedo is the Lambertian base color.
+        // restir_shade multiplies this by Lo to form the indirect term.
+        let px = vec2u(idx % res.x, idx / res.x);
+        textureStore(albedo_out, vec2i(px), vec4f(mat_base_color(mat), 1.0));
+      } else {
+        rs.throughput = vec3f(vec3h(rs.throughput) * base_h);
+      }
       rs.origin = ray_offset(hit_pos, geo_normal);
       rs.dir = new_dir;
       rs.last_bsdf_pdf = max(dot(normal, new_dir), 0.0) * INV_PI;
       rs.flags = set_bounce(rs.flags, b + 1u);
 
-      // Russian roulette after bounce 1
+      // Russian roulette at b >= 1 only (sample-frame throughput).
       if b >= 1u {
         let p = clamp(sqrt(max(max(rs.throughput.x, rs.throughput.y), rs.throughput.z)), 0.05, 0.9);
         if sampler_1d(&s) > p {
@@ -682,7 +724,8 @@ fn shadow_trace(@builtin(global_invocation_id) gid: vec3u) {
 
   let sbase = idx * 3u;
   let r0 = shadow_req[sbase];
-  if r0.w < 0.5 { return; } // no request this bounce
+  let flag = r0.w;
+  if flag < 0.5 { return; } // no request this bounce
 
   let origin = r0.xyz;
   let dir    = shadow_req[sbase + 1u].xyz;
@@ -696,9 +739,15 @@ fn shadow_trace(@builtin(global_invocation_id) gid: vec3u) {
 
   if trace_shadow(origin, dir, INF) { return; } // sun occluded
 
-  let rbase = idx * 4u + 3u;
-  let cur = ray_state[rbase];
-  ray_state[rbase] = vec4f(cur.xyz + contrib, cur.w);
+  // Route the contribution: flag 1.0 = direct (primary NEE, bounce 0)
+  // → candidate.direct; flag 2.0 = indirect (bounce >= 1 NEE) → Lo in
+  // candidate_buf (so restir_shade can read it alongside the sample
+  // point). Set by the bounce kernel at the bounce NEE was queued.
+  if flag < 1.5 {
+    cand_add_direct(idx, contrib);
+  } else {
+    cand_add_Lo(idx, contrib);
+  }
 }
 
 // ============================================================

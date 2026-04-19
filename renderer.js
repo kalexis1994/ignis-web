@@ -118,7 +118,8 @@ async function init() {
   });
   const albTex = device.createTexture({
     size: [rw, rh], format: 'rgba8unorm',
-    usage: GPUTextureUsage.STORAGE_BINDING,
+    // TEXTURE_BINDING so restir_shade can sample albedo_primary at shade time.
+    usage: GPUTextureUsage.STORAGE_BINDING | GPUTextureUsage.TEXTURE_BINDING,
   });
   // Temporal accumulation ping-pong textures. Each frame reads from one
   // and writes to the other; display samples whichever was just written.
@@ -153,15 +154,31 @@ async function init() {
     usage: GPUBufferUsage.STORAGE | GPUBufferUsage.INDIRECT | GPUBufferUsage.COPY_DST,
   });
 
+  // ReSTIR GI candidate buffer — 4 vec4f (64 B) per pixel. Cleared by
+  // `generate` each frame, written by `bounce` at b==0/1 and `shadow_trace`,
+  // read by `restir_shade`. Later phases will add a second ping-pong
+  // reservoir buffer for temporal reuse.
+  const candidateBuf = device.createBuffer({
+    size: rw * rh * 64,
+    usage: GPUBufferUsage.STORAGE,
+  });
+
   // Uniforms — 96 bytes, matches Uniforms struct in wavefront.wgsl.
   // 128 bytes: base 96 + 32 for scene_origin/scene_scale (BVH dequant).
   const uniformBuf = device.createBuffer({
     size: 128, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
   });
 
-  // Shader modules
-  const wavefrontSrc = await fetch('wavefront.wgsl').then(r => r.text());
-  const wavefrontModule = device.createShaderModule({ code: wavefrontSrc });
+  // Shader modules. wavefront.wgsl + restir_gi.wgsl are concatenated into
+  // a single compilation unit so restir_gi can reference Uniforms,
+  // Sampler, noisy_out, etc. declared in wavefront, and wavefront can call
+  // cand_* helpers / candidate_buf declared in restir_gi (WGSL is order-
+  // independent at file scope).
+  const [wavefrontSrc, restirSrc] = await Promise.all([
+    fetch('wavefront.wgsl').then(r => r.text()),
+    fetch('restir_gi.wgsl').then(r => r.text()),
+  ]);
+  const wavefrontModule = device.createShaderModule({ code: wavefrontSrc + '\n' + restirSrc });
   const displaySrc = await fetch('display.wgsl').then(r => r.text());
   const displayModule = device.createShaderModule({ code: displaySrc });
 
@@ -186,25 +203,31 @@ async function init() {
       { binding: 4, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } },
     ],
   });
-  // bgl2_main: queue_a, queue_b, counts. NO dispatch_args — so when a
-  // bounce kernel dispatches indirectly off dispatchArgsBuf the buffer
-  // isn't also bound as storage in the same pass (WebGPU forbids
-  // writable + indirect in the same sync scope).
+  // bgl2_main: queue_a, queue_b, counts, candidate_buf. NO dispatch_args
+  // — so when a bounce kernel dispatches indirectly off dispatchArgsBuf
+  // the buffer isn't also bound as storage in the same pass (WebGPU
+  // forbids writable + indirect in the same sync scope). candidate_buf
+  // (binding 4) is declared in restir_gi.wgsl and used by bounce,
+  // shadow_trace, and restir_shade.
   const bgl2_main = device.createBindGroupLayout({
     entries: [
       { binding: 0, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } },
       { binding: 1, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } },
       { binding: 2, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } },
+      { binding: 4, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } }, // candidate_buf
     ],
   });
   // bgl2_prep: same + dispatch_args. Used only by prep_dispatch which
-  // doesn't dispatch anything (writes args for the NEXT pass).
+  // doesn't dispatch anything (writes args for the NEXT pass). Also
+  // mirrors the candidate_buf binding so the same layout signature
+  // satisfies the shader module's group-2 references.
   const bgl2_prep = device.createBindGroupLayout({
     entries: [
       { binding: 0, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } },
       { binding: 1, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } },
       { binding: 2, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } },
       { binding: 3, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } }, // dispatch_args
+      { binding: 4, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } }, // candidate_buf
     ],
   });
   const pipelineLayout = device.createPipelineLayout({ bindGroupLayouts: [bgl0, bgl1, bgl2_main] });
@@ -227,6 +250,28 @@ async function init() {
   });
   const compositeLayout = device.createPipelineLayout({ bindGroupLayouts: [bgl0_composite, null, null, bgl3] });
 
+  // Group 3 view for restir_shade — reads albedo_primary as sampled
+  // texture at binding 3 (composite uses 0/1/2 of group 3 with a
+  // different layout; WebGPU applies layouts per-pipeline so the two
+  // views coexist). bgl0 binds albedo_out as write-only storage for
+  // bounce; same texture can't be bound both ways in one pass, so
+  // restir_shade uses this separate bg3 with texture_2d access.
+  const bgl3_shade = device.createBindGroupLayout({
+    entries: [
+      { binding: 3, visibility: GPUShaderStage.COMPUTE, texture: { sampleType: 'unfilterable-float' } }, // albedo_read
+    ],
+  });
+  // Minimal bgl0 for restir_shade: uniforms + noisy_out only. Omits
+  // ndTex and albTex storage-writes so binding albTex as sampled texture
+  // in bg3 doesn't collide with its write-only binding in bgl0.
+  const bgl0_shade = device.createBindGroupLayout({
+    entries: [
+      { binding: 0, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'uniform' } },
+      { binding: 1, visibility: GPUShaderStage.COMPUTE, storageTexture: { access: 'write-only', format: 'rgba16float' } },
+    ],
+  });
+  const shadeLayout = device.createPipelineLayout({ bindGroupLayouts: [bgl0_shade, null, bgl2_main, bgl3_shade] });
+
   const genPipeline     = device.createComputePipeline({ layout: pipelineLayout, compute: { module: wavefrontModule, entryPoint: 'generate'     } });
   // bounce pipelines: FIRST variant reads gid.x directly (no queue load, used
   // only for bounce 0 where every ray is alive). A/B alternate for bounces 1+.
@@ -238,6 +283,9 @@ async function init() {
   const shadowPipeline    = device.createComputePipeline({ layout: pipelineLayout,  compute: { module: wavefrontModule, entryPoint: 'shadow_trace' } });
   const finPipeline       = device.createComputePipeline({ layout: pipelineLayout,  compute: { module: wavefrontModule, entryPoint: 'finalize'     } });
   const compositePipeline = device.createComputePipeline({ layout: compositeLayout, compute: { module: wavefrontModule, entryPoint: 'composite'    } });
+  // ReSTIR GI shade — replaces finalize. Combines direct (primary-hit
+  // emission + NEE) with albedo_primary * Lo from the captured sample.
+  const shadePipeline     = device.createComputePipeline({ layout: shadeLayout,     compute: { module: wavefrontModule, entryPoint: 'restir_shade' } });
 
   const bg0 = device.createBindGroup({
     layout: bgl0,
@@ -266,6 +314,7 @@ async function init() {
       { binding: 0, resource: { buffer: queueABuf } },
       { binding: 1, resource: { buffer: queueBBuf } },
       { binding: 2, resource: { buffer: countsBuf } },
+      { binding: 4, resource: { buffer: candidateBuf } },
     ],
   });
   const bg2_prep = device.createBindGroup({
@@ -275,6 +324,22 @@ async function init() {
       { binding: 1, resource: { buffer: queueBBuf } },
       { binding: 2, resource: { buffer: countsBuf } },
       { binding: 3, resource: { buffer: dispatchArgsBuf } },
+      { binding: 4, resource: { buffer: candidateBuf } },
+    ],
+  });
+  // Group 3 bind group for restir_shade — albedo_primary at binding 3.
+  const bg3_shade = device.createBindGroup({
+    layout: bgl3_shade,
+    entries: [
+      { binding: 3, resource: albTex.createView() },
+    ],
+  });
+  // Minimal bg0 for restir_shade (uniforms + noisy_out; no albTex).
+  const bg0_shade = device.createBindGroup({
+    layout: bgl0_shade,
+    entries: [
+      { binding: 0, resource: { buffer: uniformBuf } },
+      { binding: 1, resource: noisyTex.createView() },
     ],
   });
   // Ping-pong bind groups for composite: index `i` reads prev = accumTex[1-i]
@@ -577,12 +642,15 @@ async function init() {
         p.end();
       }
     }
+    // restir_shade: combine candidate (direct + albedo*Lo) into noisy_out.
+    // Replaces the old finalize kernel. Phase 1a has no reuse, so with a
+    // single captured sample this reproduces 1-SPP PT output.
     {
       const p = enc.beginComputePass();
-      p.setPipeline(finPipeline);
-      p.setBindGroup(0, bg0);
-      p.setBindGroup(1, bg1);
+      p.setPipeline(shadePipeline);
+      p.setBindGroup(0, bg0_shade);
       p.setBindGroup(2, bg2_main);
+      p.setBindGroup(3, bg3_shade);
       p.dispatchWorkgroups(Math.ceil(rw/8), Math.ceil(rh/8));
       p.end();
     }
