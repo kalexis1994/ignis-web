@@ -29,6 +29,14 @@ struct Uniforms {
   sun_dir: vec3f,      frames_still: u32,
   scene_origin: vec3f, _pad3: f32, // BVH AABB dequantization offset (scene min)
   scene_scale: vec3f,  _pad4: f32, // BVH AABB dequantization scale (extent / 65535)
+  // Previous-frame camera pose for ReSTIR GI temporal motion reprojection.
+  // Used by restir_temporal to transform this frame's primary hit world
+  // position into the previous frame's NDC, locating the pixel whose
+  // reservoir we should consider reusing.
+  prev_cam_pos: vec3f,     _pad5: f32,
+  prev_cam_forward: vec3f, _pad6: f32,
+  prev_cam_right: vec3f,   _pad7: f32,
+  prev_cam_up: vec3f,      prev_fov_factor: f32,
 };
 
 // BVH node with uint16-quantized AABB relative to scene bounds (20 B vs
@@ -468,6 +476,12 @@ fn generate(@builtin(global_invocation_id) gid: vec3u) {
   // Reset ReSTIR GI candidate for this pixel at frame start. All fields
   // zero → valid=0 → shade treats indirect as 0 unless bounce captures.
   cand_reset(idx);
+  // Invalidate current-frame G-buffer slot. Bounce overwrites it at
+  // b==0 on a primary hit in the Lambertian path; miss / unlit / out-
+  // of-frustum pixels keep valid=0 so temporal reprojection skips them.
+  // Without this, the ping-pong buffer would hold data from TWO frames
+  // ago and falsely pass validation.
+  gbuf_curr_invalidate(idx);
 
   // NO queue_a[idx] = idx init — the first bounce pipeline is compiled with
   // FIRST_BOUNCE=1 and reads gid.x directly. Subsequent bounces write
@@ -641,6 +655,12 @@ fn bounce(
         // restir_shade multiplies this by Lo to form the indirect term.
         let px = vec2u(idx % res.x, idx / res.x);
         textureStore(albedo_out, vec2i(px), vec4f(mat_base_color(mat), 1.0));
+        // Persistent G-buffer for ReSTIR temporal reprojection: world-
+        // space primary hit position, linear view Z, and shading normal.
+        // restir_temporal reads the ping-pong-prev copy to validate
+        // reprojected history.
+        let depth_view = dot(hit_pos - uniforms.camera_pos, uniforms.camera_forward);
+        gbuf_curr_write(idx, hit_pos, depth_view, normal);
       } else {
         rs.throughput = vec3f(vec3h(rs.throughput) * base_h);
       }

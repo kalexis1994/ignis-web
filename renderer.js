@@ -156,17 +156,35 @@ async function init() {
 
   // ReSTIR GI candidate buffer — 4 vec4f (64 B) per pixel. Cleared by
   // `generate` each frame, written by `bounce` at b==0/1 and `shadow_trace`,
-  // read by `restir_shade`. Later phases will add a second ping-pong
-  // reservoir buffer for temporal reuse.
+  // read by `restir_shade`.
   const candidateBuf = device.createBuffer({
     size: rw * rh * 64,
     usage: GPUBufferUsage.STORAGE,
   });
+  // ReSTIR GI reservoir — ping-pong, 3 vec4f (48 B) per pixel. Motion
+  // reprojection reads from reservoir_prev at the reprojected pixel and
+  // writes to reservoir_curr at this pixel; single buffer would race
+  // because reads and writes target different pixels.
+  const reservoirBuf = [0, 1].map(() => device.createBuffer({
+    size: rw * rh * 48,
+    usage: GPUBufferUsage.STORAGE,
+  }));
+  // Persistent G-buffer ping-pong — 2 vec4f (32 B) per pixel.
+  //   [0] = (x_v_world.xyz, depth_view_linear)
+  //   [1] = (n_v.xyz, valid_flag)
+  // Written by bounce at b==0 (Lambertian path); read by restir_temporal
+  // to reproject current primary hits into the previous frame's camera
+  // and validate the history by normal + plane-distance comparison.
+  const gbufBuf = [0, 1].map(() => device.createBuffer({
+    size: rw * rh * 32,
+    usage: GPUBufferUsage.STORAGE,
+  }));
 
-  // Uniforms — 96 bytes, matches Uniforms struct in wavefront.wgsl.
-  // 128 bytes: base 96 + 32 for scene_origin/scene_scale (BVH dequant).
+  // Uniforms — 192 bytes. 128 base + 64 for the previous-frame camera
+  // pose (pos/forward/right/up + prev_fov_factor) consumed by
+  // restir_temporal for motion reprojection.
   const uniformBuf = device.createBuffer({
-    size: 128, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+    size: 192, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
   });
 
   // Shader modules. wavefront.wgsl + restir_gi.wgsl are concatenated into
@@ -215,12 +233,16 @@ async function init() {
       { binding: 1, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } },
       { binding: 2, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } },
       { binding: 4, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } }, // candidate_buf
+      { binding: 5, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } }, // reservoir_curr
+      { binding: 6, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } }, // reservoir_prev
+      { binding: 7, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } }, // gbuf_curr
+      { binding: 8, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } }, // gbuf_prev
     ],
   });
   // bgl2_prep: same + dispatch_args. Used only by prep_dispatch which
-  // doesn't dispatch anything (writes args for the NEXT pass). Also
-  // mirrors the candidate_buf binding so the same layout signature
-  // satisfies the shader module's group-2 references.
+  // doesn't dispatch anything (writes args for the NEXT pass). Mirrors
+  // every bg2 binding so the shared shader module compiles against
+  // either layout.
   const bgl2_prep = device.createBindGroupLayout({
     entries: [
       { binding: 0, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } },
@@ -228,6 +250,10 @@ async function init() {
       { binding: 2, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } },
       { binding: 3, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } }, // dispatch_args
       { binding: 4, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } }, // candidate_buf
+      { binding: 5, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } }, // reservoir_curr
+      { binding: 6, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } }, // reservoir_prev
+      { binding: 7, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } }, // gbuf_curr
+      { binding: 8, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } }, // gbuf_prev
     ],
   });
   const pipelineLayout = device.createPipelineLayout({ bindGroupLayouts: [bgl0, bgl1, bgl2_main] });
@@ -284,8 +310,11 @@ async function init() {
   const finPipeline       = device.createComputePipeline({ layout: pipelineLayout,  compute: { module: wavefrontModule, entryPoint: 'finalize'     } });
   const compositePipeline = device.createComputePipeline({ layout: compositeLayout, compute: { module: wavefrontModule, entryPoint: 'composite'    } });
   // ReSTIR GI shade — replaces finalize. Combines direct (primary-hit
-  // emission + NEE) with albedo_primary * Lo from the captured sample.
+  // emission + NEE) with the resampled indirect term from the reservoir.
   const shadePipeline     = device.createComputePipeline({ layout: shadeLayout,     compute: { module: wavefrontModule, entryPoint: 'restir_shade' } });
+  // ReSTIR GI temporal — WRS merge of current candidate with prev-frame
+  // reservoir at same pixel. Shares layout with shade.
+  const temporalPipeline  = device.createComputePipeline({ layout: shadeLayout,     compute: { module: wavefrontModule, entryPoint: 'restir_temporal' } });
 
   const bg0 = device.createBindGroup({
     layout: bgl0,
@@ -308,16 +337,23 @@ async function init() {
       { binding: 4, resource: { buffer: matBuf } },
     ],
   });
-  const bg2_main = device.createBindGroup({
+  // Two bg2 variants per layout: `currIdx` picks which ping-pong buffer
+  // is "curr" (read/write) and which is "prev" (read). JS alternates
+  // between them each frame so last frame's curr becomes this frame's prev.
+  const bg2_main = [0, 1].map(curr => device.createBindGroup({
     layout: bgl2_main,
     entries: [
       { binding: 0, resource: { buffer: queueABuf } },
       { binding: 1, resource: { buffer: queueBBuf } },
       { binding: 2, resource: { buffer: countsBuf } },
       { binding: 4, resource: { buffer: candidateBuf } },
+      { binding: 5, resource: { buffer: reservoirBuf[curr] } },
+      { binding: 6, resource: { buffer: reservoirBuf[1 - curr] } },
+      { binding: 7, resource: { buffer: gbufBuf[curr] } },
+      { binding: 8, resource: { buffer: gbufBuf[1 - curr] } },
     ],
-  });
-  const bg2_prep = device.createBindGroup({
+  }));
+  const bg2_prep = [0, 1].map(curr => device.createBindGroup({
     layout: bgl2_prep,
     entries: [
       { binding: 0, resource: { buffer: queueABuf } },
@@ -325,8 +361,12 @@ async function init() {
       { binding: 2, resource: { buffer: countsBuf } },
       { binding: 3, resource: { buffer: dispatchArgsBuf } },
       { binding: 4, resource: { buffer: candidateBuf } },
+      { binding: 5, resource: { buffer: reservoirBuf[curr] } },
+      { binding: 6, resource: { buffer: reservoirBuf[1 - curr] } },
+      { binding: 7, resource: { buffer: gbufBuf[curr] } },
+      { binding: 8, resource: { buffer: gbufBuf[1 - curr] } },
     ],
-  });
+  }));
   // Group 3 bind group for restir_shade — albedo_primary at binding 3.
   const bg3_shade = device.createBindGroup({
     layout: bgl3_shade,
@@ -490,6 +530,10 @@ async function init() {
   // Temporal accumulation state
   let framesStill = 0, accumFrame = 0;
   let prevPos = [...camera.pos], prevYaw = camera.yaw, prevPitch = camera.pitch;
+  // ReSTIR ping-pong: currIdx picks which {reservoir,gbuf}Buf is the
+  // "curr" (this-frame write target) and which is "prev" (last-frame
+  // read source). Flipped at end of each frame.
+  let currIdx = 0;
 
   function updateCamera(dt) {
     const { forward, right } = camVectors();
@@ -521,6 +565,11 @@ async function init() {
     }
   }
 
+  // Previous-frame camera pose, written into the uniform each frame so
+  // restir_temporal can reproject world-space primary hits into the
+  // previous frame's NDC. Initialized on first writeUniforms call.
+  let prevCamState = null;
+
   function writeUniforms() {
     const { forward, right, up } = camVectors();
     // camera.fov is applied to the NARROW axis. The shader computes
@@ -533,7 +582,13 @@ async function init() {
     const tanHalfFov = Math.tan((camera.fov * Math.PI / 180) * 0.5);
     const aspect = rw / rh;
     const fovFactor = (aspect < 1.0) ? (tanHalfFov / aspect) : tanHalfFov;
-    const buf = new ArrayBuffer(128);
+    // On the very first frame, prev = current. Reprojection will land
+    // on-screen but gbuf_prev is zero-init (valid=0) so validation fails
+    // and no reuse happens. Fine.
+    if (prevCamState === null) {
+      prevCamState = { pos: [...camera.pos], forward: [...forward], right: [...right], up: [...up], fovFactor };
+    }
+    const buf = new ArrayBuffer(192);
     const f = new Float32Array(buf);
     const u = new Uint32Array(buf);
     f[0] = rw; f[1] = rh;
@@ -547,7 +602,14 @@ async function init() {
     // BVH dequantization: scene_origin (vec3f + pad) and scene_scale (vec3f + pad)
     f[24] = bvhScene.origin[0]; f[25] = bvhScene.origin[1]; f[26] = bvhScene.origin[2];
     f[28] = bvhScene.scale[0];  f[29] = bvhScene.scale[1];  f[30] = bvhScene.scale[2];
+    // Previous-frame camera pose, offsets 128-192 → float slots 32-47.
+    f[32] = prevCamState.pos[0];     f[33] = prevCamState.pos[1];     f[34] = prevCamState.pos[2];
+    f[36] = prevCamState.forward[0]; f[37] = prevCamState.forward[1]; f[38] = prevCamState.forward[2];
+    f[40] = prevCamState.right[0];   f[41] = prevCamState.right[1];   f[42] = prevCamState.right[2];
+    f[44] = prevCamState.up[0];      f[45] = prevCamState.up[1];      f[46] = prevCamState.up[2]; f[47] = prevCamState.fovFactor;
     device.queue.writeBuffer(uniformBuf, 0, buf);
+    // Save this-frame pose for next frame's "prev".
+    prevCamState = { pos: [...camera.pos], forward: [...forward], right: [...right], up: [...up], fovFactor };
   }
 
   function cameraMoved() {
@@ -598,7 +660,7 @@ async function init() {
       p.setPipeline(genPipeline);
       p.setBindGroup(0, bg0);
       p.setBindGroup(1, bg1);
-      p.setBindGroup(2, bg2_main);
+      p.setBindGroup(2, bg2_main[currIdx]);
       p.dispatchWorkgroups(Math.ceil(rw/8), Math.ceil(rh/8));
       p.end();
     }
@@ -614,7 +676,7 @@ async function init() {
         p.setPipeline(pipe);
         p.setBindGroup(0, bg0);
         p.setBindGroup(1, bg1);
-        p.setBindGroup(2, bg2_main);
+        p.setBindGroup(2, bg2_main[currIdx]);
         p.dispatchWorkgroupsIndirect(dispatchArgsBuf, 0);
         p.end();
       }
@@ -624,7 +686,7 @@ async function init() {
         p.setPipeline(shadowPipeline);
         p.setBindGroup(0, bg0);
         p.setBindGroup(1, bg1);
-        p.setBindGroup(2, bg2_main);
+        p.setBindGroup(2, bg2_main[currIdx]);
         p.dispatchWorkgroups(Math.ceil(rw/8), Math.ceil(rh/8));
         p.end();
       }
@@ -637,19 +699,31 @@ async function init() {
         p.setPipeline(nextReadsA ? prepPipelineA : prepPipelineB);
         p.setBindGroup(0, bg0);
         p.setBindGroup(1, bg1);
-        p.setBindGroup(2, bg2_prep);
+        p.setBindGroup(2, bg2_prep[currIdx]);
         p.dispatchWorkgroups(1);
         p.end();
       }
     }
-    // restir_shade: combine candidate (direct + albedo*Lo) into noisy_out.
-    // Replaces the old finalize kernel. Phase 1a has no reuse, so with a
-    // single captured sample this reproduces 1-SPP PT output.
+    // restir_temporal: reprojects current primary hits into prev frame's
+    // NDC, validates the history via normal + plane-distance test, then
+    // WRS-merges the prev reservoir (with reconnection-shift jacobian)
+    // against the current candidate. Bg2 variant picks which ping-pong
+    // slot is curr vs prev.
+    {
+      const p = enc.beginComputePass();
+      p.setPipeline(temporalPipeline);
+      p.setBindGroup(0, bg0_shade);
+      p.setBindGroup(2, bg2_main[currIdx]);
+      p.setBindGroup(3, bg3_shade);
+      p.dispatchWorkgroups(Math.ceil(rw/8), Math.ceil(rh/8));
+      p.end();
+    }
+    // restir_shade: direct + albedo * source_pdf * Lo * W from reservoir.
     {
       const p = enc.beginComputePass();
       p.setPipeline(shadePipeline);
       p.setBindGroup(0, bg0_shade);
-      p.setBindGroup(2, bg2_main);
+      p.setBindGroup(2, bg2_main[currIdx]);
       p.setBindGroup(3, bg3_shade);
       p.dispatchWorkgroups(Math.ceil(rw/8), Math.ceil(rh/8));
       p.end();
@@ -677,6 +751,10 @@ async function init() {
     }
     // Swap ping-pong: next frame reads what we just wrote, writes the other
     accumFrame = 1 - accumFrame;
+    // ReSTIR reservoir/gbuf ping-pong: next frame's "prev" is this frame's
+    // "curr" (which we just wrote). Flip the index so bg2_main/bg2_prep
+    // variants swap which buffer is which next frame.
+    currIdx = 1 - currIdx;
     // We just added one sample to the accumulator
     framesStill++;
     device.queue.submit([enc.finish()]);
