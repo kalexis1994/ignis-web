@@ -553,9 +553,14 @@ fn bounce(
       if !front_face { normal = -normal; }
       if dot(normal, -rs.dir) < 0.01 { normal = geo_normal; } // fallback
 
-      // Emission (first hit only for v1 all-diffuse)
+      // Emission en todos los rebotes: emisivos de escena (teas Sponza)
+      // iluminan indirectamente a través del random walk. Antes solo
+      // contaban en b==0, lo que mataba toda la contribución indirecta
+      // de luces locales. Sin NEE a emisivos, este es el único canal
+      // por el que el path tracer los "descubre" — ReSTIR GI después
+      // reusará esos paths para bajar varianza.
       let em = mat_emission(mat);
-      if b == 0u && dot(em, vec3f(1.0)) > 1e-6 {
+      if dot(em, vec3f(1.0)) > 1e-6 {
         rs.radiance += rs.throughput * em;
       }
       if b == 1u { rs.hit_t = hit.t; }
