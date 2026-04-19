@@ -356,28 +356,44 @@ fn restir_temporal(@builtin(global_invocation_id) gid: vec3u) {
       if valid_hist {
         let prev = load_reservoir_prev(idx_prev);
         if prev.M > 0.0 {
-          // Reconnection-shift jacobian: transforms prev's reservoir from
-          // g_prev.x_v's hemisphere to g_curr.x_v's hemisphere around the
-          // same sample point prev.x_s. Clamped for numerical safety.
-          let v_to_s_curr = g_curr.x_v - prev.x_s;
-          let v_to_s_prev = g_prev.x_v - prev.x_s;
-          let d_curr_sq = max(dot(v_to_s_curr, v_to_s_curr), 1e-10);
-          let d_prev_sq = max(dot(v_to_s_prev, v_to_s_prev), 1e-10);
-          let d_curr_inv = inverseSqrt(d_curr_sq);
-          let d_prev_inv = inverseSqrt(d_prev_sq);
-          let cos_curr = max(dot(prev.n_s, -v_to_s_curr * d_curr_inv), 0.0);
-          let cos_prev = max(dot(prev.n_s, -v_to_s_prev * d_prev_inv), 0.0);
+          // Visibility validation: trace a shadow ray from the current
+          // visible point to the previous sample point. If occluded, the
+          // path the prev reservoir represents is no longer realisable
+          // from this pixel — reuse would introduce energy that doesn't
+          // exist in the current scene (a dynamic occluder moved into
+          // the connection). max_t just short of x_s so we don't count
+          // x_s's own surface as blocker.
+          let seg = prev.x_s - g_curr.x_v;
+          let seg_len = length(seg);
+          let seg_dir = seg / max(seg_len, 1e-10);
+          let ray_org = ray_offset(g_curr.x_v, g_curr.n_v);
+          let max_t = seg_len * 0.999;
+          let occluded = trace_shadow(ray_org, seg_dir, max_t);
 
-          if cos_curr > 1e-4 && cos_prev > 1e-4 {
-            let jacobian = clamp((cos_curr / cos_prev) * (d_prev_sq / d_curr_sq),
-                                 0.0, 10.0);
-            let p_hat = target_pdf_at(albedo, prev.Lo);
-            if p_hat > 0.0 {
-              let M_p = min(prev.M, M_CLAMP);
-              let w = p_hat * M_p * prev.W * jacobian;
-              let xi = sampler_1d(&s);
-              reservoir_combine(&r, prev.x_s, prev.n_s, prev.Lo, prev.source_pdf,
-                                w, M_p, xi);
+          if !occluded {
+            // Reconnection-shift jacobian: transforms prev's reservoir from
+            // g_prev.x_v's hemisphere to g_curr.x_v's hemisphere around the
+            // same sample point prev.x_s. Clamped for numerical safety.
+            let v_to_s_curr = g_curr.x_v - prev.x_s;
+            let v_to_s_prev = g_prev.x_v - prev.x_s;
+            let d_curr_sq = max(dot(v_to_s_curr, v_to_s_curr), 1e-10);
+            let d_prev_sq = max(dot(v_to_s_prev, v_to_s_prev), 1e-10);
+            let d_curr_inv = inverseSqrt(d_curr_sq);
+            let d_prev_inv = inverseSqrt(d_prev_sq);
+            let cos_curr = max(dot(prev.n_s, -v_to_s_curr * d_curr_inv), 0.0);
+            let cos_prev = max(dot(prev.n_s, -v_to_s_prev * d_prev_inv), 0.0);
+
+            if cos_curr > 1e-4 && cos_prev > 1e-4 {
+              let jacobian = clamp((cos_curr / cos_prev) * (d_prev_sq / d_curr_sq),
+                                   0.0, 10.0);
+              let p_hat = target_pdf_at(albedo, prev.Lo);
+              if p_hat > 0.0 {
+                let M_p = min(prev.M, M_CLAMP);
+                let w = p_hat * M_p * prev.W * jacobian;
+                let xi = sampler_1d(&s);
+                reservoir_combine(&r, prev.x_s, prev.n_s, prev.Lo, prev.source_pdf,
+                                  w, M_p, xi);
+              }
             }
           }
         }

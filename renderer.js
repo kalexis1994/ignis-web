@@ -297,6 +297,9 @@ async function init() {
     ],
   });
   const shadeLayout = device.createPipelineLayout({ bindGroupLayouts: [bgl0_shade, null, bgl2_main, bgl3_shade] });
+  // Temporal reuse needs bg1 (BVH + vertices) for the visibility shadow
+  // ray from v_curr to prev.x_s. Shade doesn't, so it keeps shadeLayout.
+  const temporalLayout = device.createPipelineLayout({ bindGroupLayouts: [bgl0_shade, bgl1, bgl2_main, bgl3_shade] });
 
   const genPipeline     = device.createComputePipeline({ layout: pipelineLayout, compute: { module: wavefrontModule, entryPoint: 'generate'     } });
   // bounce pipelines: FIRST variant reads gid.x directly (no queue load, used
@@ -312,9 +315,9 @@ async function init() {
   // ReSTIR GI shade — replaces finalize. Combines direct (primary-hit
   // emission + NEE) with the resampled indirect term from the reservoir.
   const shadePipeline     = device.createComputePipeline({ layout: shadeLayout,     compute: { module: wavefrontModule, entryPoint: 'restir_shade' } });
-  // ReSTIR GI temporal — WRS merge of current candidate with prev-frame
-  // reservoir at same pixel. Shares layout with shade.
-  const temporalPipeline  = device.createComputePipeline({ layout: shadeLayout,     compute: { module: wavefrontModule, entryPoint: 'restir_temporal' } });
+  // ReSTIR GI temporal — WRS merge with motion reprojection + jacobian +
+  // visibility validation. Uses temporalLayout (includes bgl1 for BVH).
+  const temporalPipeline  = device.createComputePipeline({ layout: temporalLayout,  compute: { module: wavefrontModule, entryPoint: 'restir_temporal' } });
 
   const bg0 = device.createBindGroup({
     layout: bgl0,
@@ -705,14 +708,15 @@ async function init() {
       }
     }
     // restir_temporal: reprojects current primary hits into prev frame's
-    // NDC, validates the history via normal + plane-distance test, then
-    // WRS-merges the prev reservoir (with reconnection-shift jacobian)
-    // against the current candidate. Bg2 variant picks which ping-pong
-    // slot is curr vs prev.
+    // NDC, validates history via normal + plane-distance + visibility
+    // shadow ray, then WRS-merges the prev reservoir (with reconnection-
+    // shift jacobian) against the current candidate. bg1 bound for the
+    // shadow ray's BVH traversal.
     {
       const p = enc.beginComputePass();
       p.setPipeline(temporalPipeline);
       p.setBindGroup(0, bg0_shade);
+      p.setBindGroup(1, bg1);
       p.setBindGroup(2, bg2_main[currIdx]);
       p.setBindGroup(3, bg3_shade);
       p.dispatchWorkgroups(Math.ceil(rw/8), Math.ceil(rh/8));
