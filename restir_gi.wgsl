@@ -123,11 +123,20 @@ fn luminance(c: vec3f) -> f32 {
   return dot(c, vec3f(0.2126, 0.7152, 0.0722));
 }
 
-// Target pdf (at visible point) for a given sample. For Lambertian with
-// albedo a and outgoing radiance Lo: p̂ = luminance(a * Lo). This matches
-// the integrand proportional to the final shaded contribution.
-fn target_pdf_at(albedo: vec3f, Lo: vec3f) -> f32 {
-  return luminance(albedo * Lo);
+// Target pdf at a visible point for a given sample.
+// Ouyang 2021: p̂(X) = || BRDF(v,X) × L(X) × cos(n_v, v→s) ||.
+// For Lambertian BRDF=albedo/π, luminance of |BRDF·L·cos| ∝
+// luminance(albedo·Lo)·cos_v (the /π is constant and drops out under
+// RIS normalization). Including cos_v makes p̂ consistent across
+// different visible points (needed for unbiased MIS weights under
+// reuse); the old target_pdf_at omitted it and was only correct up
+// to the shade-time BRDF×cos factor for same-pixel reuse.
+fn target_pdf_gi(albedo: vec3f, Lo: vec3f, n_v: vec3f, x_v: vec3f, x_s: vec3f) -> f32 {
+  let d = x_s - x_v;
+  let d_sq = dot(d, d);
+  if d_sq < 1e-10 { return 0.0; }
+  let cos_v = max(dot(n_v, d * inverseSqrt(d_sq)), 0.0);
+  return luminance(albedo * Lo) * cos_v;
 }
 
 // Generalized WRS combine — merges either a fresh candidate (M_add=1,
@@ -151,10 +160,17 @@ fn reservoir_combine(
   return select_new;
 }
 
-// Finalize W = w_sum / (M × p̂(selected)). Call after all combines done.
+// Finalize W = w_sum / p̂(selected). With pairwise MIS the M weighting
+// is already inside each m_i (balance-heuristic has M_i in numerator
+// and Σ M_j terms in denominator), so per-sample contributions are
+// w_i = m_i × p̂_r(X_i) × W_i — no extra M_i factor — and W divides by
+// p̂ only, not by M_total. Dividing by M_total here would shrink W by
+// that factor and produce systematic darkening (most noticeable in
+// shadow regions where history M accumulates). M stays tracked on the
+// reservoir for clamping / next-frame merging.
 fn reservoir_finalize(r: ptr<function, Reservoir>, target_pdf: f32) {
-  if target_pdf > 0.0 && (*r).M > 0.0 {
-    (*r).W = (*r).w_sum / ((*r).M * target_pdf);
+  if target_pdf > 0.0 {
+    (*r).W = (*r).w_sum / target_pdf;
   } else {
     (*r).W = 0.0;
   }
@@ -326,77 +342,51 @@ fn restir_temporal(@builtin(global_invocation_id) gid: vec3u) {
   var s = sampler_init(idx, uniforms.frame_seed ^ 0x9E3779B1u, 0u);
   var r = reservoir_empty();
 
-  // (1) Current candidate
-  if valid_c && source_pdf_c > 1e-8 {
-    let p_hat = target_pdf_at(albedo, Lo_c);
-    if p_hat > 0.0 {
-      let w = p_hat / source_pdf_c;
-      let xi = sampler_1d(&s);
-      reservoir_combine(&r, x_s_c, n_s_c, Lo_c, source_pdf_c, w, 1.0, xi);
-    }
-  }
+  // First locate + validate the prev reservoir (if any). We need to
+  // know whether it's usable before we set MIS weights on the canonical
+  // candidate, since m_r depends on whether R_q contributes at all.
+  var has_prev = false;
+  var prev: Reservoir;
+  var g_prev: GBufEntry;
+  var jacobian_prev: f32 = 1.0;
 
-  // (2) Temporal reuse via motion reprojection
   if g_curr.valid > 0.5 {
     let rp = reproject_prev(g_curr.x_v);
     if rp.in_front && rp.uv.x >= 0.0 && rp.uv.x < 1.0
                    && rp.uv.y >= 0.0 && rp.uv.y < 1.0 {
       let pixel_prev = vec2u(rp.uv * uniforms.resolution);
       let idx_prev = pixel_prev.y * res.x + pixel_prev.x;
-      let g_prev = gbuf_prev_load(idx_prev);
+      let g_p = gbuf_prev_load(idx_prev);
 
-      // Validate: same surface under the reprojected pixel?
-      let depth_rel_err = abs(rp.depth_view - g_prev.depth_view)
+      let depth_rel_err = abs(rp.depth_view - g_p.depth_view)
                           / max(rp.depth_view, 0.1);
-      let normal_dot = dot(g_curr.n_v, g_prev.n_v);
-      let valid_hist = g_prev.valid > 0.5
+      let normal_dot = dot(g_curr.n_v, g_p.n_v);
+      let valid_hist = g_p.valid > 0.5
                      && depth_rel_err < DEPTH_VALID_RELERR
                      && normal_dot > NORMAL_VALID_COS;
 
       if valid_hist {
-        let prev = load_reservoir_prev(idx_prev);
-        if prev.M > 0.0 {
-          // Visibility validation: trace a shadow ray from the current
-          // visible point to the previous sample point. If occluded, the
-          // path the prev reservoir represents is no longer realisable
-          // from this pixel — reuse would introduce energy that doesn't
-          // exist in the current scene (a dynamic occluder moved into
-          // the connection). max_t just short of x_s so we don't count
-          // x_s's own surface as blocker.
-          let seg = prev.x_s - g_curr.x_v;
+        let pr = load_reservoir_prev(idx_prev);
+        if pr.M > 0.0 {
+          // Visibility: trace v_curr → pr.x_s, reject if occluded.
+          let seg = pr.x_s - g_curr.x_v;
           let seg_len = length(seg);
           let seg_dir = seg / max(seg_len, 1e-10);
           let ray_org = ray_offset(g_curr.x_v, g_curr.n_v);
-          let max_t = seg_len * 0.999;
-          let occluded = trace_shadow(ray_org, seg_dir, max_t);
-
-          if !occluded {
-            // Reconnection-shift jacobian: transforms prev's reservoir from
-            // g_prev.x_v's hemisphere to g_curr.x_v's hemisphere around the
-            // same sample point prev.x_s. Clamped for numerical safety.
-            // s_to_v vector = x_v - x_s. cos θ at the sample point is
-            // dot(n_s, s_to_v/d) — positive for surfaces facing the
-            // visible point, which is the typical valid case.
-            let s_to_v_curr = g_curr.x_v - prev.x_s;
-            let s_to_v_prev = g_prev.x_v - prev.x_s;
+          if !trace_shadow(ray_org, seg_dir, seg_len * 0.999) {
+            // Reconnection-shift jacobian
+            let s_to_v_curr = g_curr.x_v - pr.x_s;
+            let s_to_v_prev = g_p.x_v - pr.x_s;
             let d_curr_sq = max(dot(s_to_v_curr, s_to_v_curr), 1e-10);
             let d_prev_sq = max(dot(s_to_v_prev, s_to_v_prev), 1e-10);
-            let d_curr_inv = inverseSqrt(d_curr_sq);
-            let d_prev_inv = inverseSqrt(d_prev_sq);
-            let cos_curr = max(dot(prev.n_s, s_to_v_curr * d_curr_inv), 0.0);
-            let cos_prev = max(dot(prev.n_s, s_to_v_prev * d_prev_inv), 0.0);
-
+            let cos_curr = max(dot(pr.n_s, s_to_v_curr * inverseSqrt(d_curr_sq)), 0.0);
+            let cos_prev = max(dot(pr.n_s, s_to_v_prev * inverseSqrt(d_prev_sq)), 0.0);
             if cos_curr > 1e-4 && cos_prev > 1e-4 {
-              let jacobian = clamp((cos_curr / cos_prev) * (d_prev_sq / d_curr_sq),
-                                   0.0, 10.0);
-              let p_hat = target_pdf_at(albedo, prev.Lo);
-              if p_hat > 0.0 {
-                let M_p = min(prev.M, M_CLAMP);
-                let w = p_hat * M_p * prev.W * jacobian;
-                let xi = sampler_1d(&s);
-                reservoir_combine(&r, prev.x_s, prev.n_s, prev.Lo, prev.source_pdf,
-                                  w, M_p, xi);
-              }
+              has_prev = true;
+              prev = pr;
+              g_prev = g_p;
+              jacobian_prev = clamp((cos_curr / cos_prev) * (d_prev_sq / d_curr_sq),
+                                    0.0, 10.0);
             }
           }
         }
@@ -404,7 +394,56 @@ fn restir_temporal(@builtin(global_invocation_id) gid: vec3u) {
     }
   }
 
-  let p_hat_sel = target_pdf_at(albedo, r.Lo);
+  // Pairwise MIS for k=1: exact balance heuristic between canonical
+  // candidate (M_r=1) and the reprojected prev reservoir (M_q = clamped
+  // prev.M). Sums to 1 per sample.
+  //   m_r(X) = M_r·p̂_r(X) / (M_r·p̂_r(X) + M_q·p̂_q(X))
+  //   m_q(X) = M_q·p̂_q(X) / (M_r·p̂_r(X) + M_q·p̂_q(X))
+  // p̂_q evaluated at prev pixel's visible point. Prev-frame albedo is
+  // not persisted, so we approximate it as current-frame albedo — fine
+  // for static scenes, slight MIS inaccuracy under moving recolored
+  // surfaces (not a correctness-critical approximation; it just means
+  // MIS weights are slightly suboptimal in variance-reduction terms).
+  let M_r: f32 = 1.0;
+  let M_q: f32 = select(0.0, min(prev.M, M_CLAMP), has_prev);
+
+  // (1) Canonical candidate (X_c)
+  if valid_c && source_pdf_c > 1e-8 {
+    let p_hat_r_Xc = target_pdf_gi(albedo, Lo_c, g_curr.n_v, g_curr.x_v, x_s_c);
+    var m_r: f32 = 1.0;
+    if has_prev {
+      let p_hat_q_Xc = target_pdf_gi(albedo, Lo_c, g_prev.n_v, g_prev.x_v, x_s_c);
+      let denom = M_r * p_hat_r_Xc + M_q * p_hat_q_Xc;
+      if denom > 1e-10 {
+        m_r = (M_r * p_hat_r_Xc) / denom;
+      }
+    }
+    if p_hat_r_Xc > 0.0 {
+      // Pairwise MIS weight formula: w_i = m_i · p̂_r(X_i) · W_i.
+      // For the canonical fresh sample W_i = 1/source_pdf_c (the
+      // standard RIS initial weight). No M factor here — M is carried
+      // inside m_i's balance-heuristic numerator.
+      let w = m_r * p_hat_r_Xc * (1.0 / source_pdf_c);
+      let xi = sampler_1d(&s);
+      reservoir_combine(&r, x_s_c, n_s_c, Lo_c, source_pdf_c, w, M_r, xi);
+    }
+  }
+
+  // (2) Reused prev reservoir (X_q)
+  if has_prev {
+    let p_hat_r_Xq = target_pdf_gi(albedo, prev.Lo, g_curr.n_v, g_curr.x_v, prev.x_s);
+    let p_hat_q_Xq = target_pdf_gi(albedo, prev.Lo, g_prev.n_v, g_prev.x_v, prev.x_s);
+    let denom = M_r * p_hat_r_Xq + M_q * p_hat_q_Xq;
+    if denom > 1e-10 && p_hat_r_Xq > 0.0 {
+      let m_q = (M_q * p_hat_q_Xq) / denom;
+      let w = m_q * p_hat_r_Xq * prev.W * jacobian_prev;
+      let xi = sampler_1d(&s);
+      reservoir_combine(&r, prev.x_s, prev.n_s, prev.Lo, prev.source_pdf,
+                        w, M_q, xi);
+    }
+  }
+
+  let p_hat_sel = target_pdf_gi(albedo, r.Lo, g_curr.n_v, g_curr.x_v, r.x_s);
   reservoir_finalize(&r, p_hat_sel);
 
   store_reservoir_curr(idx, r);
@@ -438,27 +477,21 @@ fn restir_spatial(@builtin(global_invocation_id) gid: vec3u) {
   let albedo_r = textureLoad(albedo_read, vec2i(pixel), 0).rgb;
 
   var s = sampler_init(idx, uniforms.frame_seed ^ 0xC6BC279Fu, 0u);
-  var r = reservoir_empty();
 
-  // (1) Own (this-pixel) temporal reservoir — read via reservoir_prev
-  // under bg2_spatial mapping = reservoirBuf[0] = temporal out.
+  // Load the canonical (own temporal-stage) reservoir up front. Its MIS
+  // weight depends on which neighbors end up validating, so we merge it
+  // AFTER the neighbors while tracking the running sum of m_q(X_r).
   let own = load_reservoir_prev(idx);
-  if own.M > 0.0 {
-    let p_hat = target_pdf_at(albedo_r, own.Lo);
-    if p_hat > 0.0 {
-      let w = p_hat * own.M * own.W;
-      let xi = sampler_1d(&s);
-      reservoir_combine(&r, own.x_s, own.n_s, own.Lo, own.source_pdf,
-                        w, own.M, xi);
-    }
-  }
+  let M_r = own.M;
+  let p_hat_r_Xr = target_pdf_gi(albedo_r, own.Lo, g_r.n_v, g_r.x_v, own.x_s);
 
-  // (2) Spatial neighbors — only meaningful if this pixel has a valid
-  // primary hit (otherwise there's nothing to connect from).
-  if g_r.valid > 0.5 {
+  var r = reservoir_empty();
+  // Running sum of m_i(X_r) over contributing neighbors. m_r = 1 - this.
+  var canonical_mis_minus: f32 = 0.0;
+
+  if g_r.valid > 0.5 && own.M > 0.0 {
     for (var k = 0u; k < SPATIAL_K; k = k + 1u) {
       let u = sampler_2d(&s);
-      // Uniform sample in a disk of pixel radius SPATIAL_RADIUS.
       let theta = u.x * TWO_PI;
       let radius = sqrt(u.y) * SPATIAL_RADIUS;
       let off_x = i32(round(radius * cos(theta)));
@@ -483,7 +516,7 @@ fn restir_spatial(@builtin(global_invocation_id) gid: vec3u) {
       let prev_q = load_reservoir_prev(idx_q);
       if prev_q.M <= 0.0 { continue; }
 
-      // Visibility: shadow ray from our visible point to neighbor's x_s.
+      // Visibility shadow ray
       let seg = prev_q.x_s - g_r.x_v;
       let seg_len = length(seg);
       let seg_dir = seg / max(seg_len, 1e-10);
@@ -491,41 +524,76 @@ fn restir_spatial(@builtin(global_invocation_id) gid: vec3u) {
       if trace_shadow(ray_org, seg_dir, seg_len * 0.999) { continue; }
 
       // Reconnection-shift jacobian from q's visible point to ours.
-      // s_to_v vector: cos θ at sample point is dot(n_s, s→v direction),
-      // positive for surfaces facing the visible point.
       let s_to_v_curr = g_r.x_v - prev_q.x_s;
       let s_to_v_nb   = g_q.x_v - prev_q.x_s;
       let d_curr_sq = max(dot(s_to_v_curr, s_to_v_curr), 1e-10);
       let d_nb_sq   = max(dot(s_to_v_nb,   s_to_v_nb),   1e-10);
-      let d_curr_inv = inverseSqrt(d_curr_sq);
-      let d_nb_inv   = inverseSqrt(d_nb_sq);
-      let cos_curr = max(dot(prev_q.n_s, s_to_v_curr * d_curr_inv), 0.0);
-      let cos_nb   = max(dot(prev_q.n_s, s_to_v_nb   * d_nb_inv),   0.0);
+      let cos_curr = max(dot(prev_q.n_s, s_to_v_curr * inverseSqrt(d_curr_sq)), 0.0);
+      let cos_nb   = max(dot(prev_q.n_s, s_to_v_nb   * inverseSqrt(d_nb_sq)),   0.0);
       if cos_curr < 1e-4 || cos_nb < 1e-4 { continue; }
       let jacobian = clamp((cos_curr / cos_nb) * (d_nb_sq / d_curr_sq),
                            0.0, 10.0);
 
-      let p_hat = target_pdf_at(albedo_r, prev_q.Lo);
-      if p_hat <= 0.0 { continue; }
       let M_q = min(prev_q.M, M_CLAMP);
-      let w = p_hat * M_q * prev_q.W * jacobian;
+      let albedo_q = textureLoad(albedo_read, vec2i(pq), 0).rgb;
+
+      // Pairwise MIS vs canonical (per-neighbor pairwise approximation).
+      // For neighbor q's sample X_q:
+      //   m_q(X_q) = M_q·p̂_q(X_q) / (M_r·p̂_r(X_q) + M_q·p̂_q(X_q))
+      // For canonical X_r's share of neighbor q's MIS balance:
+      //   m_q(X_r) = M_q·p̂_q(X_r) / (M_r·p̂_r(X_r) + M_q·p̂_q(X_r))
+      // canonical_mis gets 1 - Σ m_q(X_r) as its weight. Exact for k=1;
+      // approximate for k>1 since inter-neighbor pairwise terms are
+      // omitted (ignores q_i vs q_j comparisons).
+      let p_hat_r_Xq = target_pdf_gi(albedo_r, prev_q.Lo, g_r.n_v, g_r.x_v, prev_q.x_s);
+      let p_hat_q_Xq = target_pdf_gi(albedo_q, prev_q.Lo, g_q.n_v, g_q.x_v, prev_q.x_s);
+
+      if p_hat_r_Xq <= 0.0 { continue; }
+
+      let denom_q = M_r * p_hat_r_Xq + M_q * p_hat_q_Xq;
+      if denom_q <= 1e-10 { continue; }
+      let m_q = (M_q * p_hat_q_Xq) / denom_q;
+
+      // Accumulate canonical MIS fraction at X_r from this neighbor
+      let p_hat_q_Xr = target_pdf_gi(albedo_q, own.Lo, g_q.n_v, g_q.x_v, own.x_s);
+      let denom_r = M_r * p_hat_r_Xr + M_q * p_hat_q_Xr;
+      if denom_r > 1e-10 {
+        canonical_mis_minus = canonical_mis_minus
+                            + (M_q * p_hat_q_Xr) / denom_r;
+      }
+
+      // Pairwise MIS weight formula (same as temporal):
+      // w_i = m_i · p̂_r(X_i) · W_i · J_i. No M factor.
+      let w = m_q * p_hat_r_Xq * prev_q.W * jacobian;
       let xi = sampler_1d(&s);
       reservoir_combine(&r, prev_q.x_s, prev_q.n_s, prev_q.Lo, prev_q.source_pdf,
                         w, M_q, xi);
     }
   }
 
-  let p_hat_sel = target_pdf_at(albedo_r, r.Lo);
+  // Merge canonical last with complement MIS weight.
+  if own.M > 0.0 && p_hat_r_Xr > 0.0 {
+    let m_r = clamp(1.0 - canonical_mis_minus, 0.0, 1.0);
+    let w = m_r * p_hat_r_Xr * own.W;
+    let xi = sampler_1d(&s);
+    reservoir_combine(&r, own.x_s, own.n_s, own.Lo, own.source_pdf,
+                      w, M_r, xi);
+  }
+
+  let p_hat_sel = target_pdf_gi(albedo_r, r.Lo, g_r.n_v, g_r.x_v, r.x_s);
   reservoir_finalize(&r, p_hat_sel);
   store_reservoir_curr(idx, r);
 }
 
 // ============================================================
 // restir_shade — combine direct + resampled indirect.
-// For Lambertian + cosine BSDF at primary, f_r × cos = albedo × source_pdf
-// (since source_pdf = cos/π and f_r = albedo/π). The full ReSTIR estimator
-// is f_r × cos × Lo × W, which collapses to albedo × source_pdf × Lo × W.
-// For M=1 (Phase 1a case) W = 1/source_pdf → reduces to albedo × Lo.
+// Proper ReSTIR estimator: indirect = f_r × Lo × cos_v × W
+// For Lambertian f_r = albedo / π, and cos_v is the angle between the
+// current pixel's n_v and the direction to the selected sample point
+// x_s. source_pdf stored in the reservoir came from the ORIGINAL
+// sample's pixel (via cosine BSDF) and doesn't apply here when the
+// sample was reused from a neighbor — we must re-evaluate cos_v at
+// our own visible point.
 // ============================================================
 @compute @workgroup_size(8, 8)
 fn restir_shade(@builtin(global_invocation_id) gid: vec3u) {
@@ -539,11 +607,17 @@ fn restir_shade(@builtin(global_invocation_id) gid: vec3u) {
   let direct = candidate_buf[cbase + 3u].xyz;
 
   let r = load_reservoir_curr(idx);
+  let g_curr = gbuf_curr_load(idx);
   let albedo = textureLoad(albedo_read, vec2i(pixel), 0).rgb;
 
   var indirect = vec3f(0.0);
-  if r.M > 0.0 && r.W > 0.0 {
-    indirect = albedo * r.source_pdf * r.Lo * r.W;
+  if r.M > 0.0 && r.W > 0.0 && g_curr.valid > 0.5 {
+    let v_to_s = r.x_s - g_curr.x_v;
+    let d_sq = dot(v_to_s, v_to_s);
+    if d_sq > 1e-10 {
+      let cos_v = max(dot(g_curr.n_v, v_to_s * inverseSqrt(d_sq)), 0.0);
+      indirect = (albedo * INV_PI) * r.Lo * cos_v * r.W;
+    }
   }
 
   var rad = direct + indirect;
