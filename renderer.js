@@ -264,7 +264,13 @@ async function init() {
     ],
   });
   const pipelineLayout = device.createPipelineLayout({ bindGroupLayouts: [bgl0, bgl1, bgl2_main] });
-  const prepPipeLayout = device.createPipelineLayout({ bindGroupLayouts: [bgl0, bgl1, bgl2_prep] });
+  // prep_dispatch only reads `counts` (bgl2_prep binding 2) and writes
+  // `dispatch_args` (binding 3). It doesn't touch group 0 or group 1 at
+  // all. Declaring them in the layout anyway would count ALL their
+  // storage buffers against maxStorageBuffersPerShaderStage (Adreno=16):
+  //   bgl0 (2) + bgl1 (6) + bgl2_prep (9) = 17 → validation failure.
+  // Null group slots contribute 0 buffers, keeping prep_dispatch at 9.
+  const prepPipeLayout = device.createPipelineLayout({ bindGroupLayouts: [null, null, bgl2_prep] });
 
   // Group 3 is only for the composite kernel (temporal accumulation)
   const bgl3 = device.createBindGroupLayout({
@@ -282,6 +288,15 @@ async function init() {
     entries: [{ binding: 0, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'uniform' } }],
   });
   const compositeLayout = device.createPipelineLayout({ bindGroupLayouts: [bgl0_composite, null, null, bgl3] });
+  // ReLAX temporal accumulation — replaces the old frames_still-gated
+  // composite with per-pixel surface-motion reprojection and
+  // disocclusion-aware bilinear blending. Needs bg2 for gbuf access
+  // (binding 7/8 are gbuf_curr / gbuf_prev, written by bounce and
+  // read here for plane-distance / normal disocclusion checks). bg3
+  // layout is shared with composite: noisy_read + accum_prev read,
+  // accum_new write, with history_length packed into accum.a so no
+  // extra binding is needed.
+  const relaxTemporalLayout = device.createPipelineLayout({ bindGroupLayouts: [bgl0_composite, null, bgl2_main, bgl3] });
 
   // Group 3 view for restir_shade — reads albedo_primary as sampled
   // texture at binding 3 (composite uses 0/1/2 of group 3 with a
@@ -319,6 +334,7 @@ async function init() {
   const shadowPipeline    = device.createComputePipeline({ layout: pipelineLayout,  compute: { module: wavefrontModule, entryPoint: 'shadow_trace' } });
   const finPipeline       = device.createComputePipeline({ layout: pipelineLayout,  compute: { module: wavefrontModule, entryPoint: 'finalize'     } });
   const compositePipeline = device.createComputePipeline({ layout: compositeLayout, compute: { module: wavefrontModule, entryPoint: 'composite'    } });
+  const relaxTemporalPipeline = device.createComputePipeline({ layout: relaxTemporalLayout, compute: { module: wavefrontModule, entryPoint: 'relax_temporal' } });
   // ReSTIR GI shade — replaces finalize. Combines direct (primary-hit
   // emission + NEE) with the resampled indirect term from the reservoir.
   const shadePipeline     = device.createComputePipeline({ layout: shadeLayout,     compute: { module: wavefrontModule, entryPoint: 'restir_shade' } });
@@ -682,7 +698,16 @@ async function init() {
     // or immediately after any camera motion, it's 0 → alpha=1 → composite
     // overwrites history entirely (so an uninitialized or stale accumulator
     // can't leak through). Incremented AFTER dispatches, below.
-    if (cameraMoved()) { framesStill = 0; accumFrame = 0; }
+    // framesStill is only consumed by the legacy `composite` kernel
+    // (not dispatched anymore). relax_temporal uses per-pixel
+    // history_length packed in accum.a instead of a global counter.
+    // accumFrame MUST keep alternating every frame — resetting it on
+    // camera motion was causing the ping-pong to stall (read & write
+    // the same buffer pair each frame while moving), so prev content
+    // never refreshed and the frame appeared frozen once the camera
+    // stopped. Per-pixel disocclusion in relax_temporal handles the
+    // fresh-sample case locally.
+    if (cameraMoved()) { framesStill = 0; }
     frameIdx++;
     writeUniforms();
 
@@ -736,8 +761,9 @@ async function init() {
         const nextReadsA = ((b + 1) % 2) === 0;
         const p = enc.beginComputePass();
         p.setPipeline(nextReadsA ? prepPipelineA : prepPipelineB);
-        p.setBindGroup(0, bg0);
-        p.setBindGroup(1, bg1);
+        // prep_dispatch's layout is [null, null, bgl2_prep] — group 0/1
+        // aren't accessed so we skip binding them (setting them would be
+        // harmless but unnecessary).
         p.setBindGroup(2, bg2_prep[currIdx]);
         p.dispatchWorkgroups(1);
         p.end();
@@ -782,13 +808,19 @@ async function init() {
       p.dispatchWorkgroups(Math.ceil(rw/8), Math.ceil(rh/8));
       p.end();
     }
-    // composite: blend current noisy with previous accumulator → new accum.
-    // Uses minimal bg0_composite (uniforms only) + bg3. Groups 1 and 2 are
-    // null in the composite pipeline layout so they're not set here.
+    // relax_temporal: ReLAX-style per-pixel temporal accumulation.
+    // Reprojects current primary hits into prev-frame NDC, validates
+    // via plane distance + normal + in-screen, bilinear-samples
+    // accum_prev with custom weights, blends with alpha driven by
+    // per-pixel history length (packed in accum.a). Replaces the
+    // frames_still-gated composite — camera motion no longer needs
+    // a global reset since each pixel's disocclusion logic handles
+    // it locally. bg2 carries gbuf_curr/prev as storage buffers.
     {
       const p = enc.beginComputePass();
-      p.setPipeline(compositePipeline);
+      p.setPipeline(relaxTemporalPipeline);
       p.setBindGroup(0, bg0_composite);
+      p.setBindGroup(2, bg2_main[currIdx]);
       p.setBindGroup(3, bg3[accumFrame]);
       p.dispatchWorkgroups(Math.ceil(rw/8), Math.ceil(rh/8));
       p.end();

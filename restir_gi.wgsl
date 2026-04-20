@@ -629,3 +629,232 @@ fn restir_shade(@builtin(global_invocation_id) gid: vec3u) {
   if lum > max_lum { rad *= max_lum / lum; }
   textureStore(noisy_out, vec2i(pixel), vec4f(rad, 1.0));
 }
+
+// ============================================================
+// relax_temporal — ReLAX-style per-pixel temporal accumulation.
+//
+// Port of the core logic in NVIDIA NRD's
+// RELAX_TemporalAccumulation.cs.hlsl (v4.x), simplified for a single
+// diffuse stream and Lambertian geometry:
+//   • Single (non-fast/non-SH) history, packed into accum.rgb.
+//   • Per-pixel history length packed into accum.a (range 0..63, so
+//     rgba16float has ample precision and no extra texture is needed).
+//   • No checkerboard, no material IDs, no hit distance reconstruction.
+//
+// Per-pixel pipeline:
+//   1. Load the current primary hit's g-buffer entry. If invalid
+//      (primary miss, unlit, out of frustum), pass through with
+//      history = 1.
+//   2. Reproject the current world-space visible point into the
+//      previous frame's NDC using the stored prev camera pose.
+//   3. Bilinear custom-weights sample over the 4 surrounding prev
+//      pixels. Each tap is validated:
+//        • prev g-buffer entry is valid (primary hit existed there)
+//        • plane distance from current surface < disocclusion threshold
+//        • normal agreement dot ≥ NORMAL_DOT_MIN (backface / cone)
+//      Invalid taps get weight 0; valid weights are re-normalized by
+//      their sum. If every tap rejects (weight_sum ≈ 0) the pixel is
+//      treated as disoccluded → alpha = 1.
+//   4. alpha = max(1 / (MAX_FRAMES + 1), 1 / history_length) once a
+//      valid reprojection is found. During warmup (history < MAX),
+//      1/history_length dominates so the first few frames effectively
+//      do a running mean; once history saturates, alpha floors at
+//      1/(MAX+1) and behaves like an exponential blend with that time
+//      constant. RELAX 4.x uses exactly this formula — see line 604
+//      of RELAX_TemporalAccumulation.cs.hlsl.
+//   5. history_length is incremented by 1 per successful reproject,
+//      clamped to MAX_ACCUM_FRAMES. A disocclusion resets it to 1.
+//
+// The disocclusion threshold is derived from the world-space size of a
+// pixel at the current view depth, scaled by a slack factor. This
+// matches RELAX's PixelRadiusToWorld-based computation but with a
+// constant NoV factor (1.0) — proper NoV-adaptive slack is a Phase 1.5
+// refinement and mostly matters at grazing angles.
+// ============================================================
+const RELAX_MAX_ACCUM_FRAMES: f32 = 63.0;
+const RELAX_DISOCC_PIXEL_SLACK: f32 = 10.0;
+const RELAX_NORMAL_DOT_MIN: f32 = 0.9;
+
+@compute @workgroup_size(8, 8)
+fn relax_temporal(@builtin(global_invocation_id) gid: vec3u) {
+  let pixel = vec2u(gid.xy);
+  let res = vec2u(uniforms.resolution);
+  if pixel.x >= res.x || pixel.y >= res.y { return; }
+  let idx = pixel.y * res.x + pixel.x;
+
+  let curr = textureLoad(noisy_read, vec2i(pixel), 0).rgb;
+  let g_curr = gbuf_curr_load(idx);
+
+  // Primary miss / unlit / out-of-frustum: no geometry to anchor
+  // reprojection on. Just emit the current sample with a fresh
+  // history. Downstream HistoryFix (Phase 2) fills these from
+  // neighbors if present; at this stage they show the raw frame.
+  if g_curr.valid < 0.5 {
+    textureStore(accum_new, vec2i(pixel), vec4f(curr, 1.0 / RELAX_MAX_ACCUM_FRAMES));
+    return;
+  }
+
+  // Reproject. `reproject_prev` uses the stored prev camera pose and
+  // returns uv in [0,1] when on-screen.
+  let rp = reproject_prev(g_curr.x_v);
+
+  var prev_rgb = vec3f(0.0);
+  var prev_hist: f32 = 0.0;
+  var weight_sum: f32 = 0.0;
+
+  if rp.in_front && rp.uv.x > 0.0 && rp.uv.x < 1.0 && rp.uv.y > 0.0 && rp.uv.y < 1.0 {
+    // Bilinear footprint: pixel-space (uv - 0.5 shift puts the sample
+    // centers at integer coords), fractional component gives weights.
+    let prev_pf = rp.uv * uniforms.resolution - vec2f(0.5);
+    let p0 = floor(prev_pf);
+    let fr = prev_pf - p0;
+    let w00 = (1.0 - fr.x) * (1.0 - fr.y);
+    let w10 = fr.x * (1.0 - fr.y);
+    let w01 = (1.0 - fr.x) * fr.y;
+    let w11 = fr.x * fr.y;
+
+    // World-size of a pixel at the current depth → disocclusion slack.
+    //   tan(fov/2) = fov_factor, so half-height at depth d = d*fov_factor
+    //   pixel_world_size = 2 * d * fov_factor / res.y
+    let pixel_world = g_curr.depth_view * uniforms.fov_factor * 2.0
+                      / max(uniforms.resolution.y, 1.0);
+    let disocc_th = pixel_world * RELAX_DISOCC_PIXEL_SLACK;
+
+    // 4 bilinear taps, each validated against current surface.
+    let base_p = vec2i(p0);
+
+    // Tap (0,0)
+    {
+      let tp = base_p + vec2i(0, 0);
+      let w = w00;
+      if tp.x >= 0 && tp.x < i32(res.x) && tp.y >= 0 && tp.y < i32(res.y) && w > 0.0 {
+        let tidx = u32(tp.y) * res.x + u32(tp.x);
+        let g_tap = gbuf_prev_load(tidx);
+        // View-space Z distance in PREV camera frame. rp.depth_view is
+        // the current world point projected into prev view space;
+        // g_tap.depth_view is the prev frame's stored view Z at the
+        // reprojected pixel. Matches the approach used by NVIDIA NRD's
+        // RELAX_TemporalAccumulation.cs.hlsl:121 — world-space plane
+        // distance along the shading normal (what we had before) is
+        // zero for lateral displacements perpendicular to the normal,
+        // letting stale history from a different surface at the same
+        // pixel pass as valid whenever the two surfaces happened to be
+        // on the same normal-plane (common on floors/ceilings seen from
+        // rotated viewpoints).
+        let plane_d = abs(rp.depth_view - g_tap.depth_view);
+        if g_tap.valid > 0.5 && plane_d < disocc_th
+           && dot(g_curr.n_v, g_tap.n_v) >= RELAX_NORMAL_DOT_MIN {
+          let a = textureLoad(accum_prev, tp, 0);
+          prev_rgb += w * a.rgb;
+          prev_hist += w * a.a * RELAX_MAX_ACCUM_FRAMES;
+          weight_sum += w;
+        }
+      }
+    }
+    // Tap (1,0)
+    {
+      let tp = base_p + vec2i(1, 0);
+      let w = w10;
+      if tp.x >= 0 && tp.x < i32(res.x) && tp.y >= 0 && tp.y < i32(res.y) && w > 0.0 {
+        let tidx = u32(tp.y) * res.x + u32(tp.x);
+        let g_tap = gbuf_prev_load(tidx);
+        // View-space Z distance in PREV camera frame. rp.depth_view is
+        // the current world point projected into prev view space;
+        // g_tap.depth_view is the prev frame's stored view Z at the
+        // reprojected pixel. Matches the approach used by NVIDIA NRD's
+        // RELAX_TemporalAccumulation.cs.hlsl:121 — world-space plane
+        // distance along the shading normal (what we had before) is
+        // zero for lateral displacements perpendicular to the normal,
+        // letting stale history from a different surface at the same
+        // pixel pass as valid whenever the two surfaces happened to be
+        // on the same normal-plane (common on floors/ceilings seen from
+        // rotated viewpoints).
+        let plane_d = abs(rp.depth_view - g_tap.depth_view);
+        if g_tap.valid > 0.5 && plane_d < disocc_th
+           && dot(g_curr.n_v, g_tap.n_v) >= RELAX_NORMAL_DOT_MIN {
+          let a = textureLoad(accum_prev, tp, 0);
+          prev_rgb += w * a.rgb;
+          prev_hist += w * a.a * RELAX_MAX_ACCUM_FRAMES;
+          weight_sum += w;
+        }
+      }
+    }
+    // Tap (0,1)
+    {
+      let tp = base_p + vec2i(0, 1);
+      let w = w01;
+      if tp.x >= 0 && tp.x < i32(res.x) && tp.y >= 0 && tp.y < i32(res.y) && w > 0.0 {
+        let tidx = u32(tp.y) * res.x + u32(tp.x);
+        let g_tap = gbuf_prev_load(tidx);
+        // View-space Z distance in PREV camera frame. rp.depth_view is
+        // the current world point projected into prev view space;
+        // g_tap.depth_view is the prev frame's stored view Z at the
+        // reprojected pixel. Matches the approach used by NVIDIA NRD's
+        // RELAX_TemporalAccumulation.cs.hlsl:121 — world-space plane
+        // distance along the shading normal (what we had before) is
+        // zero for lateral displacements perpendicular to the normal,
+        // letting stale history from a different surface at the same
+        // pixel pass as valid whenever the two surfaces happened to be
+        // on the same normal-plane (common on floors/ceilings seen from
+        // rotated viewpoints).
+        let plane_d = abs(rp.depth_view - g_tap.depth_view);
+        if g_tap.valid > 0.5 && plane_d < disocc_th
+           && dot(g_curr.n_v, g_tap.n_v) >= RELAX_NORMAL_DOT_MIN {
+          let a = textureLoad(accum_prev, tp, 0);
+          prev_rgb += w * a.rgb;
+          prev_hist += w * a.a * RELAX_MAX_ACCUM_FRAMES;
+          weight_sum += w;
+        }
+      }
+    }
+    // Tap (1,1)
+    {
+      let tp = base_p + vec2i(1, 1);
+      let w = w11;
+      if tp.x >= 0 && tp.x < i32(res.x) && tp.y >= 0 && tp.y < i32(res.y) && w > 0.0 {
+        let tidx = u32(tp.y) * res.x + u32(tp.x);
+        let g_tap = gbuf_prev_load(tidx);
+        // View-space Z distance in PREV camera frame. rp.depth_view is
+        // the current world point projected into prev view space;
+        // g_tap.depth_view is the prev frame's stored view Z at the
+        // reprojected pixel. Matches the approach used by NVIDIA NRD's
+        // RELAX_TemporalAccumulation.cs.hlsl:121 — world-space plane
+        // distance along the shading normal (what we had before) is
+        // zero for lateral displacements perpendicular to the normal,
+        // letting stale history from a different surface at the same
+        // pixel pass as valid whenever the two surfaces happened to be
+        // on the same normal-plane (common on floors/ceilings seen from
+        // rotated viewpoints).
+        let plane_d = abs(rp.depth_view - g_tap.depth_view);
+        if g_tap.valid > 0.5 && plane_d < disocc_th
+           && dot(g_curr.n_v, g_tap.n_v) >= RELAX_NORMAL_DOT_MIN {
+          let a = textureLoad(accum_prev, tp, 0);
+          prev_rgb += w * a.rgb;
+          prev_hist += w * a.a * RELAX_MAX_ACCUM_FRAMES;
+          weight_sum += w;
+        }
+      }
+    }
+  }
+
+  var history_length: f32;
+  var mixed: vec3f;
+  if weight_sum > 0.01 {
+    // Renormalize over the valid taps that contributed.
+    let inv_ws = 1.0 / weight_sum;
+    prev_rgb *= inv_ws;
+    prev_hist *= inv_ws;
+    history_length = min(prev_hist + 1.0, RELAX_MAX_ACCUM_FRAMES);
+    // RELAX alpha (line 604): warmup 1/history_length dominates;
+    // once history saturates, floors at 1/(MAX+1). This gives a
+    // running mean up to MAX then transitions to exponential blend.
+    let alpha = max(1.0 / (RELAX_MAX_ACCUM_FRAMES + 1.0), 1.0 / history_length);
+    mixed = mix(prev_rgb, curr, alpha);
+  } else {
+    // Disocclusion: every tap rejected. Fresh sample, history = 1.
+    history_length = 1.0;
+    mixed = curr;
+  }
+
+  textureStore(accum_new, vec2i(pixel), vec4f(mixed, history_length / RELAX_MAX_ACCUM_FRAMES));
+}

@@ -132,12 +132,14 @@ const INF: f32 = 1e30;
 const T_MIN: f32 = 1e-4;
 const SUN_COS_HALF: f32 = 0.9999619; // ~0.5° angular radius
 const SUN_RADIANCE: vec3f = vec3f(6.5, 6.0, 5.0); // punchy sun, tonemap trims
-// Firefly filter threshold. RTXPT exposes this as a uniform (default
-// range 2–10 depending on scene); here it's a const until a UI slider
-// is added. Average-RGB cap for any emission/sky/NEE contribution
-// collected along an indirect path, scaled by the per-path firefly_k
-// tracker (see PathTracerHelpers.hlsli:206).
-const FIREFLY_THRESHOLD: f32 = 8.0;
+// Firefly filter threshold. Caps max RGB channel post-scale by
+// firefly_k (path tracker) or nee_k (NEE-specific). 6.0 is a balance:
+// allows direct sun-lit surfaces (~6.5 RGB) and close-view emitters
+// near full emission intensity, while clamping amplification spikes
+// (rare CDF picks × 1/d² × 1/p_pick). The d² floor and NEE-derived k
+// do the heavy lifting for NEE-specific firefly sources; the global
+// threshold is a secondary safety net.
+const FIREFLY_THRESHOLD: f32 = 6.0;
 
 const FLAG_ALIVE: u32 = 1u;
 const FLAG_DIFFUSE_PATH: u32 = 2u;
@@ -441,9 +443,15 @@ fn update_firefly_k(current_k: f32, bounce_pdf: f32, lobe_p: f32) -> f32 {
 
 fn firefly_filter(signal: vec3f, threshold: f32, k: f32) -> vec3f {
   let t = threshold * k;
-  let avg = (signal.x + signal.y + signal.z) * (1.0 / 3.0);
-  if avg > t {
-    return signal * (t / avg);
+  // RTXPT uses average-RGB to avoid hue shift toward blue under
+  // luminance-based clamping, but chromatic emitters (pure-red
+  // candles, cyan neon) let single-channel spikes slip through the
+  // average. Max-channel catches every spike regardless of hue and
+  // preserves color ratios by scaling uniformly — same property as
+  // RTXPT's rationale, without the hue bias.
+  let max_c = max(max(signal.x, signal.y), signal.z);
+  if max_c > t {
+    return signal * (t / max_c);
   }
   return signal;
 }
@@ -789,25 +797,42 @@ fn bounce(
         let x_l = sample_triangle_uniform(u_tri, v0, v1, v2);
         let n_l = normalize(cross(v1 - v0, v2 - v0));
 
-        let w       = x_l - hit_pos;
-        let d_sq    = dot(w, w);
-        let d       = sqrt(max(d_sq, 1e-20));
-        let w_hat   = w / d;
+        let w         = x_l - hit_pos;
+        // Distance² floor: the solid-angle pdf has a 1/d² singularity
+        // that spikes hard at corners/edges where an emissive surface
+        // sits within a few cm of the shading point. Flooring d² at
+        // 0.01 (= d = 0.1 m) bounds 1/d² ≤ 100 regardless of geometry
+        // pathology. Biases very-near emitter illumination downward by
+        // at most the ratio (true d² / 0.01), which for scene-scale
+        // geometries (m units) is a small underestimation in a narrow
+        // corner band and catches the firefly tail elsewhere.
+        let d_sq_raw  = dot(w, w);
+        let d_sq      = max(d_sq_raw, 0.01);
+        let d         = sqrt(d_sq);
+        let w_hat     = w / sqrt(max(d_sq_raw, 1e-20));
         let cos_surf  = dot(normal, w_hat);
         let cos_light = -dot(n_l, w_hat);
 
-        if cos_surf > 1e-4 && cos_light > 1e-4 && d_sq > 1e-8 {
+        if cos_surf > 1e-4 && cos_light > 1e-4 && d_sq_raw > 1e-8 {
           let e_mat = material_buf[etd.w];
           let Le = mat_emission(e_mat);
-          // Solid-angle pdf: p_pick * d² / (area * cos_light).
+          // Solid-angle pdf: p_pick * d² / (area * cos_light). Uses the
+          // floored d_sq so the downstream 1/pdf_sa factor is capped.
           let pdf_sa = p_pick * d_sq / max(e_area * cos_light, 1e-20);
           // BRDF × Li × cos / pdf_sa. albedo_h = base/π already, so the
           // full estimator is (albedo/π) * Le * cos_surf / pdf_sa ×
           // path throughput.
           var contrib = vec3f(throughput_h * albedo_h) * Le * (cos_surf / pdf_sa);
-          if b > 0u {
-            contrib = firefly_filter(contrib, FIREFLY_THRESHOLD, rs.firefly_k);
-          }
+          // Firefly defense: NEE-derived k shrinks the threshold for
+          // wide-lobe (low-pdf) samples which are the amplification-
+          // prone ones. Combined with the d² floor above this is
+          // enough for most cases. A harder hard luminance cap was
+          // tested (max_nee_lum = 2.0) but over-dimmed legitimate
+          // close-emitter illumination on nearby walls; relying on
+          // the pdf-floor + filter pair keeps physically plausible
+          // close contributions visible while bounding spikes.
+          let nee_k = update_firefly_k(rs.firefly_k, pdf_sa, 1.0);
+          contrib = firefly_filter(contrib, FIREFLY_THRESHOLD, nee_k);
 
           let e_origin = ray_offset(hit_pos, geo_normal);
           // max_t = d * 0.999 so we stop just short of x_l; the shadow
