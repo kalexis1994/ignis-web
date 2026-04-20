@@ -124,7 +124,12 @@ const INF: f32 = 1e30;
 const T_MIN: f32 = 1e-4;
 const SUN_COS_HALF: f32 = 0.9999619; // ~0.5° angular radius
 const SUN_RADIANCE: vec3f = vec3f(6.5, 6.0, 5.0); // punchy sun, tonemap trims
-const CLAMP_INDIRECT: f32 = 10.0;
+// Firefly filter threshold. RTXPT exposes this as a uniform (default
+// range 2–10 depending on scene); here it's a const until a UI slider
+// is added. Average-RGB cap for any emission/sky/NEE contribution
+// collected along an indirect path, scaled by the per-path firefly_k
+// tracker (see PathTracerHelpers.hlsli:206).
+const FIREFLY_THRESHOLD: f32 = 8.0;
 
 const FLAG_ALIVE: u32 = 1u;
 const FLAG_DIFFUSE_PATH: u32 = 2u;
@@ -381,17 +386,72 @@ fn sky_color(dir: vec3f) -> vec3f {
 }
 
 // ============================================================
+// Firefly filter (ported from RTXPT v1.8.1)
+//   PathTracer/PathTracerHelpers.hlsli:180-219
+//
+// Per-path scalar `firefly_k` (stored in ray_state) starts at 1.0 and
+// shrinks after every BSDF scatter by a factor derived from the ray-
+// cone spread angle implied by that scatter's pdf. Low-pdf (wide, near-
+// diffuse) lobes collapse k quickly; high-pdf (near-specular) lobes
+// preserve k. Downstream emission contributions are then clamped to
+// FIREFLY_THRESHOLD * k so rare high-variance paths (e.g. a wide
+// diffuse bounce that lands on a bright emitter) don't spike single
+// pixels. Uses RGB average instead of luminance per RTXPT comment —
+// luminance causes a hue shift toward blue under clamp.
+// ============================================================
+fn luminance(c: vec3f) -> f32 {
+  return dot(c, vec3f(0.2126, 0.7152, 0.0722));
+}
+
+// Handbook polynomial acos, max error ~7e-3 rad. Adequate for the
+// ray-cone heuristic which is already empirical.
+fn fast_acos(x: f32) -> f32 {
+  let a = abs(x);
+  var r = -0.0187293 * a + 0.0742610;
+  r = r * a - 0.2121144;
+  r = r * a + 1.5707288;
+  r = r * sqrt(max(0.0, 1.0 - a));
+  return select(PI - r, r, x >= 0.0);
+}
+
+// Ray-cone spread angle (plane angle) derived from sphere-cap solid
+// angle omega = 1/pdf. alpha = 2·acos(1 − omega/2π). RTXPT uses a
+// growth factor 0.3 for MIP LOD but 1.0 for firefly-K so diffuse
+// lobes collapse k faster.
+fn ray_cone_spread_by_pdf(pdf: f32) -> f32 {
+  if pdf <= 0.0 { return 0.0; }
+  return 2.0 * fast_acos(max(-1.0, 1.0 - (1.0 / pdf) / TWO_PI));
+}
+
+fn update_firefly_k(current_k: f32, bounce_pdf: f32, lobe_p: f32) -> f32 {
+  let angle = ray_cone_spread_by_pdf(bounce_pdf);
+  let k_emp: f32 = 32.0;                       // RTXPT empirical
+  var p = k_emp / (k_emp + angle * angle);
+  p *= sqrt(max(lobe_p, 0.0));                 // single-lobe: lobe_p = 1
+  return max(0.00001, current_k * p);
+}
+
+fn firefly_filter(signal: vec3f, threshold: f32, k: f32) -> vec3f {
+  let t = threshold * k;
+  let avg = (signal.x + signal.y + signal.z) * (1.0 / 3.0);
+  if avg > t {
+    return signal * (t / avg);
+  }
+  return signal;
+}
+
+// ============================================================
 // Ray state load / store (packed into array<vec4f>)
 // ============================================================
 struct RayState {
   origin: vec3f,
   dir: vec3f,
   throughput: vec3f,
-  radiance: vec3f,
+  radiance: vec3f,        // kept so legacy `finalize` still compiles
   sampler_dim: u32,
   flags: u32,
   last_bsdf_pdf: f32,
-  hit_t: f32,
+  firefly_k: f32,         // RTXPT firefly-filter tracker (repurposed hit_t)
 };
 
 fn load_ray_state(idx: u32) -> RayState {
@@ -408,7 +468,7 @@ fn load_ray_state(idx: u32) -> RayState {
   rs.throughput = r2.xyz;
   rs.last_bsdf_pdf = r2.w;
   rs.radiance = r3.xyz;
-  rs.hit_t = r3.w;
+  rs.firefly_k = r3.w;
   return rs;
 }
 
@@ -417,7 +477,7 @@ fn store_ray_state(idx: u32, rs: RayState) {
   ray_state[base]       = vec4f(rs.origin,    bitcast<f32>(rs.sampler_dim));
   ray_state[base + 1u]  = vec4f(rs.dir,       bitcast<f32>(rs.flags));
   ray_state[base + 2u]  = vec4f(rs.throughput, rs.last_bsdf_pdf);
-  ray_state[base + 3u]  = vec4f(rs.radiance,  rs.hit_t);
+  ray_state[base + 3u]  = vec4f(rs.radiance,  rs.firefly_k);
 }
 
 fn bounce_of(flags: u32) -> u32 { return (flags >> 8u) & 0xFFu; }
@@ -470,7 +530,7 @@ fn generate(@builtin(global_invocation_id) gid: vec3u) {
   rs.sampler_dim = s.dim; // = 2 after jitter consumed dims 0,1
   rs.flags = FLAG_ALIVE | FLAG_DIFFUSE_PATH;
   rs.last_bsdf_pdf = 0.0;
-  rs.hit_t = 1e4;
+  rs.firefly_k = 1.0;     // identity; shrinks on each BSDF scatter
   store_ray_state(idx, rs);
 
   // Reset ReSTIR GI candidate for this pixel at frame start. All fields
@@ -552,15 +612,18 @@ fn bounce(
     loop {
       let hit = trace_bvh(rs.origin, rs.dir);
       if !hit.hit {
-        // Miss
+        // Miss. Apply firefly filter at all depths (at primary k=1 the
+        // cap is effectively baseline threshold; at deeper bounces it
+        // tightens as k has collapsed through prior scatters).
+        let sky = firefly_filter(sky_color(rs.dir), FIREFLY_THRESHOLD, rs.firefly_k);
         if b == 0u {
           // Primary miss → sky is direct (no visible point, valid stays 0)
-          cand_add_direct(idx, sky_color(rs.dir));
+          cand_add_direct(idx, sky);
         } else {
           // Indirect miss → sky into Lo via sample-frame throughput, plus
           // a synthetic "far" sample so shade uses Lo (valid=1). Lo lives
           // in candidate_buf (not ray_state) so restir_shade can read it.
-          let sky_h = vec3h(sky_color(rs.dir));
+          let sky_h = vec3h(sky);
           let tp_h  = vec3h(rs.throughput);
           cand_add_Lo(idx, vec3f(tp_h * sky_h));
           let far_pos = rs.origin + rs.dir * 1e5;
@@ -592,22 +655,25 @@ fn bounce(
 
       // Emission — direct at b==0, into Lo (with sample-frame throughput)
       // at b >= 1. Emissive tri hits at bounce ≥1 are the only channel
-      // for scene-emissive GI without NEE-to-emissives.
+      // for scene-emissive GI without NEE-to-emissives. Firefly filter
+      // applied at source (same rule as RTXPT: prevents the reservoir
+      // from locking in an unfiltered spike for many frames).
       let em = mat_emission(mat);
       if dot(em, vec3f(1.0)) > 1e-6 {
+        let em_ff = firefly_filter(em, FIREFLY_THRESHOLD, rs.firefly_k);
         if b == 0u {
-          cand_add_direct(idx, em);
+          cand_add_direct(idx, em_ff);
         } else {
-          cand_add_Lo(idx, rs.throughput * em);
+          cand_add_Lo(idx, rs.throughput * em_ff);
         }
       }
 
       if mat_is_unlit(mat) {
-        let unlit_c = mat_base_color(mat);
+        let unlit_ff = firefly_filter(mat_base_color(mat), FIREFLY_THRESHOLD, rs.firefly_k);
         if b == 0u {
-          cand_add_direct(idx, unlit_c);
+          cand_add_direct(idx, unlit_ff);
         } else {
-          cand_add_Lo(idx, rs.throughput * unlit_c);
+          cand_add_Lo(idx, rs.throughput * unlit_ff);
         }
         rs.flags &= ~FLAG_ALIVE;
         break;
@@ -621,20 +687,21 @@ fn bounce(
 
       // NEE sun (delta). Flag 1.0 = direct (b==0), 2.0 = indirect (b>=1),
       // decoded by shadow_trace to route contribution to candidate.direct
-      // vs. rs.radiance (Lo).
+      // vs. rs.radiance (Lo). At indirect depth, firefly-filter the
+      // contribution with the path's current k (delta light has no
+      // derivative k update — pdf → ∞ keeps k unchanged).
       let nsl = dot(normal, uniforms.sun_dir);
       if nsl > 0.0 {
-        var contribution = throughput_h * albedo_h * vec3h(SUN_RADIANCE) * f16(nsl);
+        var contribution = vec3f(throughput_h * albedo_h * vec3h(SUN_RADIANCE) * f16(nsl));
         if b > 0u {
-          let sabs = abs(contribution.x) + abs(contribution.y) + abs(contribution.z);
-          if sabs > f16(CLAMP_INDIRECT) { contribution *= f16(CLAMP_INDIRECT) / sabs; }
+          contribution = firefly_filter(contribution, FIREFLY_THRESHOLD, rs.firefly_k);
         }
         let sun_origin = ray_offset(hit_pos, geo_normal);
         let sbase = idx * 3u;
         let nee_flag = select(2.0, 1.0, b == 0u);
-        shadow_req[sbase]      = vec4f(sun_origin,           nee_flag);
-        shadow_req[sbase + 1u] = vec4f(uniforms.sun_dir,     0.0);
-        shadow_req[sbase + 2u] = vec4f(vec3f(contribution),  0.0);
+        shadow_req[sbase]      = vec4f(sun_origin,     nee_flag);
+        shadow_req[sbase + 1u] = vec4f(uniforms.sun_dir, 0.0);
+        shadow_req[sbase + 2u] = vec4f(contribution,   0.0);
       }
 
       // BSDF sample — cosine hemisphere
@@ -669,13 +736,34 @@ fn bounce(
       rs.last_bsdf_pdf = max(dot(normal, new_dir), 0.0) * INV_PI;
       rs.flags = set_bounce(rs.flags, b + 1u);
 
-      // Russian roulette at b >= 1 only (sample-frame throughput).
+      // Update firefly-K from the scatter's pdf. Diffuse (wide lobe,
+      // low pdf) collapses k; specular (narrow, high pdf) preserves it.
+      // Single-lobe Lambertian → lobe_p = 1.
+      rs.firefly_k = update_firefly_k(rs.firefly_k, rs.last_bsdf_pdf, 1.0);
+
+      // Russian Roulette — RTXPT Falcor "milder" variant, port from
+      // PathTracer/PathTracer.hlsli:182-207. Gated at b >= 1 so the
+      // primary hit always contributes (rare low-throughput primaries
+      // still get processed even if RR formula alone would tolerate
+      // termination). Termination probability:
+      //   rr  = sqrt(luminance(throughput))                // perceptual
+      //   p   = saturate(0.85 - rr)²                        // squared Falcor
+      //   p  += max(0, vertex_ratio - 0.4)                  // ramp to max
+      //   if u < p: terminate
+      //   throughput /= (1 - p)                             // unbiased boost
+      // vertex_ratio = (b+1) / max_bounces so the additive ramp reaches
+      // 0.6 as the path nears the depth budget, guaranteeing more
+      // aggressive termination near max depth while staying light early.
       if b >= 1u {
-        let p = clamp(sqrt(max(max(rs.throughput.x, rs.throughput.y), rs.throughput.z)), 0.05, 0.9);
-        if sampler_1d(&s) > p {
+        let rr_val = sqrt(luminance(rs.throughput));
+        var prob = clamp(0.85 - rr_val, 0.0, 1.0);
+        prob = prob * prob;
+        let vertex_ratio = f32(b + 1u) / max(f32(uniforms.max_bounces), 1.0);
+        prob = clamp(prob + max(0.0, vertex_ratio - 0.4), 0.0, 1.0);
+        if sampler_1d(&s) < prob {
           rs.flags &= ~FLAG_ALIVE;
         } else {
-          rs.throughput /= p;
+          rs.throughput = rs.throughput / max(1.0 - prob, 1e-5);
         }
       }
 

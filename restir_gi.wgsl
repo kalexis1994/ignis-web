@@ -119,9 +119,7 @@ fn reservoir_empty() -> Reservoir {
   return r;
 }
 
-fn luminance(c: vec3f) -> f32 {
-  return dot(c, vec3f(0.2126, 0.7152, 0.0722));
-}
+// `luminance` is defined in wavefront.wgsl (prepended at load time).
 
 // Target pdf at a visible point for a given sample.
 // Ouyang 2021: p̂(X) = || BRDF(v,X) × L(X) × cos(n_v, v→s) ||.
