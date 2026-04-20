@@ -106,6 +106,12 @@ async function init() {
   const bvhBuf = createGPUBuffer(device, scene.gpuBVHNodes,  GPUBufferUsage.STORAGE);
   const bvhScene = scene.bvhScene; // { origin: [x,y,z], scale: [x,y,z] } for uint16 dequant
   const matBuf = createGPUBuffer(device, scene.gpuMaterials, GPUBufferUsage.STORAGE);
+  // Emissive-triangle CDF (power-weighted) built in scene-loader. 4 floats
+  // per entry: [triIdx(u32), area, cdf, 0]. Empty scene still gets a
+  // 16-byte min-size buffer so binding is always valid — shader gates on
+  // uniforms.emissive_count > 0 before reading.
+  const emissiveTrisBuf = createGPUBuffer(device, scene.gpuEmissiveTris, GPUBufferUsage.STORAGE);
+  rlog(`Emissive tris: ${scene.stats.emissiveTris}${scene.stats.emissiveTruncated ? ` (truncated from ${scene.stats.emissiveSourceTris})` : ''}`);
 
   // Output textures
   const noisyTex = device.createTexture({
@@ -219,6 +225,7 @@ async function init() {
       { binding: 2, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } },
       { binding: 3, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } },
       { binding: 4, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } },
+      { binding: 5, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } },
     ],
   });
   // bgl2_main: queue_a, queue_b, counts, candidate_buf. NO dispatch_args
@@ -341,6 +348,7 @@ async function init() {
       { binding: 2, resource: { buffer: triBuf } },
       { binding: 3, resource: { buffer: bvhBuf } },
       { binding: 4, resource: { buffer: matBuf } },
+      { binding: 5, resource: { buffer: emissiveTrisBuf } },
     ],
   });
   // Reservoir role-fixed across frames, gbuf ping-pongs.
@@ -629,8 +637,9 @@ async function init() {
     f[16] = up[0];         f[17] = up[1];         f[18] = up[2];        f[19] = fovFactor;
     f[20] = sunDir[0];     f[21] = sunDir[1];     f[22] = sunDir[2];
     u[23] = framesStill;   // replaces former _pad3
-    // BVH dequantization: scene_origin (vec3f + pad) and scene_scale (vec3f + pad)
+    // BVH dequantization: scene_origin (vec3f + emissive_count) and scene_scale (vec3f + pad)
     f[24] = bvhScene.origin[0]; f[25] = bvhScene.origin[1]; f[26] = bvhScene.origin[2];
+    u[27] = scene.stats.emissiveTris;  // count of entries in the emissive-tri CDF
     f[28] = bvhScene.scale[0];  f[29] = bvhScene.scale[1];  f[30] = bvhScene.scale[2];
     // Previous-frame camera pose, offsets 128-192 → float slots 32-47.
     f[32] = prevCamState.pos[0];     f[33] = prevCamState.pos[1];     f[34] = prevCamState.pos[2];

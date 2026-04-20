@@ -27,7 +27,7 @@ struct Uniforms {
   camera_right: vec3f, _pad2: f32,
   camera_up: vec3f,    fov_factor: f32,
   sun_dir: vec3f,      frames_still: u32,
-  scene_origin: vec3f, _pad3: f32, // BVH AABB dequantization offset (scene min)
+  scene_origin: vec3f, emissive_count: u32, // BVH AABB dequantization offset + number of emissive tris in CDF
   scene_scale: vec3f,  _pad4: f32, // BVH AABB dequantization scale (extent / 65535)
   // Previous-frame camera pose for ReSTIR GI temporal motion reprojection.
   // Used by restir_temporal to transform this frame's primary hit world
@@ -93,6 +93,14 @@ struct Material { d0: vec4f, d1: vec4f, };
 @group(1) @binding(2) var<storage, read> tri_data: array<vec4u>;
 @group(1) @binding(3) var<storage, read> bvh_nodes: array<BVHNode>;
 @group(1) @binding(4) var<storage, read> material_buf: array<Material>;
+// Emissive triangle light list, power-weighted CDF. 4 floats per entry:
+//   [0] = sorted-triangle index (u32 bitcast to f32)
+//   [1] = triangle area
+//   [2] = cumulative CDF (monotonic in [0,1])
+//   [3] = unused
+// Built by scene-loader.js::loadScene and uploaded by renderer.js.
+// Sorted by power descending, capped at MAX_EMISSIVE (see scene-loader).
+@group(1) @binding(5) var<storage, read> emissive_tris: array<vec4f>;
 
 // Ray compaction queues — ping-pong between bounces. Each bounce reads
 // from one and pushes survivors to the other via atomicAdd on counts.
@@ -441,6 +449,49 @@ fn firefly_filter(signal: vec3f, threshold: f32, k: f32) -> vec3f {
 }
 
 // ============================================================
+// Emissive-triangle NEE sampling helpers
+//
+// The emissive_tris buffer is a power-weighted CDF built host-side:
+// entry i carries the sorted-tri index, the triangle area, and the
+// cumulative probability mass (ascending, last entry = 1.0). We
+// importance-sample it with a binary search on a uniform u ∈ [0,1),
+// returning the slot whose CDF range [cdf[i-1], cdf[i]) contains u.
+// The pick probability is cdf[i] - cdf[i-1] (or cdf[0] for i=0).
+//
+// Uniform point on a triangle uses the standard fold:
+//   if (u1+u2) > 1: u1,u2 ← (1-u1, 1-u2)
+// which maps the [0,1]² square onto the triangle (α=u1, β=u2, γ=1-α-β).
+// ============================================================
+fn sample_emissive_cdf(u: f32) -> u32 {
+  let n = uniforms.emissive_count;
+  if n == 0u { return 0u; }
+  var lo: u32 = 0u;
+  var hi: u32 = n;
+  while lo < hi {
+    let mid = (lo + hi) >> 1u;
+    if u < emissive_tris[mid].z { hi = mid; } else { lo = mid + 1u; }
+  }
+  return min(lo, n - 1u);
+}
+
+fn emissive_pick_pdf(i: u32) -> f32 {
+  let cdf_curr = emissive_tris[i].z;
+  // Guard: `select` evaluates both branches, so conditioning the index
+  // expression inside select would wrap i=0 to 0xFFFFFFFF. Compute the
+  // guarded index explicitly before the load.
+  var prev_idx: u32 = 0u;
+  if i > 0u { prev_idx = i - 1u; }
+  let cdf_prev = select(0.0, emissive_tris[prev_idx].z, i > 0u);
+  return max(cdf_curr - cdf_prev, 1e-20);
+}
+
+fn sample_triangle_uniform(u_in: vec2f, a: vec3f, b: vec3f, c: vec3f) -> vec3f {
+  var uu = u_in;
+  if uu.x + uu.y > 1.0 { uu = vec2f(1.0 - uu.x, 1.0 - uu.y); }
+  return a + uu.x * (b - a) + uu.y * (c - a);
+}
+
+// ============================================================
 // Ray state load / store (packed into array<vec4f>)
 // ============================================================
 struct RayState {
@@ -653,17 +704,21 @@ fn bounce(
         cand_set_sample(idx, hit_pos, normal);
       }
 
-      // Emission — direct at b==0, into Lo (with sample-frame throughput)
-      // at b >= 1. Emissive tri hits at bounce ≥1 are the only channel
-      // for scene-emissive GI without NEE-to-emissives. Firefly filter
-      // applied at source (same rule as RTXPT: prevents the reservoir
-      // from locking in an unfiltered spike for many frames).
+      // Emission at hit.
+      //   b == 0: always added (direct view of emitter — independent of NEE).
+      //   b >= 1: only when emissive NEE is NOT available. If it is, the
+      //           same integrand is covered by NEE at the previous vertex;
+      //           summing both without MIS would double-count. When MIS
+      //           between BSDF and NEE lands (future phase with GGX), this
+      //           becomes `em * w_bsdf` at all depths.
+      // Firefly filter applied at source so the ReSTIR reservoir never
+      // locks in an unfiltered spike for future temporal reuse.
       let em = mat_emission(mat);
       if dot(em, vec3f(1.0)) > 1e-6 {
         let em_ff = firefly_filter(em, FIREFLY_THRESHOLD, rs.firefly_k);
         if b == 0u {
           cand_add_direct(idx, em_ff);
-        } else {
+        } else if uniforms.emissive_count == 0u {
           cand_add_Lo(idx, rs.throughput * em_ff);
         }
       }
@@ -702,6 +757,69 @@ fn bounce(
         shadow_req[sbase]      = vec4f(sun_origin,     nee_flag);
         shadow_req[sbase + 1u] = vec4f(uniforms.sun_dir, 0.0);
         shadow_req[sbase + 2u] = vec4f(contribution,   0.0);
+      }
+
+      // NEE to an emissive triangle. Picks one tri via power-weighted CDF,
+      // samples a uniform point on it, and traces a shadow ray inline
+      // (the dedicated shadow_trace kernel has only one request slot per
+      // pixel and it's already used by the sun above). Contribution:
+      //   BRDF * Le * cos_surf / p_sa
+      // where the solid-angle pdf converting from area sampling is
+      //   p_sa = p_pick * d² / (area * cos_light)
+      // with p_pick = cdf[i]-cdf[i-1], cos_light = dot(-w, n_l).
+      //
+      // At b >= 1 this is the ONLY channel for emissive GI — the BSDF-hit
+      // emission accumulation below is gated off when emissives exist to
+      // avoid double-counting (NEE at vertex N-1 and BSDF hit of emissive
+      // at vertex N sample the same integrand). MIS between the two is
+      // the proper fix and a future step; for v1 pure-NEE is unbiased.
+      if uniforms.emissive_count > 0u {
+        let u_pick = sampler_1d(&s);
+        let u_tri  = sampler_2d(&s);
+        let ei = sample_emissive_cdf(u_pick);
+        let et = emissive_tris[ei];
+        let e_tri_idx = bitcast<u32>(et.x);
+        let e_area    = et.y;
+        let p_pick    = emissive_pick_pdf(ei);
+
+        let etd = tri_data[e_tri_idx];
+        let v0 = vertices[etd.x].xyz;
+        let v1 = vertices[etd.y].xyz;
+        let v2 = vertices[etd.z].xyz;
+        let x_l = sample_triangle_uniform(u_tri, v0, v1, v2);
+        let n_l = normalize(cross(v1 - v0, v2 - v0));
+
+        let w       = x_l - hit_pos;
+        let d_sq    = dot(w, w);
+        let d       = sqrt(max(d_sq, 1e-20));
+        let w_hat   = w / d;
+        let cos_surf  = dot(normal, w_hat);
+        let cos_light = -dot(n_l, w_hat);
+
+        if cos_surf > 1e-4 && cos_light > 1e-4 && d_sq > 1e-8 {
+          let e_mat = material_buf[etd.w];
+          let Le = mat_emission(e_mat);
+          // Solid-angle pdf: p_pick * d² / (area * cos_light).
+          let pdf_sa = p_pick * d_sq / max(e_area * cos_light, 1e-20);
+          // BRDF × Li × cos / pdf_sa. albedo_h = base/π already, so the
+          // full estimator is (albedo/π) * Le * cos_surf / pdf_sa ×
+          // path throughput.
+          var contrib = vec3f(throughput_h * albedo_h) * Le * (cos_surf / pdf_sa);
+          if b > 0u {
+            contrib = firefly_filter(contrib, FIREFLY_THRESHOLD, rs.firefly_k);
+          }
+
+          let e_origin = ray_offset(hit_pos, geo_normal);
+          // max_t = d * 0.999 so we stop just short of x_l; the shadow
+          // test only needs to confirm free-space between the two points.
+          if !trace_shadow(e_origin, w_hat, d * 0.999) {
+            if b == 0u {
+              cand_add_direct(idx, contrib);
+            } else {
+              cand_add_Lo(idx, contrib);
+            }
+          }
+        }
       }
 
       // BSDF sample — cosine hemisphere
