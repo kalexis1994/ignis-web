@@ -464,6 +464,7 @@ fn restir_temporal(@builtin(global_invocation_id) gid: vec3u) {
 //   5. WRS merge with weight w = p̂_r(Lo_q) × M_q × W_q × J.
 // ============================================================
 const SPATIAL_K: u32 = 5u;          // neighbors per pixel
+const INV_SPATIAL_K: f32 = 0.2;     // 1 / SPATIAL_K — pairwise MIS normalizer
 const SPATIAL_RADIUS: f32 = 16.0;   // disk radius in pixels
 
 @compute @workgroup_size(8, 8)
@@ -537,14 +538,18 @@ fn restir_spatial(@builtin(global_invocation_id) gid: vec3u) {
       let M_q = min(prev_q.M, M_CLAMP);
       let albedo_q = textureLoad(albedo_read, vec2i(pq), 0).rgb;
 
-      // Pairwise MIS vs canonical (per-neighbor pairwise approximation).
-      // For neighbor q's sample X_q:
-      //   m_q(X_q) = M_q·p̂_q(X_q) / (M_r·p̂_r(X_q) + M_q·p̂_q(X_q))
-      // For canonical X_r's share of neighbor q's MIS balance:
-      //   m_q(X_r) = M_q·p̂_q(X_r) / (M_r·p̂_r(X_r) + M_q·p̂_q(X_r))
-      // canonical_mis gets 1 - Σ m_q(X_r) as its weight. Exact for k=1;
-      // approximate for k>1 since inter-neighbor pairwise terms are
-      // omitted (ignores q_i vs q_j comparisons).
+      // Defensive pairwise MIS (Bitterli 2020). Each per-pair balance
+      // heuristic is scaled by 1/k so the k neighbor weights sum to at
+      // most 1, leaving m_r = 1 − Σ m_q_i non-negative without clamping
+      // and the total MIS weight equal to exactly 1 (energy-conserving).
+      // Without the 1/k, Σ m_q_i could exceed 1 while m_r clamps to 0 →
+      // MIS weights sum > 1 → up to k× over-brightening in regions
+      // where neighbors dominate the canonical.
+      //   m_q(X_q) = (1/k) · M_q·p̂_q(X_q) / (M_r·p̂_r(X_q) + M_q·p̂_q(X_q))
+      //   m_q(X_r) = (1/k) · M_q·p̂_q(X_r) / (M_r·p̂_r(X_r) + M_q·p̂_q(X_r))
+      // canonical_mis gets 1 − Σ m_q(X_r). Exact energy conservation
+      // for any k; residual MIS-suboptimality from ignoring inter-
+      // neighbor q_i vs q_j pairs is a variance-only effect.
       let p_hat_r_Xq = target_pdf_gi(albedo_r, prev_q.Lo, g_r.n_v, g_r.x_v, prev_q.x_s);
       let p_hat_q_Xq = target_pdf_gi(albedo_q, prev_q.Lo, g_q.n_v, g_q.x_v, prev_q.x_s);
 
@@ -552,14 +557,14 @@ fn restir_spatial(@builtin(global_invocation_id) gid: vec3u) {
 
       let denom_q = M_r * p_hat_r_Xq + M_q * p_hat_q_Xq;
       if denom_q <= 1e-10 { continue; }
-      let m_q = (M_q * p_hat_q_Xq) / denom_q;
+      let m_q = INV_SPATIAL_K * (M_q * p_hat_q_Xq) / denom_q;
 
       // Accumulate canonical MIS fraction at X_r from this neighbor
       let p_hat_q_Xr = target_pdf_gi(albedo_q, own.Lo, g_q.n_v, g_q.x_v, own.x_s);
       let denom_r = M_r * p_hat_r_Xr + M_q * p_hat_q_Xr;
       if denom_r > 1e-10 {
         canonical_mis_minus = canonical_mis_minus
-                            + (M_q * p_hat_q_Xr) / denom_r;
+                            + INV_SPATIAL_K * (M_q * p_hat_q_Xr) / denom_r;
       }
 
       // Pairwise MIS weight formula (same as temporal):
