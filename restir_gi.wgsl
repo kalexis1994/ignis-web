@@ -690,7 +690,7 @@ fn relax_temporal(@builtin(global_invocation_id) gid: vec3u) {
   // history. Downstream HistoryFix (Phase 2) fills these from
   // neighbors if present; at this stage they show the raw frame.
   if g_curr.valid < 0.5 {
-    textureStore(accum_new, vec2i(pixel), vec4f(curr, 1.0 / RELAX_MAX_ACCUM_FRAMES));
+    textureStore(temp_write, vec2i(pixel), vec4f(curr, 1.0 / RELAX_MAX_ACCUM_FRAMES));
     return;
   }
 
@@ -856,5 +856,97 @@ fn relax_temporal(@builtin(global_invocation_id) gid: vec3u) {
     mixed = curr;
   }
 
-  textureStore(accum_new, vec2i(pixel), vec4f(mixed, history_length / RELAX_MAX_ACCUM_FRAMES));
+  textureStore(temp_write, vec2i(pixel), vec4f(mixed, history_length / RELAX_MAX_ACCUM_FRAMES));
 }
+
+// ============================================================
+// anti_firefly — Rank-Conditioned Rank-Selection (RCRS) filter.
+//
+// Port of NRD's RELAX_AntiFirefly.cs.hlsl:
+//   For each pixel, scan the 3×3 neighborhood. Compute min and max
+//   luminance among VALID neighbors (same surface = normal dot ≥ 0.9
+//   and view-Z rel err ≤ 5% — our stand-in for the material-ID check
+//   in the original since we don't have material tags). If the center
+//   pixel's luminance is higher than all valid neighbors, replace its
+//   color with the max-luminance neighbor's color; if lower than all,
+//   replace with the min-luminance neighbor's color. Otherwise keep
+//   the center unchanged.
+//
+// Why this works for ReSTIR-propagated fireflies:
+//   Even when a firefly slipped past the source firefly filter and
+//   entered the reservoir, spatial reuse propagates it within a
+//   ~16-pixel radius at 5 neighbors/frame. The propagated value is
+//   typically ≥ 2× what adjacent pixels receive, so RCRS clamps
+//   it to the local neighborhood extremum. It's a 1-pixel-radius
+//   pass so it doesn't disturb genuine 2-pixel-wide highlights (a
+//   real bright feature has neighbors that support it → center is
+//   within the min-max range → untouched). Isolated spikes (center
+//   higher than ALL 8 neighbors) are the target case.
+//
+// Output writes back into accum_new so the filtered value feeds
+// forward into next frame's accum_prev: a firefly that slipped into
+// the accumulator is clamped at display AND scrubbed from the
+// history, preventing ~60 frames of decay-time trails.
+//
+// History length (accum.a) is preserved — RCRS replaces color only,
+// not the temporal state.
+// ============================================================
+@compute @workgroup_size(8, 8)
+fn anti_firefly(@builtin(global_invocation_id) gid: vec3u) {
+  let pixel = vec2u(gid.xy);
+  let res = vec2u(uniforms.resolution);
+  if pixel.x >= res.x || pixel.y >= res.y { return; }
+  let idx = pixel.y * res.x + pixel.x;
+
+  let center = textureLoad(temp_read, vec2i(pixel), 0);
+  let g_c = gbuf_curr_load(idx);
+
+  // Pass-through for invalid pixels (sky, unlit, out-of-frustum).
+  // No meaningful neighborhood comparison without shading normal.
+  if g_c.valid < 0.5 {
+    textureStore(accum_new, vec2i(pixel), center);
+    return;
+  }
+
+  let lum_c = luminance(center.rgb);
+  var lum_max: f32 = -1.0;
+  var lum_min: f32 = 1e20;
+  var rgb_max: vec3f = center.rgb;
+  var rgb_min: vec3f = center.rgb;
+  var any_valid: bool = false;
+
+  // 3×3 neighborhood (8 neighbors, skip center).
+  for (var dy: i32 = -1; dy <= 1; dy = dy + 1) {
+    for (var dx: i32 = -1; dx <= 1; dx = dx + 1) {
+      if dx == 0 && dy == 0 { continue; }
+      let tp = vec2i(pixel) + vec2i(dx, dy);
+      if tp.x < 0 || tp.x >= i32(res.x) || tp.y < 0 || tp.y >= i32(res.y) { continue; }
+      let tidx = u32(tp.y) * res.x + u32(tp.x);
+      let g_t = gbuf_curr_load(tidx);
+      if g_t.valid < 0.5 { continue; }
+      if dot(g_c.n_v, g_t.n_v) < 0.9 { continue; }
+      let depth_rel = abs(g_c.depth_view - g_t.depth_view) / max(g_c.depth_view, 0.1);
+      if depth_rel > 0.05 { continue; }
+
+      let s = textureLoad(temp_read, tp, 0);
+      let lum_s = luminance(s.rgb);
+      if lum_s > lum_max { lum_max = lum_s; rgb_max = s.rgb; }
+      if lum_s < lum_min { lum_min = lum_s; rgb_min = s.rgb; }
+      any_valid = true;
+    }
+  }
+
+  // Rank-conditioned replacement: clamp outliers to neighborhood
+  // extremum. Center within [min, max] → keep as-is (genuine signal).
+  var out_rgb = center.rgb;
+  if any_valid {
+    if lum_c > lum_max {
+      out_rgb = rgb_max;
+    } else if lum_c < lum_min {
+      out_rgb = rgb_min;
+    }
+  }
+
+  textureStore(accum_new, vec2i(pixel), vec4f(out_rgb, center.a));
+}
+

@@ -127,6 +127,16 @@ async function init() {
     // TEXTURE_BINDING so restir_shade can sample albedo_primary at shade time.
     usage: GPUTextureUsage.STORAGE_BINDING | GPUTextureUsage.TEXTURE_BINDING,
   });
+  // Intermediate texture for the anti-firefly pass. relax_temporal writes
+  // its blended output here; anti_firefly reads this and writes the final
+  // accumulator, so fireflies are clamped BEFORE they feed forward into
+  // next frame's history. Without this intermediate, a firefly entering
+  // the accumulator would persist for ~60 frames (full alpha-decay) and
+  // seed neighboring pixels every frame via bilinear reprojection.
+  const tempAccumTex = device.createTexture({
+    size: [rw, rh], format: 'rgba16float',
+    usage: GPUTextureUsage.STORAGE_BINDING | GPUTextureUsage.TEXTURE_BINDING,
+  });
   // Temporal accumulation ping-pong textures. Each frame reads from one
   // and writes to the other; display samples whichever was just written.
   const accumTex = [0, 1].map(() => device.createTexture({
@@ -272,12 +282,35 @@ async function init() {
   // Null group slots contribute 0 buffers, keeping prep_dispatch at 9.
   const prepPipeLayout = device.createPipelineLayout({ bindGroupLayouts: [null, null, bgl2_prep] });
 
-  // Group 3 is only for the composite kernel (temporal accumulation)
+  // Legacy composite layout (unused now, kept for rollback). 3 bindings.
   const bgl3 = device.createBindGroupLayout({
     entries: [
       { binding: 0, visibility: GPUShaderStage.COMPUTE, texture: { sampleType: 'unfilterable-float' } }, // noisy_read
       { binding: 1, visibility: GPUShaderStage.COMPUTE, texture: { sampleType: 'unfilterable-float' } }, // accum_prev
       { binding: 2, visibility: GPUShaderStage.COMPUTE, storageTexture: { access: 'write-only', format: 'rgba16float' } }, // accum_new
+    ],
+  });
+  // relax_temporal: reads noisy + accum_prev, writes temp_accum. Binding
+  // tempAccumTex as BOTH writable storage (here) AND sampled texture
+  // (the anti_firefly side) in a single bind group is a WebGPU sync-
+  // scope violation even if the shader only uses one — the runtime
+  // treats the bind group as "carrying" all declared accesses. Split
+  // across two bind groups with separate layouts so each pass sees
+  // only the access it needs. Implicit barrier between passes handles
+  // the write→read sync.
+  const bgl3_relax = device.createBindGroupLayout({
+    entries: [
+      { binding: 0, visibility: GPUShaderStage.COMPUTE, texture: { sampleType: 'unfilterable-float' } },
+      { binding: 1, visibility: GPUShaderStage.COMPUTE, texture: { sampleType: 'unfilterable-float' } },
+      { binding: 3, visibility: GPUShaderStage.COMPUTE, storageTexture: { access: 'write-only', format: 'rgba16float' } },
+    ],
+  });
+  // anti_firefly: reads temp_accum (output of relax_temporal), writes
+  // the real accum_new. accum_prev is not needed here.
+  const bgl3_anti = device.createBindGroupLayout({
+    entries: [
+      { binding: 2, visibility: GPUShaderStage.COMPUTE, storageTexture: { access: 'write-only', format: 'rgba16float' } },
+      { binding: 4, visibility: GPUShaderStage.COMPUTE, texture: { sampleType: 'unfilterable-float' } },
     ],
   });
   // composite reads noisyTex as texture_2d via bg3, but bgl0 has noisyTex
@@ -296,7 +329,8 @@ async function init() {
   // layout is shared with composite: noisy_read + accum_prev read,
   // accum_new write, with history_length packed into accum.a so no
   // extra binding is needed.
-  const relaxTemporalLayout = device.createPipelineLayout({ bindGroupLayouts: [bgl0_composite, null, bgl2_main, bgl3] });
+  const relaxTemporalLayout = device.createPipelineLayout({ bindGroupLayouts: [bgl0_composite, null, bgl2_main, bgl3_relax] });
+  const antiFireflyLayout   = device.createPipelineLayout({ bindGroupLayouts: [bgl0_composite, null, bgl2_main, bgl3_anti]  });
 
   // Group 3 view for restir_shade — reads albedo_primary as sampled
   // texture at binding 3 (composite uses 0/1/2 of group 3 with a
@@ -335,6 +369,9 @@ async function init() {
   const finPipeline       = device.createComputePipeline({ layout: pipelineLayout,  compute: { module: wavefrontModule, entryPoint: 'finalize'     } });
   const compositePipeline = device.createComputePipeline({ layout: compositeLayout, compute: { module: wavefrontModule, entryPoint: 'composite'    } });
   const relaxTemporalPipeline = device.createComputePipeline({ layout: relaxTemporalLayout, compute: { module: wavefrontModule, entryPoint: 'relax_temporal' } });
+  // anti_firefly uses the same layout: bg2 for gbuf validation (normal
+  // + depth), bg3 for temp_read (from relax_temporal) + accum_new (final).
+  const antiFireflyPipeline = device.createComputePipeline({ layout: antiFireflyLayout, compute: { module: wavefrontModule, entryPoint: 'anti_firefly' } });
   // ReSTIR GI shade — replaces finalize. Combines direct (primary-hit
   // emission + NEE) with the resampled indirect term from the reservoir.
   const shadePipeline     = device.createComputePipeline({ layout: shadeLayout,     compute: { module: wavefrontModule, entryPoint: 'restir_shade' } });
@@ -438,12 +475,32 @@ async function init() {
   });
   // Ping-pong bind groups for composite: index `i` reads prev = accumTex[1-i]
   // and writes new = accumTex[i]. JS alternates `i` each frame.
+  // Legacy composite bind groups (unused). 3-binding bgl3.
   const bg3 = [0, 1].map(i => device.createBindGroup({
     layout: bgl3,
     entries: [
       { binding: 0, resource: noisyTex.createView() },
       { binding: 1, resource: accumTex[1 - i].createView() },
       { binding: 2, resource: accumTex[i].createView() },
+    ],
+  }));
+  // relax_temporal bind groups: reads noisy + accum_prev, writes temp.
+  // Does NOT bind tempAccumTex as readable here (would create the same-
+  // scope read+write conflict the runtime rejects).
+  const bg3_relax = [0, 1].map(i => device.createBindGroup({
+    layout: bgl3_relax,
+    entries: [
+      { binding: 0, resource: noisyTex.createView() },
+      { binding: 1, resource: accumTex[1 - i].createView() },
+      { binding: 3, resource: tempAccumTex.createView() },
+    ],
+  }));
+  // anti_firefly bind groups: reads temp, writes accum_new.
+  const bg3_anti = [0, 1].map(i => device.createBindGroup({
+    layout: bgl3_anti,
+    entries: [
+      { binding: 2, resource: accumTex[i].createView() },
+      { binding: 4, resource: tempAccumTex.createView() },
     ],
   }));
   // Minimal bg0 for composite (uniforms only — no storage textures to
@@ -809,19 +866,33 @@ async function init() {
       p.end();
     }
     // relax_temporal: ReLAX-style per-pixel temporal accumulation.
-    // Reprojects current primary hits into prev-frame NDC, validates
-    // via plane distance + normal + in-screen, bilinear-samples
+    // Reprojects primary hits into prev-frame NDC, validates via
+    // view-Z distance + normal + in-screen, bilinear samples
     // accum_prev with custom weights, blends with alpha driven by
-    // per-pixel history length (packed in accum.a). Replaces the
-    // frames_still-gated composite — camera motion no longer needs
-    // a global reset since each pixel's disocclusion logic handles
-    // it locally. bg2 carries gbuf_curr/prev as storage buffers.
+    // per-pixel history length (packed in accum.a). Output to
+    // tempAccumTex so the next pass (anti_firefly) can clamp
+    // propagated spikes BEFORE they land in the accumulator and
+    // feed forward into next frame's history.
     {
       const p = enc.beginComputePass();
       p.setPipeline(relaxTemporalPipeline);
       p.setBindGroup(0, bg0_composite);
       p.setBindGroup(2, bg2_main[currIdx]);
-      p.setBindGroup(3, bg3[accumFrame]);
+      p.setBindGroup(3, bg3_relax[accumFrame]);
+      p.dispatchWorkgroups(Math.ceil(rw/8), Math.ceil(rh/8));
+      p.end();
+    }
+    // anti_firefly: RCRS (Rank-Conditioned Rank-Selection) 3×3 filter
+    // that replaces center pixels whose luminance falls outside the
+    // neighborhood's [min, max] with the nearest-extreme neighbor's
+    // color. Validates via normal + depth to avoid mixing surfaces.
+    // Reads tempAccumTex (relax output), writes accum_new (final).
+    {
+      const p = enc.beginComputePass();
+      p.setPipeline(antiFireflyPipeline);
+      p.setBindGroup(0, bg0_composite);
+      p.setBindGroup(2, bg2_main[currIdx]);
+      p.setBindGroup(3, bg3_anti[accumFrame]);
       p.dispatchWorkgroups(Math.ceil(rw/8), Math.ceil(rh/8));
       p.end();
     }

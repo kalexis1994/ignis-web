@@ -124,6 +124,10 @@ override FIRST_BOUNCE: u32 = 0u; // bounce: 1 = skip queue read, use gid.x direc
 @group(3) @binding(0) var noisy_read: texture_2d<f32>;    // curr frame's finalize output
 @group(3) @binding(1) var accum_prev: texture_2d<f32>;    // previous frame's accumulator
 @group(3) @binding(2) var accum_new:  texture_storage_2d<rgba16float, write>;
+// RELAX intermediate: relax_temporal writes here, anti_firefly reads it.
+// Same physical texture, two views — keeps the chain single-buffered.
+@group(3) @binding(3) var temp_write: texture_storage_2d<rgba16float, write>;
+@group(3) @binding(4) var temp_read:  texture_2d<f32>;
 
 const PI: f32 = 3.14159265359;
 const TWO_PI: f32 = 6.28318530718;
