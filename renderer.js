@@ -54,6 +54,12 @@ async function init() {
     ],
     requiredLimits: {
       maxStorageBuffersPerShaderStage: Math.min(adapter.limits.maxStorageBuffersPerShaderStage, 16),
+      // Request the adapter's full storage-buffer binding size so we can bind
+      // the ~180MB contiguous-triangle buffer (gpuTriFlat) for cache-friendly
+      // traversal. Default WebGPU limit is 128 MiB < 180 MB. Requesting the
+      // adapter's own max is always valid; if it's still < the buffer size we
+      // fall back to the indexed-vertex path (see useTriFlat below).
+      maxStorageBufferBindingSize: adapter.limits.maxStorageBufferBindingSize,
     },
   });
   device.onuncapturederror = (e) => rlog('GPU_ERROR: ' + e.error.message);
@@ -62,6 +68,12 @@ async function init() {
   const adapterInfo = adapter.info || {};
   const gpuStr = `${adapterInfo.vendor||''} ${adapterInfo.architecture||''} ${adapterInfo.device||''}`.trim();
   rlog(`GPU: ${gpuStr}`);
+
+  // URL query params — profiling toggles (?spatial/?temporal/?bounces/?triflat)
+  // and BVH leaf-size probe (?leaf). Declared up here because scene loading
+  // (?leaf) and geometry-buffer selection (?triflat) both read it.
+  const qp = new URLSearchParams(location.search);
+  const qpInt = (k, d) => { const v = qp.get(k); return v == null ? d : parseInt(v, 10); };
 
   // Canvas + context
   const canvas = document.getElementById('canvas');
@@ -84,7 +96,7 @@ async function init() {
   info.textContent = 'Loading scene...';
   let scene;
   try {
-    scene = await loadScene('scene', m => { info.textContent = m; });
+    scene = await loadScene('scene', m => { info.textContent = m; }, { leafSize: qpInt('leaf', 4) });
   } catch (e) {
     showError(`Scene load failed: ${e.message}`);
     console.error(e);
@@ -100,7 +112,23 @@ async function init() {
   rlog(`Scene: ${scene.stats.triangles} tris, ${scene.stats.bvhNodes} BVH nodes, ${scene.stats.materials} materials`);
 
   // Scene buffers (same layout the legacy pathtracer used)
-  const vtxBuf = createGPUBuffer(device, scene.gpuPositions, GPUBufferUsage.STORAGE);
+  // Geometry buffer for triangle positions. Two layouts:
+  //   USE_TRIFLAT=1: scene.gpuTriFlat — 3 vec4f per tri, leaf-ordered, CONTIGUOUS.
+  //                  One cache miss loads a whole triangle; consecutive leaf
+  //                  tris are adjacent → far fewer misses for incoherent rays.
+  //   USE_TRIFLAT=0: scene.gpuPositions — per-vertex, indexed by tri_data.xyz
+  //                  (3 scattered gathers per tri). Original path; fallback.
+  // Pick tri_flat when it fits the (possibly device-clamped) binding size.
+  // ?triflat=0/1 forces the path for A/B comparison.
+  const triFlatFits = !!scene.gpuTriFlat
+    && scene.gpuTriFlat.byteLength <= device.limits.maxStorageBufferBindingSize;
+  // ?triflat=0 forces indexed (A/B baseline), =1 forces contiguous (needs fit),
+  // unset = auto (contiguous if it fits).
+  const useTriFlat = triFlatFits && qpInt('triflat', -1) !== 0;
+  const geoBuf = createGPUBuffer(device,
+    useTriFlat ? scene.gpuTriFlat : scene.gpuPositions, GPUBufferUsage.STORAGE);
+  rlog(`Geometry: ${useTriFlat ? 'tri_flat (contiguous)' : 'indexed verts'}`
+     + ` | triFlat ${(scene.gpuTriFlat.byteLength/1048576).toFixed(0)}MB, bindLimit ${(device.limits.maxStorageBufferBindingSize/1048576).toFixed(0)}MB`);
   const nrmBuf = createGPUBuffer(device, scene.gpuNormals,   GPUBufferUsage.STORAGE);
   const triBuf = createGPUBuffer(device, scene.gpuTriData,   GPUBufferUsage.STORAGE);
   const bvhBuf = createGPUBuffer(device, scene.gpuBVHNodes,  GPUBufferUsage.STORAGE);
@@ -212,7 +240,16 @@ async function init() {
     fetch('wavefront.wgsl').then(r => r.text()),
     fetch('restir_gi.wgsl').then(r => r.text()),
   ]);
-  const wavefrontModule = device.createShaderModule({ code: wavefrontSrc + '\n' + restirSrc });
+  // Inject the BVH traversal stack depth from the tree's actual max depth
+  // (+margin) so it never overflows → correct closest-hit/shadow for any leaf
+  // size. Ordered traversal stacks at most one deferred far-child per level,
+  // so tree depth is a safe bound.
+  const stackDepth = Math.max(16, (scene.stats.bvhMaxDepth || 24) + 4);
+  const wavefrontStacked = wavefrontSrc.replace(
+    /const STACK_DEPTH: u32 = \d+u;/,
+    `const STACK_DEPTH: u32 = ${stackDepth}u;`);
+  rlog(`BVH maxDepth ${scene.stats.bvhMaxDepth}, traversal stack ${stackDepth}`);
+  const wavefrontModule = device.createShaderModule({ code: wavefrontStacked + '\n' + restirSrc });
   const displaySrc = await fetch('display.wgsl').then(r => r.text());
   const displayModule = device.createShaderModule({ code: displaySrc });
 
@@ -357,15 +394,19 @@ async function init() {
   // ray from v_curr to prev.x_s. Shade doesn't, so it keeps shadeLayout.
   const temporalLayout = device.createPipelineLayout({ bindGroupLayouts: [bgl0_shade, bgl1, bgl2_main, bgl3_shade] });
 
+  // USE_TRIFLAT override must match the buffer bound at group(1) binding(0)
+  // on EVERY traversal pipeline (bounce/shadow/temporal/spatial), else the
+  // shader would read the geometry buffer with the wrong indexing → garbage.
+  const TF = useTriFlat ? 1 : 0;
   const genPipeline     = device.createComputePipeline({ layout: pipelineLayout, compute: { module: wavefrontModule, entryPoint: 'generate'     } });
   // bounce pipelines: FIRST variant reads gid.x directly (no queue load, used
   // only for bounce 0 where every ray is alive). A/B alternate for bounces 1+.
-  const bouncePipelineFirst = device.createComputePipeline({ layout: pipelineLayout, compute: { module: wavefrontModule, entryPoint: 'bounce', constants: { FIRST_BOUNCE: 1, SRC_QUEUE: 0 } } });
-  const bouncePipelineA     = device.createComputePipeline({ layout: pipelineLayout, compute: { module: wavefrontModule, entryPoint: 'bounce', constants: { FIRST_BOUNCE: 0, SRC_QUEUE: 0 } } });
-  const bouncePipelineB     = device.createComputePipeline({ layout: pipelineLayout, compute: { module: wavefrontModule, entryPoint: 'bounce', constants: { FIRST_BOUNCE: 0, SRC_QUEUE: 1 } } });
+  const bouncePipelineFirst = device.createComputePipeline({ layout: pipelineLayout, compute: { module: wavefrontModule, entryPoint: 'bounce', constants: { FIRST_BOUNCE: 1, SRC_QUEUE: 0, USE_TRIFLAT: TF } } });
+  const bouncePipelineA     = device.createComputePipeline({ layout: pipelineLayout, compute: { module: wavefrontModule, entryPoint: 'bounce', constants: { FIRST_BOUNCE: 0, SRC_QUEUE: 0, USE_TRIFLAT: TF } } });
+  const bouncePipelineB     = device.createComputePipeline({ layout: pipelineLayout, compute: { module: wavefrontModule, entryPoint: 'bounce', constants: { FIRST_BOUNCE: 0, SRC_QUEUE: 1, USE_TRIFLAT: TF } } });
   const prepPipelineA   = device.createComputePipeline({ layout: prepPipeLayout, compute: { module: wavefrontModule, entryPoint: 'prep_dispatch', constants: { READ_IDX: 0 } } });
   const prepPipelineB   = device.createComputePipeline({ layout: prepPipeLayout, compute: { module: wavefrontModule, entryPoint: 'prep_dispatch', constants: { READ_IDX: 1 } } });
-  const shadowPipeline    = device.createComputePipeline({ layout: pipelineLayout,  compute: { module: wavefrontModule, entryPoint: 'shadow_trace' } });
+  const shadowPipeline    = device.createComputePipeline({ layout: pipelineLayout,  compute: { module: wavefrontModule, entryPoint: 'shadow_trace', constants: { USE_TRIFLAT: TF } } });
   const finPipeline       = device.createComputePipeline({ layout: pipelineLayout,  compute: { module: wavefrontModule, entryPoint: 'finalize'     } });
   const compositePipeline = device.createComputePipeline({ layout: compositeLayout, compute: { module: wavefrontModule, entryPoint: 'composite'    } });
   const relaxTemporalPipeline = device.createComputePipeline({ layout: relaxTemporalLayout, compute: { module: wavefrontModule, entryPoint: 'relax_temporal' } });
@@ -377,10 +418,10 @@ async function init() {
   const shadePipeline     = device.createComputePipeline({ layout: shadeLayout,     compute: { module: wavefrontModule, entryPoint: 'restir_shade' } });
   // ReSTIR GI temporal — WRS merge with motion reprojection + jacobian +
   // visibility validation. Uses temporalLayout (includes bgl1 for BVH).
-  const temporalPipeline  = device.createComputePipeline({ layout: temporalLayout,  compute: { module: wavefrontModule, entryPoint: 'restir_temporal' } });
+  const temporalPipeline  = device.createComputePipeline({ layout: temporalLayout,  compute: { module: wavefrontModule, entryPoint: 'restir_temporal', constants: { USE_TRIFLAT: TF } } });
   // ReSTIR GI spatial — k random neighbors' reservoirs merged with jacobian
   // + visibility shadow ray. Shares temporalLayout (same bgl signatures).
-  const spatialPipeline   = device.createComputePipeline({ layout: temporalLayout,  compute: { module: wavefrontModule, entryPoint: 'restir_spatial' } });
+  const spatialPipeline   = device.createComputePipeline({ layout: temporalLayout,  compute: { module: wavefrontModule, entryPoint: 'restir_spatial', constants: { USE_TRIFLAT: TF } } });
 
   const bg0 = device.createBindGroup({
     layout: bgl0,
@@ -396,7 +437,7 @@ async function init() {
   const bg1 = device.createBindGroup({
     layout: bgl1,
     entries: [
-      { binding: 0, resource: { buffer: vtxBuf } },
+      { binding: 0, resource: { buffer: geoBuf } },
       { binding: 1, resource: { buffer: nrmBuf } },
       { binding: 2, resource: { buffer: triBuf } },
       { binding: 3, resource: { buffer: bvhBuf } },
@@ -530,7 +571,46 @@ async function init() {
 
   // Camera
   const cfg = window.IGNIS_CONFIG || {};
-  const maxBounces = Math.max(1, Math.min(8, cfg.bounces || 3));
+  // Differential-profiling toggles (URL query overrides cfg). Skip individual
+  // passes and watch ns/px in the overlay to attribute the frame's GPU cost
+  // without per-pass timestamps (unusable on Adreno TBDR).
+  //   ?bounces=N   max bounces 1..8
+  //   ?spatial=0   skip restir_spatial (the 5-shadow-ray pass); shade falls
+  //                back to the temporal-out reservoir so the image stays valid
+  //   ?temporal=0  skip restir_temporal (reservoir goes stale, image degrades,
+  //                but the dispatch-cost delta is the measurement we want)
+  // (qp / qpInt declared earlier, near the geometry-buffer selection.)
+  let dbgSpatial  = qpInt('spatial',  1) !== 0;
+  let dbgTemporal = qpInt('temporal', 1) !== 0;
+  let maxBounces = Math.max(1, Math.min(8, qpInt('bounces', cfg.bounces || 3)));
+  // Compact self-describing tag for the overlay + TIMING log. Includes BVH
+  // leaf size (L) and geometry path (F=tri_flat contiguous, i=indexed) so each
+  // captured measurement records its full config.
+  const leafSz = qpInt('leaf', 4);
+  const geoTag = useTriFlat ? 'F' : 'i';
+  const mkFlags = () => `b${maxBounces} S${dbgSpatial ? 1 : 0} T${dbgTemporal ? 1 : 0} L${leafSz} ${geoTag}`;
+  let dbgFlags = mkFlags();
+  // Auto-sweep profiler: ?profile=1 cycles through a fixed set of pass configs,
+  // ~SWEEP_SEC each, mutating the toggles at runtime and re-tagging the TIMING
+  // log per config. Removes the need to hand-type query URLs on a phone — load
+  // once, leave it still ~40 s, and the whole differential sweep lands in the
+  // log. Loops forever, so longer = more samples per config.
+  const SWEEP = qp.has('profile');
+  const sweepConfigs = [
+    { b: 2, s: true,  t: true  },   // full baseline
+    { b: 2, s: false, t: true  },   // − spatial (the 5-shadow-ray pass)
+    { b: 2, s: false, t: false },   // − spatial − temporal
+    { b: 1, s: true,  t: true  },   // 1 bounce, full reuse
+    { b: 1, s: false, t: false },   // 1 bounce, no reuse (minimal)
+  ];
+  let sweepIdx = 0, sweepElapsed = 0;
+  const SWEEP_SEC = 8;
+  function applySweep(i) {
+    const c = sweepConfigs[i];
+    maxBounces = c.b; dbgSpatial = c.s; dbgTemporal = c.t;
+    dbgFlags = mkFlags();
+  }
+  if (SWEEP) applySweep(0);
   const bb = scene.stats;
   const camera = {
     pos: [
@@ -638,6 +718,36 @@ async function init() {
 
   // Frame loop
   let frameIdx = 0, lastTime = performance.now(), fps = 0, fpsAccum = 0, fpsCount = 0;
+  // ---- Coarse perf instrumentation ----
+  // timestamp-query is unusable on Adreno/Mali (TBDR): each timestampWrites
+  // forces a tile/pipeline flush, so per-pass GPU timing would dominate the
+  // frame. Instead we measure two cheap, overhead-free signals:
+  //   cpu_encode = wall time spent building + submitting the command buffer
+  //                (synchronous, exact — tells us if pass setup is the cost).
+  //   gpu_lat    = wall time from submit() to queue.onSubmittedWorkDone()
+  //                resolving (async, NON-blocking via .then so the rAF loop
+  //                never stalls). Coarse: includes whatever was already
+  //                in-flight in the queue (~1 frame), so it reads as an
+  //                upper-bound on this frame's GPU cost — but stable enough
+  //                to tell whether a change moved the needle, which is all a
+  //                baseline needs. ns/px = gpu_lat / (rw*rh) for the per-pixel
+  //                budget the optimization plan reasons in (~60 ns/px @ 30fps).
+  // Both are windowed-averaged over TIMING_LOG_INTERVAL frames and logged.
+  let cpuAccum = 0, cpuCount = 0;
+  let gpuAccum = 0, gpuCount = 0;
+  let lastGpuLat = 0;            // most recent sample, for the live overlay
+  let gpuSampleInFlight = false; // one outstanding onSubmittedWorkDone at a time
+  // Frame-period (rAF dt) stats. When fps << 60 (we're at ~2-3) rAF is not
+  // vsync-capped, so dt ≈ true frame time — a cleaner GPU-bound signal than
+  // gpu_lat (which double-counts whatever was in-flight in the queue).
+  // We average over the window (frame_avg): the MIN is contaminated by
+  // scheduling glitches where two rAFs fire ~1ms apart, so frame_avg is the
+  // robust statistic for before/after comparisons.
+  let dtAccum = 0;
+  // Time-based, not frame-based: at 1-8 fps a 120-frame interval would be a
+  // 15-60 s wait for the first line. 2 s gives a prompt baseline at any fps.
+  let timingElapsed = 0;
+  const TIMING_LOG_SEC = 2.0;
   // Temporal accumulation state
   let framesStill = 0, accumFrame = 0;
   let prevPos = [...camera.pos], prevYaw = camera.yaw, prevPitch = camera.pitch;
@@ -766,6 +876,19 @@ async function init() {
     // fresh-sample case locally.
     if (cameraMoved()) { framesStill = 0; }
     frameIdx++;
+    // Advance the auto-sweep profiler (?profile=1): switch config every
+    // SWEEP_SEC and reset the timing window so each TIMING line is pure to
+    // the config it's tagged with.
+    if (SWEEP) {
+      sweepElapsed += dt;
+      if (sweepElapsed >= SWEEP_SEC) {
+        sweepElapsed = 0;
+        sweepIdx = (sweepIdx + 1) % sweepConfigs.length;
+        applySweep(sweepIdx);
+        cpuAccum = 0; cpuCount = 0; gpuAccum = 0; gpuCount = 0; timingElapsed = 0; dtAccum = 0;
+        rlog(`SWEEP -> cfg=[${dbgFlags}]`);
+      }
+    }
     writeUniforms();
 
     // Reset queue state for the frame: all pixels start alive in queue_a
@@ -775,6 +898,7 @@ async function init() {
     device.queue.writeBuffer(countsBuf, 0, new Uint32Array([pixelCount, 0]));
     device.queue.writeBuffer(dispatchArgsBuf, 0, new Uint32Array([Math.ceil(pixelCount / 64), 1, 1, 0]));
 
+    const encodeStart = performance.now();
     const enc = device.createCommandEncoder();
     {
       const p = enc.beginComputePass();
@@ -831,7 +955,7 @@ async function init() {
     // shadow ray, then WRS-merges the prev reservoir (with reconnection-
     // shift jacobian) against the current candidate. bg1 bound for the
     // shadow ray's BVH traversal. Writes to reservoirBuf[0] (temporal-out).
-    {
+    if (dbgTemporal) {
       const p = enc.beginComputePass();
       p.setPipeline(temporalPipeline);
       p.setBindGroup(0, bg0_shade);
@@ -844,7 +968,7 @@ async function init() {
     // restir_spatial: k random neighbors merged with jacobian + visibility.
     // Under bg2_spatial mapping: reads reservoirBuf[0] (temporal-out) as
     // "prev", writes reservoirBuf[1] (spatial-out) as "curr".
-    {
+    if (dbgSpatial) {
       const p = enc.beginComputePass();
       p.setPipeline(spatialPipeline);
       p.setBindGroup(0, bg0_shade);
@@ -860,7 +984,10 @@ async function init() {
       const p = enc.beginComputePass();
       p.setPipeline(shadePipeline);
       p.setBindGroup(0, bg0_shade);
-      p.setBindGroup(2, bg2_spatial[currIdx]);
+      // Spatial skipped → read the freshly-written temporal-out reservoir
+      // (bg2_main binding 5) instead of the stale spatial-out, so the image
+      // stays valid (temporal-only GI) during ?spatial=0 profiling.
+      p.setBindGroup(2, dbgSpatial ? bg2_spatial[currIdx] : bg2_main[currIdx]);
       p.setBindGroup(3, bg3_shade);
       p.dispatchWorkgroups(Math.ceil(rw/8), Math.ceil(rh/8));
       p.end();
@@ -916,9 +1043,37 @@ async function init() {
     framesStill++;
     device.queue.submit([enc.finish()]);
 
+    // cpu_encode: synchronous cost of building + submitting this frame.
+    cpuAccum += performance.now() - encodeStart; cpuCount++;
+    // Frame-period stats (dt is this-frame wall time, computed at frame top).
+    dtAccum += dt;
+    // gpu_lat: sample submit→idle latency, non-blocking. Only one in flight
+    // so we don't pile up promises faster than the GPU drains them.
+    if (!gpuSampleInFlight) {
+      gpuSampleInFlight = true;
+      const submitT = performance.now();
+      device.queue.onSubmittedWorkDone().then(() => {
+        lastGpuLat = performance.now() - submitT;
+        gpuAccum += lastGpuLat; gpuCount++;
+        gpuSampleInFlight = false;
+      });
+    }
+    // Windowed TIMING log every ~TIMING_LOG_SEC seconds → client.log.
+    timingElapsed += dt;
+    if (timingElapsed >= TIMING_LOG_SEC && cpuCount > 0) {
+      const cpuAvg = cpuAccum / cpuCount;
+      const gpuAvg = gpuCount > 0 ? gpuAccum / gpuCount : 0;
+      const frameAvg = dtAccum / cpuCount * 1000;  // avg frame period (ms) — robust metric
+      const nsPerPx = frameAvg * 1e6 / (rw * rh);  // ns/px over render-res pixels
+      rlog(`TIMING: fps=${fps} frame_avg=${frameAvg.toFixed(1)}ms ns/px=${nsPerPx.toFixed(1)} cpu=${cpuAvg.toFixed(2)}ms gpu_lat=${gpuAvg.toFixed(0)}ms cfg=[${dbgFlags}] res=${rw}x${rh}`);
+      cpuAccum = 0; cpuCount = 0; gpuAccum = 0; gpuCount = 0; timingElapsed = 0; dtAccum = 0;
+    }
+
+    const nsPxLive = dt * 1e6 / (rw * rh); // current frame period → ns/px
     info.innerHTML =
       `<b>Ignis Wavefront</b> | ${rw}x${rh} → ${canvas.width}x${canvas.height}<br>` +
-      `FPS:${fps} frame:${frameIdx} bounces:${maxBounces}`;
+      `FPS:${fps} frame:${frameIdx} cfg:[${dbgFlags}]<br>` +
+      `frame:${(dt*1000).toFixed(0)}ms ns/px:${nsPxLive.toFixed(0)} gpu_lat:${lastGpuLat.toFixed(0)}ms`;
 
     if (frameIdx === 1) rlog('First frame OK');
     requestAnimationFrame(frame);

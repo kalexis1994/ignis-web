@@ -456,7 +456,8 @@ function surfaceArea(mnx,mny,mnz, mxx,mxy,mxz) {
   return 2*(dx*dy + dy*dz + dz*dx);
 }
 
-function buildBVH(positions, triDataArr, triCount, onProgress) {
+function buildBVH(positions, triDataArr, triCount, onProgress, leafSize) {
+  leafSize = leafSize || MAX_LEAF_SIZE;
   const centroids = new Float32Array(triCount * 3);
   const tMin = new Float32Array(triCount * 3);
   const tMax = new Float32Array(triCount * 3);
@@ -475,7 +476,7 @@ function buildBVH(positions, triDataArr, triCount, onProgress) {
   const triOrder = new Uint32Array(triCount);
   for (let i = 0; i < triCount; i++) triOrder[i] = i;
 
-  let nodeCap = Math.max(1024, Math.ceil(triCount / MAX_LEAF_SIZE) * 3);
+  let nodeCap = Math.max(1024, Math.ceil(triCount / leafSize) * 3);
   let nodesF32 = new Float32Array(nodeCap * 8);
   let nodesU32 = new Uint32Array(nodesF32.buffer);
   let nodeCount = 0;
@@ -577,22 +578,24 @@ function buildBVH(positions, triDataArr, triCount, onProgress) {
   }
 
   const rootIdx = allocNode();
-  const workStack = [{ ni: rootIdx, start: 0, end: triCount }];
+  const workStack = [{ ni: rootIdx, start: 0, end: triCount, depth: 0 }];
   let built = 0;
+  let maxDepth = 0; // deepest leaf — sizes the GPU traversal stack (correctness)
 
   while (workStack.length > 0) {
-    const { ni, start, end } = workStack.pop();
+    const { ni, start, end, depth } = workStack.pop();
+    if (depth > maxDepth) maxDepth = depth;
     const count = end - start;
     const [mnx,mny,mnz, mxx,mxy,mxz] = computeAABB(start, end);
     const off = ni * 8;
     nodesF32[off]=mnx; nodesF32[off+1]=mny; nodesF32[off+2]=mnz;
     nodesF32[off+4]=mxx; nodesF32[off+5]=mxy; nodesF32[off+6]=mxz;
 
-    if (count <= MAX_LEAF_SIZE) {
+    if (count <= leafSize) {
       nodesU32[off+3] = start;
       nodesU32[off+7] = count;
       built += count;
-      if (built % 500000 < MAX_LEAF_SIZE) onProgress?.(`Building SAH BVH... ${((built/triCount)*100)|0}%`);
+      if (built % 500000 < leafSize) onProgress?.(`Building SAH BVH... ${((built/triCount)*100)|0}%`);
       continue;
     }
 
@@ -625,8 +628,8 @@ function buildBVH(positions, triDataArr, triCount, onProgress) {
     nodesU32[off+3] = leftIdx;
     nodesU32[off+7] = 0;
 
-    workStack.push({ ni: rightIdx, start: mid, end: end });
-    workStack.push({ ni: leftIdx, start: start, end: mid });
+    workStack.push({ ni: rightIdx, start: mid, end: end, depth: depth + 1 });
+    workStack.push({ ni: leftIdx, start: start, end: mid, depth: depth + 1 });
   }
 
   // Reorder triData by BVH leaf order
@@ -645,6 +648,7 @@ function buildBVH(positions, triDataArr, triCount, onProgress) {
     nodesU32: nodesU32.subarray(0, nodeCount * 8),
     sortedTriData,
     nodeCount,
+    maxDepth,
   };
 }
 
@@ -694,7 +698,10 @@ async function hashBuffer(buf) {
   return h.toString(16);
 }
 
-export async function loadScene(basePath, onProgress) {
+export async function loadScene(basePath, onProgress, opts) {
+  // BVH leaf size — tunable via ?leaf for the node-access-cost probe. Cached
+  // per leaf size (key below) so each value builds once. Default 8.
+  const leafSize = (opts && opts.leafSize) || MAX_LEAF_SIZE;
   let gltf = null;
   let gltfText = '';
   let buffers = [];
@@ -791,7 +798,7 @@ export async function loadScene(basePath, onProgress) {
     const gltfSig = `${sceneLabel}-${gltfText.length}-${(gltfHash >>> 0).toString(16)}`;
     // Fast key: use buffer sizes instead of content hash (instant, no buffer iteration)
     const bufferSizes = buffers.map((buf, i) => `${i}:${buf.byteLength}`).join('.');
-    cacheKey = 'scene-v9-' + gltfSig + '-' + bufferSizes;
+    cacheKey = 'scene-v11-' + gltfSig + '-leaf' + leafSize + '-' + bufferSizes;
     cached = await dbGet(db, cacheKey);
   } catch(e) { /* IndexedDB not available, proceed without cache */ }
 
@@ -917,7 +924,7 @@ export async function loadScene(basePath, onProgress) {
   onProgress?.(`Building BVH for ${totalTris|0} triangles...`);
 
   // Build BVH
-  const bvh = buildBVH(allPos, allTriData, totalTris, onProgress);
+  const bvh = buildBVH(allPos, allTriData, totalTris, onProgress, leafSize);
 
   // Pre-flatten triangle positions for cache-friendly BVH traversal
   // Layout: 3 × vec4f per triangle = 48 bytes, positions contiguous
@@ -1102,6 +1109,7 @@ export async function loadScene(basePath, onProgress) {
     triangles: totalTris,
     vertices: totalVerts,
     bvhNodes: bvh.nodeCount,
+    bvhMaxDepth: bvh.maxDepth,
     materials: materials.length,
     punctualLights: punctualLights.length,
     emissiveTris: emissiveCount,

@@ -464,6 +464,20 @@
         _log('MODULE_FAIL: ' + e.message, true);
       });
     });
+
+    // Auto-start for differential profiling: if the URL carries a debug param
+    // (spatial / temporal / bounces / auto), skip the splash and launch the
+    // renderer automatically — so we A/B configs by just editing the URL +
+    // refreshing, no clicking. The renderer reads its toggles from
+    // location.search directly; this programmatic click still builds
+    // IGNIS_CONFIG from the (profile-adjusted) splash form. The small delay
+    // lets the async GPU/profile detection populate the form defaults first.
+    (function() {
+      var qp = new URLSearchParams(location.search);
+      if (qp.has('spatial') || qp.has('temporal') || qp.has('bounces') || qp.has('auto') || qp.has('profile')) {
+        setTimeout(function() { document.getElementById('splash-start').click(); }, 600);
+      }
+    })();
   </script>
 </body>
 </html>

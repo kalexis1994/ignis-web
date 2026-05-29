@@ -88,7 +88,12 @@ struct Material { d0: vec4f, d1: vec4f, };
 //   [2] = (contribution.xyz, _pad) — added to radiance if shadow ray unblocked
 @group(0) @binding(5) var<storage, read_write> shadow_req: array<vec4f>;
 
-@group(1) @binding(0) var<storage, read> vertices: array<vec4f>;
+// Geometry positions. Interpretation depends on USE_TRIFLAT:
+//   0: per-vertex positions; triangle i's verts are geo[tri_data[i].x/y/z]
+//      (3 scattered gathers per tri — original indexed layout).
+//   1: contiguous per-triangle; triangle i's verts are geo[i*3 + 0/1/2]
+//      (leaf-ordered, cache-friendly — one miss loads the whole tri).
+@group(1) @binding(0) var<storage, read> geo: array<vec4f>;
 @group(1) @binding(1) var<storage, read> vert_normals: array<vec4f>;
 @group(1) @binding(2) var<storage, read> tri_data: array<vec4u>;
 @group(1) @binding(3) var<storage, read> bvh_nodes: array<BVHNode>;
@@ -117,6 +122,17 @@ struct Material { d0: vec4f, d1: vec4f, };
 override SRC_QUEUE: u32 = 0u;   // bounce: 0 reads queue_a, 1 reads queue_b
 override READ_IDX: u32 = 0u;    // prep: which count feeds the next bounce
 override FIRST_BOUNCE: u32 = 0u; // bounce: 1 = skip queue read, use gid.x directly
+// Geometry layout selector — must match the buffer bound at group(1) binding(0).
+// 0 = indexed per-vertex (geo + tri_data), 1 = contiguous per-tri (geo only).
+override USE_TRIFLAT: u32 = 0u;
+
+// BVH traversal stack depth. The `12u` literal is rewritten by renderer.js to
+// the BVH's actual max depth (+margin) at module-creation time, so the stack
+// never overflows → correct closest-hit / shadow for ANY leaf size. (We're
+// leaf-intersection-bound, not register-bound, so a deeper stack is cheap.)
+// Ordered traversal only ever stacks the deferred far-children along one
+// root→leaf path, so tree-depth is a safe upper bound.
+const STACK_DEPTH: u32 = 12u;
 
 // Temporal accumulation textures (group 3, ping-pong per frame).
 // Separate from group 0 so only the composite kernel needs this group;
@@ -312,13 +328,35 @@ fn intersect_tri(origin: vec3f, dir: vec3f, a: vec3f, b: vec3f, c: vec3f, max_t:
   return vec3f(t, u, v);
 }
 
+// Load a triangle's 3 world-space positions by sorted-triangle index.
+// USE_TRIFLAT is an override constant, so the compiler keeps only one branch
+// (no runtime branch, and the indexed path's tri_data load is elided when
+// contiguous). This is the single hot-path geometry fetch — closest-hit and
+// any-hit shadow both go through it once per leaf triangle.
+struct Tri3 { a: vec3f, b: vec3f, c: vec3f, };
+fn load_tri3(ti: u32) -> Tri3 {
+  var t: Tri3;
+  if USE_TRIFLAT == 1u {
+    let base = ti * 3u;
+    t.a = geo[base].xyz;
+    t.b = geo[base + 1u].xyz;
+    t.c = geo[base + 2u].xyz;
+  } else {
+    let td = tri_data[ti];
+    t.a = geo[td.x].xyz;
+    t.b = geo[td.y].xyz;
+    t.c = geo[td.z].xyz;
+  }
+  return t;
+}
+
 // ============================================================
 // BVH traversal — closest hit (v1: opaque-only, no alpha)
 // ============================================================
 fn trace_bvh(origin: vec3f, dir: vec3f) -> HitInfo {
   var hit: HitInfo; hit.t = INF; hit.hit = false;
   let inv_dir = 1.0 / dir;
-  var stk: array<u32, 12>; var sp = 0u; var cur = 0u;
+  var stk: array<u32, STACK_DEPTH>; var sp = 0u; var cur = 0u;
   let root_ab = node_aabb(bvh_nodes[0u]);
   if intersect_aabb(origin, inv_dir, root_ab.mn, root_ab.mx, INF) >= INF { return hit; }
   loop {
@@ -326,9 +364,8 @@ fn trace_bvh(origin: vec3f, dir: vec3f) -> HitInfo {
     if nd.tri_count > 0u {
       for (var i = 0u; i < nd.tri_count; i++) {
         let ti = nd.left_first + i;
-        let td = tri_data[ti];
-        let r = intersect_tri(origin, dir,
-          vertices[td.x].xyz, vertices[td.y].xyz, vertices[td.z].xyz, hit.t);
+        let tv = load_tri3(ti);
+        let r = intersect_tri(origin, dir, tv.a, tv.b, tv.c, hit.t);
         if r.x < hit.t {
           hit.t = r.x; hit.u = r.y; hit.v = r.z;
           hit.tri_idx = ti; hit.hit = true;
@@ -342,10 +379,10 @@ fn trace_bvh(origin: vec3f, dir: vec3f) -> HitInfo {
     let tl = intersect_aabb(origin, inv_dir, lab.mn, lab.mx, hit.t);
     let tr = intersect_aabb(origin, inv_dir, rab.mn, rab.mx, hit.t);
     if tl < tr {
-      if tr < hit.t && sp < 12u { stk[sp] = r; sp++; }
+      if tr < hit.t && sp < STACK_DEPTH { stk[sp] = r; sp++; }
       if tl < hit.t { cur = l; } else { if sp == 0u { break; } sp--; cur = stk[sp]; }
     } else {
-      if tl < hit.t && sp < 12u { stk[sp] = l; sp++; }
+      if tl < hit.t && sp < STACK_DEPTH { stk[sp] = l; sp++; }
       if tr < hit.t { cur = r; } else { if sp == 0u { break; } sp--; cur = stk[sp]; }
     }
   }
@@ -355,7 +392,7 @@ fn trace_bvh(origin: vec3f, dir: vec3f) -> HitInfo {
 // BVH any-hit for shadows (returns true if blocked before max_t)
 fn trace_shadow(origin: vec3f, dir: vec3f, max_t: f32) -> bool {
   let inv_dir = 1.0 / dir;
-  var stk: array<u32, 12>; var sp = 0u; var cur = 0u;
+  var stk: array<u32, STACK_DEPTH>; var sp = 0u; var cur = 0u;
   let root_ab = node_aabb(bvh_nodes[0u]);
   if intersect_aabb(origin, inv_dir, root_ab.mn, root_ab.mx, max_t) >= max_t { return false; }
   loop {
@@ -363,9 +400,8 @@ fn trace_shadow(origin: vec3f, dir: vec3f, max_t: f32) -> bool {
     if nd.tri_count > 0u {
       for (var i = 0u; i < nd.tri_count; i++) {
         let ti = nd.left_first + i;
-        let td = tri_data[ti];
-        let r = intersect_tri(origin, dir,
-          vertices[td.x].xyz, vertices[td.y].xyz, vertices[td.z].xyz, max_t);
+        let tv = load_tri3(ti);
+        let r = intersect_tri(origin, dir, tv.a, tv.b, tv.c, max_t);
         if r.x < max_t { return true; }
       }
       if sp == 0u { break; } sp--; cur = stk[sp]; continue;
@@ -376,10 +412,10 @@ fn trace_shadow(origin: vec3f, dir: vec3f, max_t: f32) -> bool {
     let tl = intersect_aabb(origin, inv_dir, lab.mn, lab.mx, max_t);
     let tr = intersect_aabb(origin, inv_dir, rab.mn, rab.mx, max_t);
     if tl < tr {
-      if tr < max_t && sp < 12u { stk[sp] = r; sp++; }
+      if tr < max_t && sp < STACK_DEPTH { stk[sp] = r; sp++; }
       if tl < max_t { cur = l; } else { if sp == 0u { break; } sp--; cur = stk[sp]; }
     } else {
-      if tl < max_t && sp < 12u { stk[sp] = l; sp++; }
+      if tl < max_t && sp < STACK_DEPTH { stk[sp] = l; sp++; }
       if tr < max_t { cur = r; } else { if sp == 0u { break; } sp--; cur = stk[sp]; }
     }
   }
@@ -554,9 +590,9 @@ fn mat_base_color(m: Material) -> vec3f { return m.d0.xyz; }
 fn mat_emission(m: Material) -> vec3f { return m.d1.xyz; } // already premultiplied with strength by scene-loader
 fn mat_is_unlit(m: Material) -> bool { return m.d0.w > 0.5; }
 
-fn triangle_geo_normal(td: vec4u) -> vec3f {
-  let a = vertices[td.x].xyz; let b = vertices[td.y].xyz; let c = vertices[td.z].xyz;
-  return normalize(cross(b - a, c - a));
+fn triangle_geo_normal(ti: u32) -> vec3f {
+  let tv = load_tri3(ti);
+  return normalize(cross(tv.b - tv.a, tv.c - tv.a));
 }
 
 // ============================================================
@@ -699,7 +735,7 @@ fn bounce(
       let td = tri_data[hit.tri_idx];
       let mat = material_buf[td.w];
       let hit_pos = rs.origin + rs.dir * hit.t;
-      let geo_normal_raw = triangle_geo_normal(td);
+      let geo_normal_raw = triangle_geo_normal(hit.tri_idx);
       let front_face = dot(rs.dir, geo_normal_raw) < 0.0;
       let geo_normal = select(-geo_normal_raw, geo_normal_raw, front_face);
       let bw = 1.0 - hit.u - hit.v;
@@ -794,10 +830,11 @@ fn bounce(
         let e_area    = et.y;
         let p_pick    = emissive_pick_pdf(ei);
 
-        let etd = tri_data[e_tri_idx];
-        let v0 = vertices[etd.x].xyz;
-        let v1 = vertices[etd.y].xyz;
-        let v2 = vertices[etd.z].xyz;
+        let etd = tri_data[e_tri_idx];  // kept for the emissive material id (etd.w)
+        let etv = load_tri3(e_tri_idx);
+        let v0 = etv.a;
+        let v1 = etv.b;
+        let v2 = etv.c;
         let x_l = sample_triangle_uniform(u_tri, v0, v1, v2);
         let n_l = normalize(cross(v1 - v0, v2 - v0));
 
