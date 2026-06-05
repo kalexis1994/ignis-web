@@ -271,8 +271,13 @@ fn temporal(@builtin(global_invocation_id) gid: vec3u) {
       let hist_dl = luma(diff_hist);
       let cur_dl = luma(diff_cur);
       let d_change = abs(hist_dl - cur_dl) / (max(hist_dl, cur_dl) + 0.001);
-      // If change > threshold relative to accumSpeed, reduce history confidence
-      let d_antilag = 1.0 / (1.0 + d_change * history_len * 0.5);
+      // Deadzone: ignore sub-noise-floor luma differences. diff_cur is a 1-spp
+      // frame and fluctuates frame-to-frame; the old formula (d_change * history_len)
+      // let that noise collapse the accumulated history every frame, so the image
+      // never converged (permanent jitter/splotches). Only react to changes that
+      // clearly exceed the noise floor, and don't scale the reaction by history_len.
+      let d_significant = max(d_change - 0.3, 0.0);
+      let d_antilag = 1.0 / (1.0 + d_significant * 20.0);
       let effective_history = history_len * d_antilag;
 
       let alpha = max(1.0 / (effective_history + 1.0), 0.02);

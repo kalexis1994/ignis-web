@@ -2256,7 +2256,10 @@ fn path_trace(primary_origin: vec3f, primary_dir: vec3f) -> PathResult {
     // Perceptual √ Russian roulette (ignis-rt / NRD guideline)
     // sqrt prevents dim paths from surviving with huge weight → fewer fireflies
     // Min 0.05 = max 20× boost (NRD recommendation)
-    if bounce >= 2u {
+    // Starts at bounce >= 1 (was 2): unbiased termination of dim paths one bounce
+    // earlier — big traversal cut in shadowed regions; extra variance is absorbed
+    // by the BMFR + temporal denoiser.
+    if bounce >= 1u {
       let p = clamp(sqrt(max(throughput.x, max(throughput.y, throughput.z))), 0.05, 0.9);
       if rand() > p { break; }
       throughput /= p;

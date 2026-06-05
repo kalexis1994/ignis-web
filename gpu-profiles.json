@@ -24,11 +24,12 @@
     "nvidia_ada": {
       "match": [
         "nvidia.*ada",
+        "nvidia.*lovelace",
         "nvidia.*rtx.*40",
         "geforce.*rtx.*40"
       ],
       "fsrMode": "quality",
-      "maxBounces": 3,
+      "maxBounces": 2,
       "texSize": 1024,
       "displayCap": 1440,
       "waveSize": 32,

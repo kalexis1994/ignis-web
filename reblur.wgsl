@@ -438,9 +438,9 @@ fn spatial_filter(
     areaFactor_s *= nonLinearAccumSpeed;
   }
 
-  // DEBUG: force large radius to verify spatial filter works
-  var blurRadius_d = 30.0; //radiusScale * sqrt(areaFactor_d) * gp.max_blur_radius;
-  var blurRadius_s = 30.0 * max(smc, 0.3); //radiusScale * sqrt(areaFactor_s) * gp.max_blur_radius * smc;
+  // Adaptive radius (NRD): shrinks as the signal converges (areaFactor folds in accumSpeed)
+  var blurRadius_d = radiusScale * sqrt(areaFactor_d) * gp.max_blur_radius;
+  var blurRadius_s = radiusScale * sqrt(areaFactor_s) * gp.max_blur_radius * smc;
   blurRadius_d = max(blurRadius_d, gp.min_blur_radius);
   blurRadius_s = max(blurRadius_s, gp.min_blur_radius * smc);
 

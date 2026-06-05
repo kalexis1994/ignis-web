@@ -81,7 +81,9 @@ fn trace_closest(@builtin(global_invocation_id) gid: vec3u) {
 
   let root = bvh_nodes[0u];
   if intersect_aabb(origin, inv_dir, root.aabb_min, root.aabb_max, best_t) >= best_t {
-    hits[ray_idx] = vec4f(bitcast<f32>(0xFFFFFFFFu), 0.0, 0.0, INF);
+    // best_tri is 0xFFFFFFFFu here (miss sentinel). Bitcasting a runtime var
+    // avoids WGSL const-eval rejecting the -NaN bit pattern of a literal.
+    hits[ray_idx] = vec4f(bitcast<f32>(best_tri), 0.0, 0.0, INF);
     return;
   }
 

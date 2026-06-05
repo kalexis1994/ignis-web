@@ -165,7 +165,7 @@ async function init() {
   if (!FSR_MODES[fsrMode]) fsrMode = 'balanced';
   const displayCap = cfg.displayCap || gpuProfile.displayCap || 1080;
   const texSize = cfg.texSize ?? gpuProfile.texSize ?? 512;
-  const denoiseMode = 'reblur'; // cfg.denoise || gpuProfile.denoise || 'full';
+  const denoiseMode = cfg.denoise || gpuProfile.denoise || 'reblur'; // honor splash selector
   const maxBounces = cfg.bounces || gpuProfile.maxBounces || 3;
   const sppPerFrame = cfg.spp || gpuProfile.spp || 1;
   const sharcEnabled = cfg.sharc !== undefined ? cfg.sharc : (gpuProfile.sharc !== false);
@@ -208,7 +208,7 @@ async function init() {
   // --- Load shaders ---
   const v = Date.now(); // cache bust
   let [ptCode, dispCode, fsrCode, dnCode, tmpCode, gbCode, smCode, reblurCode,
-       wfRayGenCode, wfTraceCode, wfShadeCode, wfAccumCode] = await Promise.all([
+       wfRayGenCode, wfTraceCode, wfShadeCode, wfAccumCode, bmfrCode] = await Promise.all([
     fetch(`pathtracer.wgsl?v=${v}`).then(r => r.text()),
     fetch(`display.wgsl?v=${v}`).then(r => r.text()),
     fetch(`fsr.wgsl?v=${v}`).then(r => r.text()),
@@ -221,6 +221,7 @@ async function init() {
     fetch(`wf_trace.wgsl?v=${v}`).then(r => r.text()),
     fetch(`wf_shade.wgsl?v=${v}`).then(r => r.text()),
     fetch(`wf_accumulate.wgsl?v=${v}`).then(r => r.text()),
+    fetch(`bmfr.wgsl?v=${v}`).then(r => r.text()),
   ]);
 
   if (hasSubgroups) rlog('Subgroups available (reserved for denoiser)');
@@ -251,6 +252,7 @@ async function init() {
   const gbModule = device.createShaderModule({ code: gbCode, ...smOpts });
   const shadowModule = device.createShaderModule({ code: smCode, ...smOpts });
   const reblurModule = device.createShaderModule({ code: reblurCode, ...smOpts });
+  const bmfrModule = device.createShaderModule({ code: bmfrCode, ...smOpts });
 
   // Wavefront modules
   const wfRayGenModule = device.createShaderModule({ code: wfRayGenCode, ...smOpts });
@@ -805,6 +807,37 @@ async function init() {
   // ReBLUR uniform buffer (ReblurParams struct, ~640 bytes)
   const reblurParamBuf = device.createBuffer({ size: 576, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
 
+  // === BMFR — blockwise regression denoiser (diffuse). solve -> bilinear eval -> temporal. ===
+  const bmfrParamBuf = device.createBuffer({ size: 176, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
+  const bmfrFitTex = device.createTexture({ size:[width,height], format:'rgba16float', usage:F16 });
+  const bmfrHistA  = device.createTexture({ size:[width,height], format:'rgba16float', usage:F16 });
+  const bmfrHistB  = device.createTexture({ size:[width,height], format:'rgba16float', usage:F16 });
+  const bmfrFitPipeline   = device.createComputePipeline({ layout: 'auto', compute: { module: bmfrModule, entryPoint: 'fit' } });
+  const bmfrAccumPipeline = device.createComputePipeline({ layout: 'auto', compute: { module: bmfrModule, entryPoint: 'accumulate' } });
+  const bmfrFitBG = device.createBindGroup({ layout: bmfrFitPipeline.getBindGroupLayout(0), entries: [
+    { binding: 0, resource: { buffer: bmfrParamBuf } },
+    { binding: 1, resource: noisyTex.createView() },       // in: noisy demodulated diffuse
+    { binding: 2, resource: denoiseNdTex.createView() },   // in: normal(xyz)+hit-dist(w)
+    { binding: 3, resource: bmfrFitTex.createView() },     // out: per-pixel own-block reconstruction
+  ]});
+  // Accumulate ping-pong: even frames read A/write B, odd read B/write A
+  const bmfrAccumBG_A = device.createBindGroup({ layout: bmfrAccumPipeline.getBindGroupLayout(0), entries: [
+    { binding: 0, resource: { buffer: bmfrParamBuf } },
+    { binding: 2, resource: denoiseNdTex.createView() },
+    { binding: 4, resource: bmfrFitTex.createView() },
+    { binding: 5, resource: bmfrHistA.createView() },
+    { binding: 6, resource: hdrTex.createView() },
+    { binding: 7, resource: bmfrHistB.createView() },
+  ]});
+  const bmfrAccumBG_B = device.createBindGroup({ layout: bmfrAccumPipeline.getBindGroupLayout(0), entries: [
+    { binding: 0, resource: { buffer: bmfrParamBuf } },
+    { binding: 2, resource: denoiseNdTex.createView() },
+    { binding: 4, resource: bmfrFitTex.createView() },
+    { binding: 5, resource: bmfrHistB.createView() },
+    { binding: 6, resource: hdrTex.createView() },
+    { binding: 7, resource: bmfrHistA.createView() },
+  ]});
+
   // ReBLUR bind groups — spatial passes use group(0) only, temporal passes use group(0)+group(1)
   // Reuse dnParamBufs[0] as uniform for spatial passes (step_size + frames_still)
   const reblurBG_prepass = device.createBindGroup({ layout: dnAtrousLayout, entries: [
@@ -1174,6 +1207,20 @@ async function init() {
     { binding: 0, resource: { buffer: dnCompParamBuf } },
     { binding: 1, resource: hdrTex.createView() },
     { binding: 4, resource: specHdrTex.createView() },
+    { binding: 6, resource: albedoTex.createView() },
+    { binding: 7, resource: ptOutputTex.createView() },
+    { binding: 8, resource: matIdTex.createView() },
+    { binding: 9, resource: ndTex.createView() },
+    { binding: 10, resource: prevFrameTex.createView() },
+    { binding: 11, resource: compSampler },
+    { binding: 12, resource: { buffer: matBuf } },
+    { binding: 13, resource: { buffer: exposureBuf } },
+  ]});
+  // BMFR composite: diffuse from hdrTex (regression output), specular raw (M1)
+  const dnBG_comp_bmfr = device.createBindGroup({ layout: dnCompLayout, entries: [
+    { binding: 0, resource: { buffer: dnCompParamBuf } },
+    { binding: 1, resource: hdrTex.createView() },
+    { binding: 4, resource: specNoisyTex.createView() },
     { binding: 6, resource: albedoTex.createView() },
     { binding: 7, resource: ptOutputTex.createView() },
     { binding: 8, resource: matIdTex.createView() },
@@ -2245,6 +2292,8 @@ async function init() {
     td[36]=fovFactor;td[37]=aspect;td[38]=0.1;td[39]=512.0; // depth_reject_scale, max_history
     device.queue.writeBuffer(tmpBuf, 0, td);
 
+    // BMFR reprojection needs the REAL previous-frame camera; snapshot before overwrite.
+    const bmfrPrevCam = prevCam;
     // Save current camera as previous for next frame
     prevCam = { pos:[...camera.pos], right:[...right], up:[...up], fwd:[...forward] };
 
@@ -2400,6 +2449,31 @@ async function init() {
           oidn.blendFrame = 1 - oidn.blendFrame;
         }
         // When OIDN skipped: composite reads last OIDN result from history (still clean)
+      } else if (denoiseMode === 'bmfr') {
+        // === BMFR (M2): blockwise regression + temporal accumulation ===
+        const bpf = new Float32Array(44);
+        const bpi = new Int32Array(bpf.buffer);
+        // R2 low-discrepancy offset: evenly covers the 32x32 block over consecutive
+        // frames so the grid averages out faster than a random/clumping offset.
+        const ox = ((0.5 + 0.7548776662 * frameIndex) % 1) * 32;
+        const oy = ((0.5 + 0.5698402910 * frameIndex) % 1) * 32;
+        bpf[0] = width; bpf[1] = height;
+        bpi[2] = Math.floor(ox) & 31; bpi[3] = Math.floor(oy) & 31;
+        bpf[4]=right[0];    bpf[5]=right[1];    bpf[6]=right[2];    bpf[7]=0;
+        bpf[8]=up[0];       bpf[9]=up[1];       bpf[10]=up[2];      bpf[11]=0;
+        bpf[12]=forward[0]; bpf[13]=forward[1]; bpf[14]=forward[2]; bpf[15]=0;
+        bpf[16]=camera.pos[0]; bpf[17]=camera.pos[1]; bpf[18]=camera.pos[2]; bpf[19]=0;
+        bpf[20]=bmfrPrevCam.right[0]; bpf[21]=bmfrPrevCam.right[1]; bpf[22]=bmfrPrevCam.right[2]; bpf[23]=0;
+        bpf[24]=bmfrPrevCam.up[0];    bpf[25]=bmfrPrevCam.up[1];    bpf[26]=bmfrPrevCam.up[2];    bpf[27]=0;
+        bpf[28]=bmfrPrevCam.fwd[0];   bpf[29]=bmfrPrevCam.fwd[1];   bpf[30]=bmfrPrevCam.fwd[2];   bpf[31]=0;
+        bpf[32]=bmfrPrevCam.pos[0];   bpf[33]=bmfrPrevCam.pos[1];   bpf[34]=bmfrPrevCam.pos[2];   bpf[35]=0;
+        bpf[36]=fovFactor; bpf[37]=aspect; bpf[38]=0.05; bpf[39]=0.03;   // ridge (relative), min_alpha
+        bpf[40]=framesStill; bpf[41]=256.0; bpf[42]=0.1; bpf[43]=0;      // frames_still, max_history, depth_reject
+        device.queue.writeBuffer(bmfrParamBuf, 0, bpf);
+        // Pass 1: per-block regression fit (per-pixel own-block) -> bmfrFitTex
+        { const p = encoder.beginComputePass(); p.setPipeline(bmfrFitPipeline); p.setBindGroup(0, bmfrFitBG); p.dispatchWorkgroups(Math.ceil(width/32)+1, Math.ceil(height/32)+1); p.end(); }
+        // Pass 2: temporal accumulate -> hdrTex + new history
+        { const p = encoder.beginComputePass(); p.setPipeline(bmfrAccumPipeline); p.setBindGroup(0, (frameIndex & 1) === 0 ? bmfrAccumBG_A : bmfrAccumBG_B); p.dispatchWorkgroups(Math.ceil(width/8), Math.ceil(height/8)); p.end(); }
       } else if (denoiseMode === 'reblur') {
         // === ReBLUR pipeline: 6 passes ===
         const wg = [Math.ceil(width/16), Math.ceil(height/16)];
@@ -2506,8 +2580,8 @@ async function init() {
         rp[119]=2.0;     // plane_dist_sensitivity
         rp[120]=0.5;     // min_blur_radius
         rp[121]=20.0;    // max_blur_radius
-        rp[122]=30.0;    // diff_prepass_blur_radius
-        rp[123]=30.0;    // spec_prepass_blur_radius
+        rp[122]=10.0;    // diff_prepass_blur_radius (was 30 = over-blur at low internal res)
+        rp[123]=10.0;    // spec_prepass_blur_radius
         rp[124]=63.0;    // max_accumulated_frame_num
         rp[125]=8.0;     // max_fast_accumulated_frame_num
         rp[126]=0.5;     // lobe_angle_fraction
@@ -2575,7 +2649,7 @@ async function init() {
         historyFrame = 1 - historyFrame;
       }
 
-      if (denoiseMode !== 'off' && denoiseMode !== 'oidn' && denoiseMode !== 'reblur') {
+      if (denoiseMode !== 'off' && denoiseMode !== 'oidn' && denoiseMode !== 'reblur' && denoiseMode !== 'bmfr') {
         // Update denoise params with framesStill for motion-adaptive filtering
         for (let di = 0; di < denoisePasses; di++) {
           device.queue.writeBuffer(dnParamBufs[di], 0, new Float32Array([width, height, dnSteps[di], framesStill]));
@@ -2621,6 +2695,7 @@ async function init() {
       const compBG = (denoiseMode.startsWith('oidn') && oidn)
                    ? (oidn.blendFrame === 0 ? dnBG_comp_oidn_A : dnBG_comp_oidn_B)
                    : denoiseMode === 'reblur' ? dnBG_comp_reblur  // reads hdrTex (stabilized)
+                   : denoiseMode === 'bmfr' ? dnBG_comp_bmfr      // reads hdrTex (regression output)
                    : denoiseMode !== 'off' ? dnBG_comp : dnBG_comp_noisy;
       compPass.setBindGroup(0, compBG);
       compPass.dispatchWorkgroups(Math.ceil(width/16), Math.ceil(height/16));
