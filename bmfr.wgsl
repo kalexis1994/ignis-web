@@ -116,6 +116,59 @@ fn read_diff_clamped(px: vec2i, sz: vec2i) -> vec3f {
 }
 
 // ============================================================
+// KERNEL 0 — pre_accumulate: reprojected EMA of the RAW noisy diffuse.
+// The BMFR-paper structure is accumulate -> fit -> accumulate; fitting the
+// raw 1-spp signal makes the per-cell model coefficients flicker frame to
+// frame (coarse, cell-sized noise while the camera moves). A short
+// moving-average -> 80/20 EMA (paper's rule) cuts input variance ~5x.
+// History is always AABB-clamped to the current 3x3 envelope: ghosts here
+// would poison the fit itself.
+// ============================================================
+@compute @workgroup_size(8, 8)
+fn pre_accumulate(@builtin(global_invocation_id) gid: vec3u) {
+  let px = vec2i(gid.xy);
+  let sz = vec2i(bp.resolution);
+  if px.x >= sz.x || px.y >= sz.y { return; }
+
+  let nd = textureLoad(in_nd, px, 0);
+  let cz = nd.w;
+  let cur = textureLoad(in_diff, px, 0).rgb;
+  if cz >= SKY_Z {
+    textureStore(hist_out, px, vec4f(cur, 0.0));
+    return;
+  }
+
+  let world = reconstruct_world(vec2f(px), cz);
+  let puv = project_to_uv(world, bp.prev_right.xyz, bp.prev_up.xyz, bp.prev_fwd.xyz, bp.prev_pos.xyz);
+
+  var blended = cur;
+  var cnt = 1.0;
+  if puv.x >= 0.0 && puv.x <= 1.0 && puv.y >= 0.0 && puv.y <= 1.0 {
+    let ppx = clamp(vec2i(puv.xy * bp.resolution), vec2i(0), sz - 1);
+    let h = textureLoad(in_hist, ppx, 0);
+
+    // LOOSE ghost gate only. A tight 1-spp colour clamp zeroes the history
+    // wherever the current 3x3 happens to be all-dark (sparse GI samples) —
+    // exactly the regions accumulation must help. Bright-residue ghosts are
+    // the visible kind, so cap history at a multiple of the local max; the
+    // short window (<=16) bounds any surviving ghost's lifetime.
+    var mx = cur;
+    for (var dy = -1; dy <= 1; dy++) {
+      for (var dx = -1; dx <= 1; dx++) {
+        let sp = clamp(px + vec2i(dx, dy), vec2i(0), sz - 1);
+        mx = max(mx, textureLoad(in_diff, sp, 0).rgb);
+      }
+    }
+    let hc = clamp(h.rgb, vec3f(0.0), mx * 4.0 + vec3f(0.25));
+
+    cnt = min(max(h.a, 0.0) + 1.0, 16.0);
+    let alpha = max(1.0 / cnt, 0.2);     // moving average for the first 5, then 80/20 EMA
+    blended = mix(hc, cur, alpha);
+  }
+  textureStore(hist_out, px, vec4f(blended, cnt));
+}
+
+// ============================================================
 // KERNEL 1 — moments: one 8x8 workgroup per coarse cell
 // Positions are accumulated RELATIVE TO A PER-CELL REFERENCE (first valid
 // pixel's world pos). Raw camera-relative positions (magnitude ~ scene size)
@@ -200,6 +253,16 @@ fn solve(@builtin(global_invocation_id) gid: vec3u) {
   let cbase = (gid.y * mx + gid.x) * MSTRIDE;
   let ref_c = vec3f(momBuf[cbase + 49u], momBuf[cbase + 50u], momBuf[cbase + 51u]);
 
+  // Bilateral moment blur: weight neighbour cells by mean-luminance similarity.
+  // A lighting edge inside one surface (light pool / shadow) has NO feature
+  // difference, so the linear model alone smears it across the whole window
+  // ("bloom" around lit areas). Cell means (64-px averages) are stable enough
+  // at 1 spp to gate the mixing: similar lighting -> full sharing, different
+  // lighting -> cells keep their own statistics and the edge stays sharp.
+  let S_c = momBuf[cbase + 0u];
+  let valid_c = S_c > 1.0e-3;
+  let lum_c = luma(vec3f(momBuf[cbase + 28u], momBuf[cbase + 29u], momBuf[cbase + 30u])) / max(S_c, 1.0e-3);
+
   var A: array<f32, 28>;
   var b: array<f32, 21>;
   for (var k = 0u; k < NA; k++) { A[k] = 0.0; }
@@ -209,8 +272,17 @@ fn solve(@builtin(global_invocation_id) gid: vec3u) {
     for (var di = -2; di <= 2; di++) {
       let cx = u32(clamp(i32(gid.x) + di, 0, i32(mx) - 1));
       let cy = u32(clamp(i32(gid.y) + dj, 0, i32(my) - 1));
-      let w = gw5(di) * gw5(dj);
       let base = (cy * mx + cx) * MSTRIDE;
+
+      let S_n = momBuf[base + 0u];
+      if S_n <= 1.0e-3 { continue; }     // empty/sky cell: nothing to contribute
+
+      var w = gw5(di) * gw5(dj);
+      if valid_c {
+        let lum_n = luma(vec3f(momBuf[base + 28u], momBuf[base + 29u], momBuf[base + 30u])) / max(S_n, 1.0e-3);
+        let rel = abs(lum_c - lum_n) / (max(lum_c, lum_n) + 1.0e-3);
+        w *= exp(-rel * rel * 8.0);      // ~1 for similar lighting, ~0 across light/shadow
+      }
 
       var mA: array<f32, 28>;
       var mb: array<f32, 21>;
@@ -379,6 +451,25 @@ fn apply(@builtin(global_invocation_id) gid: vec3u) {
   let w11 = fx * fy * step(1.0e-6, v11.a);
   var col = (v00.rgb * w00 + v10.rgb * w10 + v01.rgb * w01 + v11.rgb * w11)
             / max(w00 + w10 + w01 + w11, 1.0e-4);
+
+  // Anti-bleed clamp: a model fitted/blended across a lighting edge (cell straddling
+  // light/shadow, or bilinear pulling a lit cell's model into shadow pixels) can emit
+  // values the local pixels never contained -> "bloom". Bound the result to the 3x3
+  // range of the noisy input (wide under noise, so it rarely bites elsewhere).
+  let c0 = textureLoad(in_diff, px, 0).rgb;   // centre pixel is non-sky here
+  var bmn = c0; var bmx = c0;
+  for (var dy = -1; dy <= 1; dy++) {
+    for (var dx = -1; dx <= 1; dx++) {
+      if dx == 0 && dy == 0 { continue; }
+      let sp = clamp(px + vec2i(dx, dy), vec2i(0), sz - 1);
+      if textureLoad(in_nd, sp, 0).w < SKY_Z {
+        let c = textureLoad(in_diff, sp, 0).rgb;
+        bmn = min(bmn, c); bmx = max(bmx, c);
+      }
+    }
+  }
+  let bext = (bmx - bmn) * 0.5 + vec3f(0.01);
+  col = clamp(col, max(bmn - bext, vec3f(0.0)), bmx + bext);
 
   let safe = clamp(col, vec3f(0.0), vec3f(64.0));
   col = select(vec3f(0.0), safe, safe == safe);

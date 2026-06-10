@@ -815,28 +815,55 @@ async function init() {
   const bmfrNbx = Math.ceil(width/8), bmfrNby = Math.ceil(height/8);   // coarse (1/8) grid
   const bmfrMomentBuf = device.createBuffer({ size: bmfrNbx*bmfrNby*52*4, usage: GPUBufferUsage.STORAGE }); // 52 f32/cell (49 moments + cell ref)
   const bmfrCoefBuf   = device.createBuffer({ size: bmfrNbx*bmfrNby*25*4, usage: GPUBufferUsage.STORAGE }); // 25 f32/cell (coefs + cell ref)
+  // Pre-accumulation (BMFR paper: accumulate -> fit -> accumulate). Ping-pong A/B.
+  const bmfrPreA = device.createTexture({ size:[width,height], format:'rgba16float', usage:F16 });
+  const bmfrPreB = device.createTexture({ size:[width,height], format:'rgba16float', usage:F16 });
+  const bmfrPrePipeline     = device.createComputePipeline({ layout: 'auto', compute: { module: bmfrModule, entryPoint: 'pre_accumulate' } });
   const bmfrMomentsPipeline = device.createComputePipeline({ layout: 'auto', compute: { module: bmfrModule, entryPoint: 'moments' } });
   const bmfrSolvePipeline   = device.createComputePipeline({ layout: 'auto', compute: { module: bmfrModule, entryPoint: 'solve' } });
   const bmfrApplyPipeline   = device.createComputePipeline({ layout: 'auto', compute: { module: bmfrModule, entryPoint: 'apply' } });
   const bmfrAccumPipeline   = device.createComputePipeline({ layout: 'auto', compute: { module: bmfrModule, entryPoint: 'accumulate' } });
-  const bmfrMomentsBG = device.createBindGroup({ layout: bmfrMomentsPipeline.getBindGroupLayout(0), entries: [
+  // flip=0: pre reads preB -> writes preA; moments/apply read preA (and vice versa)
+  const bmfrPreBG_A = device.createBindGroup({ layout: bmfrPrePipeline.getBindGroupLayout(0), entries: [
+    { binding: 0, resource: { buffer: bmfrParamBuf } },
+    { binding: 1, resource: noisyTex.createView() },       // raw noisy demodulated diffuse
+    { binding: 2, resource: denoiseNdTex.createView() },
+    { binding: 5, resource: bmfrPreB.createView() },       // in: previous pre-accum
+    { binding: 7, resource: bmfrPreA.createView() },       // out: pre-accumulated input
+  ]});
+  const bmfrPreBG_B = device.createBindGroup({ layout: bmfrPrePipeline.getBindGroupLayout(0), entries: [
     { binding: 0, resource: { buffer: bmfrParamBuf } },
     { binding: 1, resource: noisyTex.createView() },
     { binding: 2, resource: denoiseNdTex.createView() },
-    { binding: 8, resource: { buffer: bmfrMomentBuf } },
+    { binding: 5, resource: bmfrPreA.createView() },
+    { binding: 7, resource: bmfrPreB.createView() },
   ]});
+  function makeBmfrMomentsBG(srcTex) {
+    return device.createBindGroup({ layout: bmfrMomentsPipeline.getBindGroupLayout(0), entries: [
+      { binding: 0, resource: { buffer: bmfrParamBuf } },
+      { binding: 1, resource: srcTex.createView() },       // pre-accumulated diffuse
+      { binding: 2, resource: denoiseNdTex.createView() },
+      { binding: 8, resource: { buffer: bmfrMomentBuf } },
+    ]});
+  }
+  const bmfrMomentsBG_A = makeBmfrMomentsBG(bmfrPreA);
+  const bmfrMomentsBG_B = makeBmfrMomentsBG(bmfrPreB);
   const bmfrSolveBG = device.createBindGroup({ layout: bmfrSolvePipeline.getBindGroupLayout(0), entries: [
     { binding: 0, resource: { buffer: bmfrParamBuf } },
     { binding: 8, resource: { buffer: bmfrMomentBuf } },
     { binding: 9, resource: { buffer: bmfrCoefBuf } },
   ]});
-  const bmfrApplyBG = device.createBindGroup({ layout: bmfrApplyPipeline.getBindGroupLayout(0), entries: [
-    { binding: 0, resource: { buffer: bmfrParamBuf } },
-    { binding: 1, resource: noisyTex.createView() },
-    { binding: 2, resource: denoiseNdTex.createView() },
-    { binding: 3, resource: bmfrFitTex.createView() },
-    { binding: 9, resource: { buffer: bmfrCoefBuf } },
-  ]});
+  function makeBmfrApplyBG(srcTex) {
+    return device.createBindGroup({ layout: bmfrApplyPipeline.getBindGroupLayout(0), entries: [
+      { binding: 0, resource: { buffer: bmfrParamBuf } },
+      { binding: 1, resource: srcTex.createView() },       // pre-accumulated (sky passthrough + anti-bleed range)
+      { binding: 2, resource: denoiseNdTex.createView() },
+      { binding: 3, resource: bmfrFitTex.createView() },
+      { binding: 9, resource: { buffer: bmfrCoefBuf } },
+    ]});
+  }
+  const bmfrApplyBG_A = makeBmfrApplyBG(bmfrPreA);
+  const bmfrApplyBG_B = makeBmfrApplyBG(bmfrPreB);
   // Accumulate ping-pong: even frames read A/write B, odd read B/write A
   const bmfrAccumBG_A = device.createBindGroup({ layout: bmfrAccumPipeline.getBindGroupLayout(0), entries: [
     { binding: 0, resource: { buffer: bmfrParamBuf } },
@@ -2436,8 +2463,10 @@ async function init() {
           device.queue.writeBuffer(oidn.ioParams, 20, new Float32Array([autoExposure]));
           device.queue.writeBuffer(oidn.outParams, 20, new Float32Array([autoExposure]));
           oidn.encode(encoder, oidn.inputBG, oidn.outputBG);
-          // Reprojected temporal blend of OIDN output (smooths residual noise; disocclusion pushes alpha->1)
-          const blendAlpha = 0.15;
+          // Reprojected temporal blend of OIDN output (smooths residual noise; disocclusion pushes alpha->1).
+          // Motion-adaptive: fast response while moving (kills trailing ghosts at low fps),
+          // heavy smoothing once still (shimmer-free convergence).
+          const blendAlpha = framesStill < 4 ? 0.6 : 0.15;
           const bcam = new Float32Array(40);
           const bcamU = new Uint32Array(bcam.buffer);
           bcamU[0] = width; bcamU[1] = height; bcamU[2] = Math.round(blendAlpha * 1000); bcamU[3] = 0;
@@ -2478,12 +2507,14 @@ async function init() {
         bpf[36]=fovFactor; bpf[37]=aspect; bpf[38]=0.05; bpf[39]=0.03;   // ridge (relative), min_alpha
         bpf[40]=framesStill; bpf[41]=256.0; bpf[42]=0.1; bpf[43]=0;      // frames_still, max_history, depth_reject
         device.queue.writeBuffer(bmfrParamBuf, 0, bpf);
+        // K0: pre-accumulate raw noisy input (BMFR paper: accumulate -> fit -> accumulate)
+        { const p = encoder.beginComputePass(); p.setPipeline(bmfrPrePipeline); p.setBindGroup(0, bmfrFlip === 0 ? bmfrPreBG_A : bmfrPreBG_B); p.dispatchWorkgroups(Math.ceil(width/8), Math.ceil(height/8)); p.end(); }
         // K1: per-8x8-block moments -> coarse moment buffer
-        { const p = encoder.beginComputePass(); p.setPipeline(bmfrMomentsPipeline); p.setBindGroup(0, bmfrMomentsBG); p.dispatchWorkgroups(bmfrNbx, bmfrNby); p.end(); }
+        { const p = encoder.beginComputePass(); p.setPipeline(bmfrMomentsPipeline); p.setBindGroup(0, bmfrFlip === 0 ? bmfrMomentsBG_A : bmfrMomentsBG_B); p.dispatchWorkgroups(bmfrNbx, bmfrNby); p.end(); }
         // K2: blur 5x5 moments + Cholesky solve -> coarse coef buffer
         { const p = encoder.beginComputePass(); p.setPipeline(bmfrSolvePipeline); p.setBindGroup(0, bmfrSolveBG); p.dispatchWorkgroups(Math.ceil(bmfrNbx/8), Math.ceil(bmfrNby/8)); p.end(); }
         // K3: bilinear-apply coarse coefficients -> bmfrFitTex
-        { const p = encoder.beginComputePass(); p.setPipeline(bmfrApplyPipeline); p.setBindGroup(0, bmfrApplyBG); p.dispatchWorkgroups(Math.ceil(width/8), Math.ceil(height/8)); p.end(); }
+        { const p = encoder.beginComputePass(); p.setPipeline(bmfrApplyPipeline); p.setBindGroup(0, bmfrFlip === 0 ? bmfrApplyBG_A : bmfrApplyBG_B); p.dispatchWorkgroups(Math.ceil(width/8), Math.ceil(height/8)); p.end(); }
         // K4: temporal accumulate -> hdrTex + new history
         { const p = encoder.beginComputePass(); p.setPipeline(bmfrAccumPipeline); p.setBindGroup(0, bmfrFlip === 0 ? bmfrAccumBG_A : bmfrAccumBG_B); p.dispatchWorkgroups(Math.ceil(width/8), Math.ceil(height/8)); p.end(); }
         // K5: specular temporal denoise -> specHdrTex
