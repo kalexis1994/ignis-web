@@ -8,10 +8,30 @@ struct OpsParams {
   out_width: u32,
   out_height: u32,
   channels: u32,
-  _pad0: u32,
-  _pad1: u32,
+  hdr_scale: f32,      // inputScale (autoexposure) for the HDR PU transfer
+  transfer_mode: u32,  // 0 = LDR (Reinhard+sRGB, rt_ldr_* weights), 1 = HDR (PU, rt_hdr_* weights)
   _pad2: u32,
 };
+
+// OIDN PU (perceptual) HDR transfer — forward (HDR linear -> network) and inverse.
+// Exact constants from OIDN core/color.h. Bounded curve (no 1/(1-x) blow-up).
+// OIDN normalizes the curve so the network input lands in [0,1]:
+//   PU_NORM_SCALE = 1 / pu_forward(65504) ≈ 1 / 3.13510
+const PU_NORM_SCALE: f32 = 0.3189699;
+fn pu_forward(yv: f32) -> f32 {
+  let y = max(yv, 0.0);
+  if y <= 1.57945760e-06 { return 1.41283765e+03 * y; }
+  else if y <= 3.22087631e-02 { return 1.64593172 * pow(y, 4.31384981e-01) - 2.94139609e-03; }
+  else { return 1.92653254e-01 * log(y + 6.26026094e-03) + 9.98620152e-01; }
+}
+fn pu_inverse(xv: f32) -> f32 {
+  let x = max(xv, 0.0);
+  if x <= 2.23151711e-03 { return x / 1.41283765e+03; }
+  else if x <= 3.70974749e-01 { return pow((x + 2.94139609e-03) / 1.64593172, 1.0 / 4.31384981e-01); }
+  else { return exp((x - 9.98620152e-01) / 1.92653254e-01) - 6.26026094e-03; }
+}
+fn pu_forward_norm(y: f32) -> f32 { return pu_forward(y) * PU_NORM_SCALE; }
+fn pu_inverse_norm(x: f32) -> f32 { return pu_inverse(x / PU_NORM_SCALE); }
 
 @group(0) @binding(0) var<uniform> params: OpsParams;
 @group(0) @binding(1) var<storage, read> buf_in: array<f16>;
@@ -121,9 +141,17 @@ fn input_assembly(
     beauty *= max_lum / center_lum;
   }
 
-  // LDR model: expects sRGB gamma-encoded [0,1] (like a final render)
-  let tonemapped = beauty / (beauty + 1.0);          // Reinhard tonemap → [0,1)
-  let tf = pow(max(tonemapped, vec3f(0.0)), vec3f(1.0 / 2.2)); // sRGB gamma
+  // Transfer to the network's trained input distribution ([0,1] in both cases).
+  var tf: vec3f;
+  if params.transfer_mode == 1u {
+    // HDR model: scale by inputScale, then OIDN's normalized PU perceptual transfer.
+    let bs = beauty * params.hdr_scale;
+    tf = vec3f(pu_forward_norm(bs.x), pu_forward_norm(bs.y), pu_forward_norm(bs.z));
+  } else {
+    // LDR model: Reinhard tonemap + sRGB gamma (what rt_ldr_* weights were trained on).
+    let tonemapped = beauty / (beauty + 1.0);
+    tf = pow(max(tonemapped, vec3f(0.0)), vec3f(1.0 / 2.2));
+  }
 
   // Write 9 channels NCHW: color(3) + albedo(3) + normal(3)
   buf_out[0u * HW + idx] = f16(tf.x);
@@ -159,11 +187,21 @@ fn output_extraction(
   let g = f32(buf_in[1u * HW + idx]);
   let b = f32(buf_in[2u * HW + idx]);
 
-  // Inverse: sRGB gamma → linear → inverse Reinhard → HDR
-  let srgb = clamp(vec3f(r, g, b), vec3f(0.0), vec3f(1.0));
-  let linear = pow(srgb, vec3f(2.2));                    // inverse gamma
-  let beauty = linear / max(1.0 - linear, vec3f(0.001)); // inverse Reinhard
-  // beauty /= 0.5; // undo exposure — skip, let composite exposure handle it
+  // Invert the transfer. Network output is unconstrained f16 — clamp to the trained
+  // [0,1] range BEFORE inverting (pu_inverse is exponential above ~0.37: an overshoot
+  // of 3.0 would decode to ~3e4, blow past f16 max after /hdr_scale, and poison the
+  // temporal history with Inf). Then sanitize NaN.
+  var beauty: vec3f;
+  let xc = clamp(vec3f(r, g, b), vec3f(0.0), vec3f(1.0));
+  if params.transfer_mode == 1u {
+    let lin = vec3f(pu_inverse_norm(xc.x), pu_inverse_norm(xc.y), pu_inverse_norm(xc.z));
+    beauty = lin / max(params.hdr_scale, 1.0e-4);
+  } else {
+    let linear = pow(xc, vec3f(2.2));                       // inverse sRGB gamma
+    beauty = linear / max(1.0 - linear, vec3f(0.001));      // inverse Reinhard (capped ~1000)
+  }
+  beauty = clamp(beauty, vec3f(0.0), vec3f(60000.0));       // keep below f16 max
+  beauty = select(vec3f(0.0), beauty, beauty == beauty);    // NaN -> 0
 
   // Write full denoised beauty pass — composite handles OIDN mode without remodulation
   textureStore(out_tex, vec2i(gid.xy), vec4f(beauty, 1.0));

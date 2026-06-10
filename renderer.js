@@ -807,18 +807,35 @@ async function init() {
   // ReBLUR uniform buffer (ReblurParams struct, ~640 bytes)
   const reblurParamBuf = device.createBuffer({ size: 576, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
 
-  // === BMFR — blockwise regression denoiser (diffuse). solve -> bilinear eval -> temporal. ===
+  // === BMFR — Fast Local Linear Regression (FLNR): moments -> solve -> apply -> temporal. ===
   const bmfrParamBuf = device.createBuffer({ size: 176, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
   const bmfrFitTex = device.createTexture({ size:[width,height], format:'rgba16float', usage:F16 });
   const bmfrHistA  = device.createTexture({ size:[width,height], format:'rgba16float', usage:F16 });
   const bmfrHistB  = device.createTexture({ size:[width,height], format:'rgba16float', usage:F16 });
-  const bmfrFitPipeline   = device.createComputePipeline({ layout: 'auto', compute: { module: bmfrModule, entryPoint: 'fit' } });
-  const bmfrAccumPipeline = device.createComputePipeline({ layout: 'auto', compute: { module: bmfrModule, entryPoint: 'accumulate' } });
-  const bmfrFitBG = device.createBindGroup({ layout: bmfrFitPipeline.getBindGroupLayout(0), entries: [
+  const bmfrNbx = Math.ceil(width/8), bmfrNby = Math.ceil(height/8);   // coarse (1/8) grid
+  const bmfrMomentBuf = device.createBuffer({ size: bmfrNbx*bmfrNby*52*4, usage: GPUBufferUsage.STORAGE }); // 52 f32/cell (49 moments + cell ref)
+  const bmfrCoefBuf   = device.createBuffer({ size: bmfrNbx*bmfrNby*25*4, usage: GPUBufferUsage.STORAGE }); // 25 f32/cell (coefs + cell ref)
+  const bmfrMomentsPipeline = device.createComputePipeline({ layout: 'auto', compute: { module: bmfrModule, entryPoint: 'moments' } });
+  const bmfrSolvePipeline   = device.createComputePipeline({ layout: 'auto', compute: { module: bmfrModule, entryPoint: 'solve' } });
+  const bmfrApplyPipeline   = device.createComputePipeline({ layout: 'auto', compute: { module: bmfrModule, entryPoint: 'apply' } });
+  const bmfrAccumPipeline   = device.createComputePipeline({ layout: 'auto', compute: { module: bmfrModule, entryPoint: 'accumulate' } });
+  const bmfrMomentsBG = device.createBindGroup({ layout: bmfrMomentsPipeline.getBindGroupLayout(0), entries: [
     { binding: 0, resource: { buffer: bmfrParamBuf } },
-    { binding: 1, resource: noisyTex.createView() },       // in: noisy demodulated diffuse
-    { binding: 2, resource: denoiseNdTex.createView() },   // in: normal(xyz)+hit-dist(w)
-    { binding: 3, resource: bmfrFitTex.createView() },     // out: per-pixel own-block reconstruction
+    { binding: 1, resource: noisyTex.createView() },
+    { binding: 2, resource: denoiseNdTex.createView() },
+    { binding: 8, resource: { buffer: bmfrMomentBuf } },
+  ]});
+  const bmfrSolveBG = device.createBindGroup({ layout: bmfrSolvePipeline.getBindGroupLayout(0), entries: [
+    { binding: 0, resource: { buffer: bmfrParamBuf } },
+    { binding: 8, resource: { buffer: bmfrMomentBuf } },
+    { binding: 9, resource: { buffer: bmfrCoefBuf } },
+  ]});
+  const bmfrApplyBG = device.createBindGroup({ layout: bmfrApplyPipeline.getBindGroupLayout(0), entries: [
+    { binding: 0, resource: { buffer: bmfrParamBuf } },
+    { binding: 1, resource: noisyTex.createView() },
+    { binding: 2, resource: denoiseNdTex.createView() },
+    { binding: 3, resource: bmfrFitTex.createView() },
+    { binding: 9, resource: { buffer: bmfrCoefBuf } },
   ]});
   // Accumulate ping-pong: even frames read A/write B, odd read B/write A
   const bmfrAccumBG_A = device.createBindGroup({ layout: bmfrAccumPipeline.getBindGroupLayout(0), entries: [
@@ -836,6 +853,26 @@ async function init() {
     { binding: 5, resource: bmfrHistB.createView() },
     { binding: 6, resource: hdrTex.createView() },
     { binding: 7, resource: bmfrHistA.createView() },
+  ]});
+  // Specular temporal denoiser (NRD-style: firefly + virtual motion + roughness history)
+  const bmfrSpecTempPipeline = device.createComputePipeline({ layout: 'auto', compute: { module: bmfrModule, entryPoint: 'spec_temporal' } });
+  const bmfrSpecBG_A = device.createBindGroup({ layout: bmfrSpecTempPipeline.getBindGroupLayout(0), entries: [
+    { binding: 0, resource: { buffer: bmfrParamBuf } },
+    { binding: 2, resource: denoiseNdTex.createView() },
+    { binding: 10, resource: specNoisyTex.createView() },
+    { binding: 11, resource: albedoTex.createView() },
+    { binding: 12, resource: specHistoryA.createView() },
+    { binding: 13, resource: specHdrTex.createView() },
+    { binding: 14, resource: specHistoryB.createView() },
+  ]});
+  const bmfrSpecBG_B = device.createBindGroup({ layout: bmfrSpecTempPipeline.getBindGroupLayout(0), entries: [
+    { binding: 0, resource: { buffer: bmfrParamBuf } },
+    { binding: 2, resource: denoiseNdTex.createView() },
+    { binding: 10, resource: specNoisyTex.createView() },
+    { binding: 11, resource: albedoTex.createView() },
+    { binding: 12, resource: specHistoryB.createView() },
+    { binding: 13, resource: specHdrTex.createView() },
+    { binding: 14, resource: specHistoryA.createView() },
   ]});
 
   // ReBLUR bind groups — spatial passes use group(0) only, temporal passes use group(0)+group(1)
@@ -1220,7 +1257,7 @@ async function init() {
   const dnBG_comp_bmfr = device.createBindGroup({ layout: dnCompLayout, entries: [
     { binding: 0, resource: { buffer: dnCompParamBuf } },
     { binding: 1, resource: hdrTex.createView() },
-    { binding: 4, resource: specNoisyTex.createView() },
+    { binding: 4, resource: specHdrTex.createView() },     // denoised specular (BMFR spec_temporal)
     { binding: 6, resource: albedoTex.createView() },
     { binding: 7, resource: ptOutputTex.createView() },
     { binding: 8, resource: matIdTex.createView() },
@@ -1313,13 +1350,17 @@ async function init() {
   let oidn = null;
   if (denoiseMode.startsWith('oidn')) {
     try {
-      const oidnWeights = denoiseMode === 'oidn-fast' ? 'oidn/rt_ldr_alb_nrm_small.tza' : 'oidn/rt_ldr_alb_nrm.tza';
+      const oidnWeights = denoiseMode === 'oidn-fast' ? 'oidn/rt_ldr_alb_nrm_small.tza' : 'oidn/rt_hdr_alb_nrm.tza';
+      const oidnTransferMode = oidnWeights.includes('hdr') ? 1 : 0;   // transfer must match the weights' training (PU vs sRGB)
       oidn = await createOIDNPipeline(device, oidnWeights, width, height, hasF16, rlog);
 
       // Input assembly bind group: textures → 9ch NCHW buffer
       // We feed the combined beauty pass: albedo * diffuse + specular
       const ioParams = device.createBuffer({ size: 32, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
-      device.queue.writeBuffer(ioParams, 0, new Uint32Array([width, height, oidn.padW, oidn.padH, 9, 0, 0, 0]));
+      { const ab = new ArrayBuffer(32);
+        new Uint32Array(ab).set([width, height, oidn.padW, oidn.padH, 9, 0, oidnTransferMode, 0]);
+        new Float32Array(ab)[5] = 1.0;   // hdr_scale (inputScale) — updated per frame with autoExposure
+        device.queue.writeBuffer(ioParams, 0, ab); }
 
       // Dummy buffer for unused bind slots (avoids read+write conflict on same buffer)
       const oidnDummy = device.createBuffer({ size: 16, usage: GPUBufferUsage.STORAGE });
@@ -1335,33 +1376,12 @@ async function init() {
         { binding: 7, resource: specNoisyTex.createView() },      // noisy specular radiance
       ]});
 
-      // Input BG reading from TEMPORAL output (pre-converged, more stable for OIDN)
-      oidn.inputBG_temporal = device.createBindGroup({ layout: oidn.ioBGL, entries: [
-        { binding: 0, resource: { buffer: ioParams } },
-        { binding: 1, resource: { buffer: oidnDummy } },
-        { binding: 2, resource: { buffer: oidn.skipInput } },
-        { binding: 3, resource: hdrTex.createView() },             // temporal accumulated diffuse
-        { binding: 4, resource: albedoTex.createView() },
-        { binding: 5, resource: denoiseNdTex.createView() },
-        { binding: 6, resource: pingTex.createView() },
-        { binding: 7, resource: specHdrTex.createView() },         // temporal accumulated specular
-      ]});
-
-      // Input BG reading from preblurred textures (pingTex/specPingTex after anti-firefly pass)
-      oidn.inputBG_pb = device.createBindGroup({ layout: oidn.ioBGL, entries: [
-        { binding: 0, resource: { buffer: ioParams } },
-        { binding: 1, resource: { buffer: oidnDummy } },
-        { binding: 2, resource: { buffer: oidn.skipInput } },
-        { binding: 3, resource: pingTex.createView() },             // preblurred diffuse
-        { binding: 4, resource: albedoTex.createView() },
-        { binding: 5, resource: denoiseNdTex.createView() },
-        { binding: 6, resource: pongTex.createView() },             // unused write slot (not pingTex!)
-        { binding: 7, resource: specPingTex.createView() },         // preblurred specular
-      ]});
-
       // Output extraction: 3ch denoised beauty → pingTex
       const outParams = device.createBuffer({ size: 32, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
-      device.queue.writeBuffer(outParams, 0, new Uint32Array([oidn.padW, oidn.padH, width, height, 3, 0, 0, 0]));
+      { const ab = new ArrayBuffer(32);
+        new Uint32Array(ab).set([oidn.padW, oidn.padH, width, height, 3, 0, oidnTransferMode, 0]);
+        new Float32Array(ab)[5] = 1.0;   // hdr_scale must match input_assembly
+        device.queue.writeBuffer(outParams, 0, ab); }
 
       oidn.outputBG = device.createBindGroup({ layout: oidn.ioBGL, entries: [
         { binding: 0, resource: { buffer: outParams } },
@@ -1423,6 +1443,7 @@ async function init() {
       ]});
       oidn.blendPipeline = blendPipeline;
       oidn.blendParams = blendParams;
+      oidn.ioParams = ioParams; oidn.outParams = outParams;
       oidn.blendCamBuf = blendCamBuf;
       oidn.blendFrame = 0;
 
@@ -2033,6 +2054,7 @@ async function init() {
 
   // --- Render state ---
   let frameIndex = 0, cameraMoved = false, framesStill = 0, autoExposure = 1.0;
+  let bmfrFlip = 0;   // dedicated history ping-pong toggle (frameIndex parity breaks with even spp)
   // Reusable staging buffer for autoexposure readback (avoids creating one per frame)
   let exposureStagingBusy = false;
   const exposureStagingBuf = device.createBuffer({ size: 16, usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST });
@@ -2292,8 +2314,8 @@ async function init() {
     td[36]=fovFactor;td[37]=aspect;td[38]=0.1;td[39]=512.0; // depth_reject_scale, max_history
     device.queue.writeBuffer(tmpBuf, 0, td);
 
-    // BMFR reprojection needs the REAL previous-frame camera; snapshot before overwrite.
-    const bmfrPrevCam = prevCam;
+    // BMFR/OIDN reprojection needs the REAL previous-frame camera; snapshot before overwrite.
+    const framePrevCam = prevCam;
     // Save current camera as previous for next frame
     prevCam = { pos:[...camera.pos], right:[...right], up:[...up], fwd:[...forward] };
 
@@ -2402,32 +2424,20 @@ async function init() {
       }
 
       if (denoiseMode.startsWith('oidn') && oidn) {
-        // === Temporal BEFORE OIDN: stabilizes input → stable OIDN output ===
-        // 1. Run temporal on noisy input → partially converged in hdrTex/specHdrTex
-        // 2. Feed temporal output to OIDN → clean + stable result
-        // 3. No post-OIDN blend needed (temporal already handled stability)
-
-        // Step 1: Temporal accumulation (same as 'full' mode)
-        const pbPass = encoder.beginComputePass();
-        pbPass.setPipeline(preblurSMPipeline);
-        pbPass.setBindGroup(0, preblurBG);
-        pbPass.dispatchWorkgroups(Math.ceil(width/16), Math.ceil(height/16));
-        pbPass.end();
-
-        const tmpPass = encoder.beginComputePass();
-        tmpPass.setPipeline(tmpPipeline);
-        tmpPass.setBindGroup(0, historyFrame === 0 ? tmpBG_A : tmpBG_B);
-        tmpPass.dispatchWorkgroups(Math.ceil(width/16), Math.ceil(height/16));
-        tmpPass.end();
-        historyFrame = 1 - historyFrame;
-
-        // Step 2: OIDN reads temporal output (stable, partially converged)
-        // Run every frame when moving, skip when still (temporal already converged)
-        const runOidn = framesStill < 4 || (framesStill < 32 && frameIndex % 4 === 0) || framesStill === 4;
+        // === OIDN: UNet on RAW noisy input -> reprojected temporal blend -> history ===
+        // (The old preblur+temporal passes were removed: OIDN reads raw input, and those
+        // passes wrote historyA/B — the SAME textures the OIDN blend owns — corrupting
+        // the displayed result whenever the two ping-pongs desynced. historyA/B are now
+        // exclusively OIDN's in this mode.)
+        oidn.tick = (oidn.tick | 0) + 1;
+        const runOidn = framesStill < 4 || (oidn.tick & 1) === 0;  // every frame while moving, every 2nd when still (spp-parity-proof)
         if (runOidn) {
-          oidn.encode(encoder, oidn.inputBG_temporal, oidn.outputBG);
-          // Copy OIDN result to history for composite to read
-          const blendAlpha = 1.0; // 100% OIDN (no blend, just store)
+          // inputScale = scene auto-exposure (OIDN's 0.18/avgLum); same value for assembly+extraction.
+          device.queue.writeBuffer(oidn.ioParams, 20, new Float32Array([autoExposure]));
+          device.queue.writeBuffer(oidn.outParams, 20, new Float32Array([autoExposure]));
+          oidn.encode(encoder, oidn.inputBG, oidn.outputBG);
+          // Reprojected temporal blend of OIDN output (smooths residual noise; disocclusion pushes alpha->1)
+          const blendAlpha = 0.15;
           const bcam = new Float32Array(40);
           const bcamU = new Uint32Array(bcam.buffer);
           bcamU[0] = width; bcamU[1] = height; bcamU[2] = Math.round(blendAlpha * 1000); bcamU[3] = 0;
@@ -2435,10 +2445,12 @@ async function init() {
           bcam[8] = up[0]; bcam[9] = up[1]; bcam[10] = up[2]; bcam[11] = 0;
           bcam[12] = forward[0]; bcam[13] = forward[1]; bcam[14] = forward[2]; bcam[15] = 0;
           bcam[16] = camera.pos[0]; bcam[17] = camera.pos[1]; bcam[18] = camera.pos[2]; bcam[19] = 0;
-          bcam[20] = prevCam.right[0]; bcam[21] = prevCam.right[1]; bcam[22] = prevCam.right[2]; bcam[23] = 0;
-          bcam[24] = prevCam.up[0]; bcam[25] = prevCam.up[1]; bcam[26] = prevCam.up[2]; bcam[27] = 0;
-          bcam[28] = prevCam.fwd[0]; bcam[29] = prevCam.fwd[1]; bcam[30] = prevCam.fwd[2]; bcam[31] = 0;
-          bcam[32] = prevCam.pos[0]; bcam[33] = prevCam.pos[1]; bcam[34] = prevCam.pos[2]; bcam[35] = 0;
+          // Use the REAL previous-frame camera (prevCam is already overwritten to the
+          // current camera by this point — same fix as BMFR's snapshot).
+          bcam[20] = framePrevCam.right[0]; bcam[21] = framePrevCam.right[1]; bcam[22] = framePrevCam.right[2]; bcam[23] = 0;
+          bcam[24] = framePrevCam.up[0]; bcam[25] = framePrevCam.up[1]; bcam[26] = framePrevCam.up[2]; bcam[27] = 0;
+          bcam[28] = framePrevCam.fwd[0]; bcam[29] = framePrevCam.fwd[1]; bcam[30] = framePrevCam.fwd[2]; bcam[31] = 0;
+          bcam[32] = framePrevCam.pos[0]; bcam[33] = framePrevCam.pos[1]; bcam[34] = framePrevCam.pos[2]; bcam[35] = 0;
           bcam[36] = fovFactor; bcam[37] = aspect; bcam[38] = 0; bcam[39] = 0;
           device.queue.writeBuffer(oidn.blendCamBuf, 0, bcam);
           const blendPass = encoder.beginComputePass();
@@ -2453,27 +2465,30 @@ async function init() {
         // === BMFR (M2): blockwise regression + temporal accumulation ===
         const bpf = new Float32Array(44);
         const bpi = new Int32Array(bpf.buffer);
-        // R2 low-discrepancy offset: evenly covers the 32x32 block over consecutive
-        // frames so the grid averages out faster than a random/clumping offset.
-        const ox = ((0.5 + 0.7548776662 * frameIndex) % 1) * 32;
-        const oy = ((0.5 + 0.5698402910 * frameIndex) % 1) * 32;
         bpf[0] = width; bpf[1] = height;
-        bpi[2] = Math.floor(ox) & 31; bpi[3] = Math.floor(oy) & 31;
+        bpi[2] = 0; bpi[3] = 0;   // block_offset unused by FLNR (de-grid comes from moment blur + bilinear apply)
         bpf[4]=right[0];    bpf[5]=right[1];    bpf[6]=right[2];    bpf[7]=0;
         bpf[8]=up[0];       bpf[9]=up[1];       bpf[10]=up[2];      bpf[11]=0;
         bpf[12]=forward[0]; bpf[13]=forward[1]; bpf[14]=forward[2]; bpf[15]=0;
         bpf[16]=camera.pos[0]; bpf[17]=camera.pos[1]; bpf[18]=camera.pos[2]; bpf[19]=0;
-        bpf[20]=bmfrPrevCam.right[0]; bpf[21]=bmfrPrevCam.right[1]; bpf[22]=bmfrPrevCam.right[2]; bpf[23]=0;
-        bpf[24]=bmfrPrevCam.up[0];    bpf[25]=bmfrPrevCam.up[1];    bpf[26]=bmfrPrevCam.up[2];    bpf[27]=0;
-        bpf[28]=bmfrPrevCam.fwd[0];   bpf[29]=bmfrPrevCam.fwd[1];   bpf[30]=bmfrPrevCam.fwd[2];   bpf[31]=0;
-        bpf[32]=bmfrPrevCam.pos[0];   bpf[33]=bmfrPrevCam.pos[1];   bpf[34]=bmfrPrevCam.pos[2];   bpf[35]=0;
+        bpf[20]=framePrevCam.right[0]; bpf[21]=framePrevCam.right[1]; bpf[22]=framePrevCam.right[2]; bpf[23]=0;
+        bpf[24]=framePrevCam.up[0];    bpf[25]=framePrevCam.up[1];    bpf[26]=framePrevCam.up[2];    bpf[27]=0;
+        bpf[28]=framePrevCam.fwd[0];   bpf[29]=framePrevCam.fwd[1];   bpf[30]=framePrevCam.fwd[2];   bpf[31]=0;
+        bpf[32]=framePrevCam.pos[0];   bpf[33]=framePrevCam.pos[1];   bpf[34]=framePrevCam.pos[2];   bpf[35]=0;
         bpf[36]=fovFactor; bpf[37]=aspect; bpf[38]=0.05; bpf[39]=0.03;   // ridge (relative), min_alpha
         bpf[40]=framesStill; bpf[41]=256.0; bpf[42]=0.1; bpf[43]=0;      // frames_still, max_history, depth_reject
         device.queue.writeBuffer(bmfrParamBuf, 0, bpf);
-        // Pass 1: per-block regression fit (per-pixel own-block) -> bmfrFitTex
-        { const p = encoder.beginComputePass(); p.setPipeline(bmfrFitPipeline); p.setBindGroup(0, bmfrFitBG); p.dispatchWorkgroups(Math.ceil(width/32)+1, Math.ceil(height/32)+1); p.end(); }
-        // Pass 2: temporal accumulate -> hdrTex + new history
-        { const p = encoder.beginComputePass(); p.setPipeline(bmfrAccumPipeline); p.setBindGroup(0, (frameIndex & 1) === 0 ? bmfrAccumBG_A : bmfrAccumBG_B); p.dispatchWorkgroups(Math.ceil(width/8), Math.ceil(height/8)); p.end(); }
+        // K1: per-8x8-block moments -> coarse moment buffer
+        { const p = encoder.beginComputePass(); p.setPipeline(bmfrMomentsPipeline); p.setBindGroup(0, bmfrMomentsBG); p.dispatchWorkgroups(bmfrNbx, bmfrNby); p.end(); }
+        // K2: blur 5x5 moments + Cholesky solve -> coarse coef buffer
+        { const p = encoder.beginComputePass(); p.setPipeline(bmfrSolvePipeline); p.setBindGroup(0, bmfrSolveBG); p.dispatchWorkgroups(Math.ceil(bmfrNbx/8), Math.ceil(bmfrNby/8)); p.end(); }
+        // K3: bilinear-apply coarse coefficients -> bmfrFitTex
+        { const p = encoder.beginComputePass(); p.setPipeline(bmfrApplyPipeline); p.setBindGroup(0, bmfrApplyBG); p.dispatchWorkgroups(Math.ceil(width/8), Math.ceil(height/8)); p.end(); }
+        // K4: temporal accumulate -> hdrTex + new history
+        { const p = encoder.beginComputePass(); p.setPipeline(bmfrAccumPipeline); p.setBindGroup(0, bmfrFlip === 0 ? bmfrAccumBG_A : bmfrAccumBG_B); p.dispatchWorkgroups(Math.ceil(width/8), Math.ceil(height/8)); p.end(); }
+        // K5: specular temporal denoise -> specHdrTex
+        { const p = encoder.beginComputePass(); p.setPipeline(bmfrSpecTempPipeline); p.setBindGroup(0, bmfrFlip === 0 ? bmfrSpecBG_A : bmfrSpecBG_B); p.dispatchWorkgroups(Math.ceil(width/8), Math.ceil(height/8)); p.end(); }
+        bmfrFlip = 1 - bmfrFlip;
       } else if (denoiseMode === 'reblur') {
         // === ReBLUR pipeline: 6 passes ===
         const wg = [Math.ceil(width/16), Math.ceil(height/16)];
@@ -2692,8 +2707,10 @@ async function init() {
 
       const compPass = encoder.beginComputePass();
       compPass.setPipeline(dnCompPipeline);
+      // blendFrame polarity: after blend with BG_A (reads A, WRITES B) blendFrame flips to 1,
+      // so the freshly-written buffer is historyB = comp_oidn_A's binding. Read that one.
       const compBG = (denoiseMode.startsWith('oidn') && oidn)
-                   ? (oidn.blendFrame === 0 ? dnBG_comp_oidn_A : dnBG_comp_oidn_B)
+                   ? (oidn.blendFrame === 1 ? dnBG_comp_oidn_A : dnBG_comp_oidn_B)
                    : denoiseMode === 'reblur' ? dnBG_comp_reblur  // reads hdrTex (stabilized)
                    : denoiseMode === 'bmfr' ? dnBG_comp_bmfr      // reads hdrTex (regression output)
                    : denoiseMode !== 'off' ? dnBG_comp : dnBG_comp_noisy;
