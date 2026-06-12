@@ -247,6 +247,10 @@
           <label>SHaRC GI Cache</label>
           <input type="checkbox" id="splash-sharc" checked>
         </div>
+        <div class="splash-row">
+          <label>ReSTIR GI</label>
+          <input type="checkbox" id="splash-restir">
+        </div>
       </div>
       <div class="splash-sec">
         <div class="menu-title">Color</div>
@@ -455,6 +459,7 @@
         bounces:    parseInt(document.getElementById('splash-bounces').value),
         spp:        parseInt(document.getElementById('splash-spp').value),
         sharc:      document.getElementById('splash-sharc').checked,
+        restir:     document.getElementById('splash-restir').checked,
         tonemap:    parseInt(document.getElementById('splash-tonemap').value),
       };
       _log('Config: ' + JSON.stringify(window.IGNIS_CONFIG));

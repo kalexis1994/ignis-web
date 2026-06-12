@@ -582,12 +582,12 @@ async function init() {
   });
 
   // --- ReSTIR GI buffers (created before SHaRC so bg2 can reference them) ---
-  // ReSTIR GI is OFF by default: the temporal reuse lacks visibility validation,
-  // which ADDS energy from occluded samples (false lighting / leaks) and its held
-  // samples read as sticky "tracking" noise in motion. Opt back in with ?restir=1
-  // once final-shading visibility rays are implemented (RAB_GetConservativeVisibility).
+  // ReSTIR GI: OFF by default (splash checkbox / ?restir=1 to opt in). The temporal
+  // reuse lacks visibility validation, which ADDS energy from occluded samples
+  // (false lighting / leaks) and its held samples read as sticky "tracking" noise
+  // in motion. Needs final-shading visibility rays before enabling by default.
   const restirEnabled = device.limits.maxStorageBuffersPerShaderStage >= requiredStorageBuffersPerStage
-                        && /[?&]restir=1/.test(location.search);
+                        && (cfg.restir === true || /[?&]restir=1/.test(location.search));
   const restirPixels = width * height;
   const restirBufSize = restirEnabled ? restirPixels * 3 * 16 : 48;
   const restirBufA = device.createBuffer({ size: restirBufSize, usage: GPUBufferUsage.STORAGE });
