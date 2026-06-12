@@ -10,11 +10,12 @@ struct TraceParams {
   _pad: vec2u,
 };
 
+// Wide node (64B): internal nodes carry BOTH children's AABBs (one fetch/step).
 struct BVHNode {
-  aabb_min: vec3f,
-  left_first: u32,
-  aabb_max: vec3f,
-  tri_count: u32,
+  l_min: vec3f, left_first: u32,
+  l_max: vec3f, tri_count: u32,
+  r_min: vec3f, _p0: u32,
+  r_max: vec3f, _p1: u32,
 };
 
 @group(0) @binding(0) var<uniform> params: TraceParams;
@@ -79,14 +80,6 @@ fn trace_closest(@builtin(global_invocation_id) gid: vec3u) {
   var sp = 0u;
   var cur = 0u;
 
-  let root = bvh_nodes[0u];
-  if intersect_aabb(origin, inv_dir, root.aabb_min, root.aabb_max, best_t) >= best_t {
-    // best_tri is 0xFFFFFFFFu here (miss sentinel). Bitcasting a runtime var
-    // avoids WGSL const-eval rejecting the -NaN bit pattern of a literal.
-    hits[ray_idx] = vec4f(bitcast<f32>(best_tri), 0.0, 0.0, INF);
-    return;
-  }
-
   loop {
     let nd = bvh_nodes[cur];
     if nd.tri_count > 0u {
@@ -113,8 +106,8 @@ fn trace_closest(@builtin(global_invocation_id) gid: vec3u) {
     // Internal node: traverse children
     let l = nd.left_first;
     let r = l + 1u;
-    let tl = intersect_aabb(origin, inv_dir, bvh_nodes[l].aabb_min, bvh_nodes[l].aabb_max, best_t);
-    let tr = intersect_aabb(origin, inv_dir, bvh_nodes[r].aabb_min, bvh_nodes[r].aabb_max, best_t);
+    let tl = intersect_aabb(origin, inv_dir, nd.l_min, nd.l_max, best_t);
+    let tr = intersect_aabb(origin, inv_dir, nd.r_min, nd.r_max, best_t);
 
     if tl < tr {
       if tr < best_t && sp < 24u { stk[sp] = r; sp++; }
@@ -147,12 +140,6 @@ fn trace_shadow(@builtin(global_invocation_id) gid: vec3u) {
   var sp = 0u;
   var cur = 0u;
 
-  let root = bvh_nodes[0u];
-  if intersect_aabb(origin, inv_dir, root.aabb_min, root.aabb_max, max_t) >= max_t {
-    hits[ray_idx] = vec4f(0.0); // no hit = unoccluded
-    return;
-  }
-
   loop {
     let nd = bvh_nodes[cur];
     if nd.tri_count > 0u {
@@ -175,8 +162,8 @@ fn trace_shadow(@builtin(global_invocation_id) gid: vec3u) {
 
     let l = nd.left_first;
     let r = l + 1u;
-    let tl = intersect_aabb(origin, inv_dir, bvh_nodes[l].aabb_min, bvh_nodes[l].aabb_max, max_t);
-    let tr = intersect_aabb(origin, inv_dir, bvh_nodes[r].aabb_min, bvh_nodes[r].aabb_max, max_t);
+    let tl = intersect_aabb(origin, inv_dir, nd.l_min, nd.l_max, max_t);
+    let tr = intersect_aabb(origin, inv_dir, nd.r_min, nd.r_max, max_t);
 
     if tl < tr {
       if tr < max_t && sp < 24u { stk[sp] = r; sp++; }

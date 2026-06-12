@@ -640,9 +640,40 @@ function buildBVH(positions, triDataArr, triCount, onProgress) {
     sortedTriData[dst+3] = triDataArr[src+3];
   }
 
+  // Wide nodes (64B): each INTERNAL node stores BOTH children's AABBs, so the
+  // traversal inner loop does ONE contiguous 64B fetch per step instead of three
+  // scattered 32B fetches (node + left child + right child). Software traversal
+  // is memory-latency-bound -> fewer dependent loads = directly faster.
+  // Layout (16 f32): [Lmin.xyz, left_first][Lmax.xyz, tri_count][Rmin.xyz, 0][Rmax.xyz, 0]
+  const wideF32 = new Float32Array(nodeCount * 16);
+  const wideU32 = new Uint32Array(wideF32.buffer);
+  for (let i = 0; i < nodeCount; i++) {
+    const src = i * 8, dst = i * 16;
+    const leftFirst = nodesU32[src + 3];
+    const triCnt = nodesU32[src + 7];
+    wideU32[dst + 3] = leftFirst;
+    wideU32[dst + 7] = triCnt;
+    if (triCnt > 0) {
+      // Leaf: own AABB in the L slot (not read by traversal; kept for debug)
+      for (let k = 0; k < 3; k++) {
+        wideF32[dst + k] = nodesF32[src + k];
+        wideF32[dst + 4 + k] = nodesF32[src + 4 + k];
+      }
+    } else {
+      const l = leftFirst * 8, r = (leftFirst + 1) * 8;
+      for (let k = 0; k < 3; k++) {
+        wideF32[dst + k]      = nodesF32[l + k];        // L min
+        wideF32[dst + 4 + k]  = nodesF32[l + 4 + k];    // L max
+        wideF32[dst + 8 + k]  = nodesF32[r + k];        // R min
+        wideF32[dst + 12 + k] = nodesF32[r + 4 + k];    // R max
+      }
+    }
+  }
+
   return {
     nodesF32: nodesF32.subarray(0, nodeCount * 8),
     nodesU32: nodesU32.subarray(0, nodeCount * 8),
+    nodesWide: wideF32,
     sortedTriData,
     nodeCount,
   };
@@ -791,7 +822,7 @@ export async function loadScene(basePath, onProgress) {
     const gltfSig = `${sceneLabel}-${gltfText.length}-${(gltfHash >>> 0).toString(16)}`;
     // Fast key: use buffer sizes instead of content hash (instant, no buffer iteration)
     const bufferSizes = buffers.map((buf, i) => `${i}:${buf.byteLength}`).join('.');
-    cacheKey = 'scene-v7-' + gltfSig + '-' + bufferSizes;
+    cacheKey = 'scene-v8-' + gltfSig + '-' + bufferSizes;
     cached = await dbGet(db, cacheKey);
   } catch(e) { /* IndexedDB not available, proceed without cache */ }
 
@@ -1217,7 +1248,7 @@ export async function loadScene(basePath, onProgress) {
     gpuUVExtra,
     gpuTriData: bvh.sortedTriData,
     gpuTriFlat,
-    gpuBVHNodes: bvh.nodesF32,
+    gpuBVHNodes: bvh.nodesWide,   // 64B wide nodes (children AABBs in parent)
     gpuMaterials,
     materialStride: 80,
     gpuEmissiveTris,

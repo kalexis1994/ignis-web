@@ -523,8 +523,16 @@ async function init() {
       { binding: 6, visibility: GPUShaderStage.COMPUTE, storageTexture: { access: 'write-only', format: 'rgba16float' } },
       { binding: 7, visibility: GPUShaderStage.COMPUTE, texture: { sampleType: 'depth' } },
       { binding: 8, visibility: GPUShaderStage.COMPUTE, sampler: { type: 'comparison' } },
+      { binding: 9, visibility: GPUShaderStage.COMPUTE, texture: { sampleType: 'float' } },   // blue noise
     ],
   });
+  // Spatiotemporal blue noise (64x64x4ch, void-and-cluster): low-discrepancy
+  // per-pixel sample source for primary jitter + first-bounce GI direction.
+  // Neighbouring pixels get maximally-different samples -> noise moves to high
+  // frequencies, which the denoisers absorb far better than white noise.
+  const bnData = new Uint8Array(await fetch(`bluenoise64.bin?v=${v}`).then(r => r.arrayBuffer()));
+  const blueNoiseTex = device.createTexture({ size: [64, 64], format: 'rgba8unorm', usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST });
+  device.queue.writeTexture({ texture: blueNoiseTex }, bnData, { bytesPerRow: 256 }, [64, 64]);
   const bg0 = device.createBindGroup({
     layout: bg0Layout,
     entries: [
@@ -537,6 +545,7 @@ async function init() {
       { binding: 6, resource: specNoisyTex.createView() },
       { binding: 7, resource: shadowDepthTex.createView() },
       { binding: 8, resource: shadowSampler },
+      { binding: 9, resource: blueNoiseTex.createView() },
     ],
   });
 
@@ -573,7 +582,12 @@ async function init() {
   });
 
   // --- ReSTIR GI buffers (created before SHaRC so bg2 can reference them) ---
-  const restirEnabled = device.limits.maxStorageBuffersPerShaderStage >= requiredStorageBuffersPerStage;
+  // ReSTIR GI is OFF by default: the temporal reuse lacks visibility validation,
+  // which ADDS energy from occluded samples (false lighting / leaks) and its held
+  // samples read as sticky "tracking" noise in motion. Opt back in with ?restir=1
+  // once final-shading visibility rays are implemented (RAB_GetConservativeVisibility).
+  const restirEnabled = device.limits.maxStorageBuffersPerShaderStage >= requiredStorageBuffersPerStage
+                        && /[?&]restir=1/.test(location.search);
   const restirPixels = width * height;
   const restirBufSize = restirEnabled ? restirPixels * 3 * 16 : 48;
   const restirBufA = device.createBuffer({ size: restirBufSize, usage: GPUBufferUsage.STORAGE });
@@ -1377,7 +1391,8 @@ async function init() {
   let oidn = null;
   if (denoiseMode.startsWith('oidn')) {
     try {
-      const oidnWeights = denoiseMode === 'oidn-fast' ? 'oidn/rt_ldr_alb_nrm_small.tza' : 'oidn/rt_hdr_alb_nrm.tza';
+      // Small HDR net = Intel's documented "balanced" mode, recommended for interactive use
+      const oidnWeights = denoiseMode === 'oidn-fast' ? 'oidn/rt_hdr_alb_nrm_small.tza' : 'oidn/rt_hdr_alb_nrm.tza';
       const oidnTransferMode = oidnWeights.includes('hdr') ? 1 : 0;   // transfer must match the weights' training (PU vs sRGB)
       oidn = await createOIDNPipeline(device, oidnWeights, width, height, hasF16, rlog);
 

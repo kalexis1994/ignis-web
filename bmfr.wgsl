@@ -162,10 +162,17 @@ fn pre_accumulate(@builtin(global_invocation_id) gid: vec3u) {
         mx = max(mx, textureLoad(in_diff, sp, 0).rgb);
       }
     }
-    let hc = clamp(h.rgb, vec3f(0.0), mx * 4.0 + vec3f(0.25));
+    // Motion-aware ghost gate + window: while the camera moves, history trails
+    // read as noisy "tracking" streaks on object edges — keep the window short
+    // and the gate tight, and only deepen/loosen as the camera settles.
+    let still_t = clamp(bp.frames_still / 16.0, 0.0, 1.0);
+    let gate_k = mix(1.5, 4.0, still_t);
+    let gate_f = mix(0.08, 0.25, still_t);
+    let hc = clamp(h.rgb, vec3f(0.0), mx * gate_k + vec3f(gate_f));
 
-    cnt = min(max(h.a, 0.0) + 1.0, 16.0);
-    let alpha = max(1.0 / cnt, 0.2);     // moving average for the first 5, then 80/20 EMA
+    let cap = mix(3.0, 16.0, still_t);
+    cnt = min(max(h.a, 0.0) + 1.0, cap);
+    let alpha = max(1.0 / cnt, mix(0.4, 0.2, still_t));   // ~2.5-frame window moving, 80/20 still
     blended = mix(hc, cur, alpha);
   }
   textureStore(hist_out, px, vec4f(blended, cnt));

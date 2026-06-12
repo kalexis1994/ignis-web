@@ -48,7 +48,14 @@ struct Uniforms {
   lights: array<PunctualLight, 16>,
 };
 
-struct BVHNode { aabb_min: vec3f, left_first: u32, aabb_max: vec3f, tri_count: u32, };
+// Wide BVH node (64B): an internal node carries BOTH children's AABBs, so each
+// traversal step is ONE contiguous fetch instead of three dependent ones.
+struct BVHNode {
+  l_min: vec3f, left_first: u32,
+  l_max: vec3f, tri_count: u32,
+  r_min: vec3f, _p0: u32,
+  r_max: vec3f, _p1: u32,
+};
 struct Material {
   d0: vec4f, // albedo.rgb + mat_type
   d1: vec4f, // emission.rgb + roughness
@@ -82,6 +89,7 @@ struct HitInfo { t: f32, u: f32, v: f32, tri_idx: u32, hit: bool, };
 @group(0) @binding(6) var specular_out: texture_storage_2d<rgba16float, write>;
 @group(0) @binding(7) var shadow_map: texture_depth_2d;
 @group(0) @binding(8) var shadow_sampler: sampler_comparison;
+@group(0) @binding(9) var bluenoise_tex: texture_2d<f32>;
 // accumulation handled by temporal pass (no extra buffer needed)
 
 @group(1) @binding(0) var<storage, read> vertices: array<vec4f>;
@@ -225,10 +233,26 @@ fn build_onb(n: vec3f) -> mat3x3f {
 
 fn cosine_sample_hemisphere(normal: vec3f) -> vec3f {
   let u = rand2();
+  return cosine_sample_hemisphere_u(normal, u);
+}
+
+fn cosine_sample_hemisphere_u(normal: vec3f, u: vec2f) -> vec3f {
   let phi = TWO_PI * u.x;
   let sr2 = sqrt(u.y);
   let local = vec3f(cos(phi)*sr2, sin(phi)*sr2, sqrt(1.0-u.y));
   return normalize(build_onb(normal) * local);
+}
+
+// === Spatiotemporal blue noise (64x64x4, void-and-cluster) ===
+// Per-pixel blue noise + per-frame golden-ratio Cranley-Patterson rotation.
+// Neighbouring pixels get maximally-different sample values -> the 1spp noise
+// lands in high spatial frequencies, which temporal+spatial denoisers absorb
+// far better than PCG white noise. Used for primary jitter (dims 0,1) and the
+// first-bounce GI direction (dims 2,3); deeper bounces keep PCG.
+var<private> g_bn: vec4f;
+const BN_ROT = vec4f(0.7548776662, 0.5698402910, 0.6180339887, 0.3247179572);
+fn bn(dim: u32) -> f32 {
+  return fract(g_bn[dim & 3u] + f32(uniforms.frame_seed % 4096u) * BN_ROT[dim & 3u]);
 }
 
 fn sample_cone(axis: vec3f, cos_theta_max: f32) -> vec3f {
@@ -1184,8 +1208,6 @@ fn trace_bvh_hint(origin: vec3f, dir: vec3f, t_hint: f32) -> HitInfo {
   var hit: HitInfo; hit.t = t_hint; hit.hit = false;
   let inv_dir = 1.0 / dir;
   var stk: array<u32, 16>; var sp = 0u; var cur = 0u;
-  let root = bvh_nodes[0u];
-  if intersect_aabb(origin, inv_dir, root.aabb_min, root.aabb_max, INF) >= INF { return hit; }
   loop {
     let nd = bvh_nodes[cur];
     if nd.tri_count > 0u {
@@ -1209,8 +1231,8 @@ fn trace_bvh_hint(origin: vec3f, dir: vec3f, t_hint: f32) -> HitInfo {
       if sp==0u{break;} sp--; cur=stk[sp]; continue;
     }
     let l = nd.left_first; let r = l+1u;
-    let tl = intersect_aabb(origin, inv_dir, bvh_nodes[l].aabb_min, bvh_nodes[l].aabb_max, hit.t);
-    let tr = intersect_aabb(origin, inv_dir, bvh_nodes[r].aabb_min, bvh_nodes[r].aabb_max, hit.t);
+    let tl = intersect_aabb(origin, inv_dir, nd.l_min, nd.l_max, hit.t);
+    let tr = intersect_aabb(origin, inv_dir, nd.r_min, nd.r_max, hit.t);
     if tl < tr {
       if tr < hit.t && sp < 16u { stk[sp]=r; sp++; }
       if tl < hit.t { cur=l; } else { if sp==0u{break;} sp--; cur=stk[sp]; }
@@ -1226,8 +1248,6 @@ fn trace_bvh_hint(origin: vec3f, dir: vec3f, t_hint: f32) -> HitInfo {
 fn trace_shadow_skip_mat(origin: vec3f, dir: vec3f, max_t: f32, skip_mat: u32) -> bool {
   let inv_dir = 1.0 / dir;
   var stk: array<u32, 16>; var sp = 0u; var cur = 0u;
-  let root = bvh_nodes[0u];
-  if intersect_aabb(origin, inv_dir, root.aabb_min, root.aabb_max, max_t) >= max_t { return false; }
   loop {
     let nd = bvh_nodes[cur];
     if nd.tri_count > 0u {
@@ -1253,8 +1273,8 @@ fn trace_shadow_skip_mat(origin: vec3f, dir: vec3f, max_t: f32, skip_mat: u32) -
       if sp==0u{break;} sp--; cur=stk[sp]; continue;
     }
     let l=nd.left_first; let r=l+1u;
-    let tl=intersect_aabb(origin,inv_dir,bvh_nodes[l].aabb_min,bvh_nodes[l].aabb_max,max_t);
-    let tr=intersect_aabb(origin,inv_dir,bvh_nodes[r].aabb_min,bvh_nodes[r].aabb_max,max_t);
+    let tl=intersect_aabb(origin,inv_dir,nd.l_min,nd.l_max,max_t);
+    let tr=intersect_aabb(origin,inv_dir,nd.r_min,nd.r_max,max_t);
     if tl<tr {
       if tr<max_t && sp<16u { stk[sp]=r; sp++; }
       if tl<max_t { cur=l; } else { if sp==0u{break;} sp--; cur=stk[sp]; }
@@ -1270,8 +1290,6 @@ fn trace_shadow_skip_mat(origin: vec3f, dir: vec3f, max_t: f32, skip_mat: u32) -
 fn trace_shadow(origin: vec3f, dir: vec3f, max_t: f32) -> bool {
   let inv_dir = 1.0 / dir;
   var stk: array<u32, 16>; var sp = 0u; var cur = 0u;
-  let root = bvh_nodes[0u];
-  if intersect_aabb(origin, inv_dir, root.aabb_min, root.aabb_max, max_t) >= max_t { return false; }
   loop {
     let nd = bvh_nodes[cur];
     if nd.tri_count > 0u {
@@ -1298,8 +1316,8 @@ fn trace_shadow(origin: vec3f, dir: vec3f, max_t: f32) -> bool {
       if sp==0u{break;} sp--; cur=stk[sp]; continue;
     }
     let l=nd.left_first; let r=l+1u;
-    let tl=intersect_aabb(origin,inv_dir,bvh_nodes[l].aabb_min,bvh_nodes[l].aabb_max,max_t);
-    let tr=intersect_aabb(origin,inv_dir,bvh_nodes[r].aabb_min,bvh_nodes[r].aabb_max,max_t);
+    let tl=intersect_aabb(origin,inv_dir,nd.l_min,nd.l_max,max_t);
+    let tr=intersect_aabb(origin,inv_dir,nd.r_min,nd.r_max,max_t);
     if tl<tr {
       if tr<max_t && sp<16u { stk[sp]=r; sp++; }
       if tl<max_t { cur=l; } else { if sp==0u{break;} sp--; cur=stk[sp]; }
@@ -2260,7 +2278,12 @@ fn path_trace(primary_origin: vec3f, primary_dir: vec3f) -> PathResult {
     } else {
       // Diffuse closure: cosine hemisphere sampling (pure, no SHaRC guiding)
       let p_diff = max(1.0 - p_cc - p_spec, 0.01);
-      dir = cosine_sample_hemisphere(normal);
+      if bounce == 0u {
+        // First GI bounce drives most visible noise: use blue noise (dims 2,3)
+        dir = cosine_sample_hemisphere_u(normal, vec2f(bn(2u), bn(3u)));
+      } else {
+        dir = cosine_sample_hemisphere(normal);
+      }
       if dot(normal, dir) <= 0.0 { break; }
       let diffuse_scale = max((1.0 - metallic) * (1.0 - glass_transmission), 0.0);
       if bounce == 0u && !went_through_glass {
@@ -2422,18 +2445,16 @@ fn main(@builtin(global_invocation_id) gid: vec3u) {
   // Full quality path trace with all features:
   // - Normal maps, texture sampling, alpha testing, full BRDF
   // - G-buffer depth hint accelerates BVH traversal ~60-80% (prunes far nodes)
-  // Per-pixel Halton jitter: each pixel gets its own low-discrepancy sequence
-  // pixel_hash offsets the Halton index so neighbors sample different sub-pixel positions
-  // → no image shake (each pixel jitters independently), fine noise, good temporal convergence
-  let halton_hash = (pixel.x * 12979u + pixel.y * 48271u) & 0xFFu;
-  let hidx = ((uniforms.frame_seed + halton_hash) % 256u) + 1u;
-  var hx = 0.0; var hb2 = 0.5;
-  var hi2 = hidx;
-  for (var _h = 0u; _h < 10u; _h++) { if hi2 == 0u { break; } hx += hb2 * f32(hi2 % 2u); hi2 /= 2u; hb2 *= 0.5; }
-  var hy = 0.0; var hb3 = 1.0 / 3.0;
-  var hi3 = hidx;
-  for (var _h = 0u; _h < 10u; _h++) { if hi3 == 0u { break; } hy += hb3 * f32(hi3 % 3u); hi3 /= 3u; hb3 /= 3.0; }
-  let jitter = vec2f(hx, hy);
+  // Blue-noise sub-pixel jitter: spatially blue (neighbours maximally different).
+  // The tile is SHIFTED by an R2 pixel offset every frame: a screen-fixed pattern
+  // slides over surfaces under camera motion, and reprojected accumulation then
+  // averages values correlated along the motion path -> crawling low-frequency
+  // clumps. Per-frame tile shifts decorrelate consecutive frames (Jimenez-style),
+  // while each individual frame stays spatially blue.
+  let bn_f = f32(uniforms.frame_seed % 4096u);
+  let bn_shift = vec2u(u32(fract(bn_f * 0.7548776662) * 64.0), u32(fract(bn_f * 0.5698402910) * 64.0));
+  g_bn = textureLoad(bluenoise_tex, vec2i((pixel + bn_shift) % vec2u(64u)), 0);
+  let jitter = vec2f(bn(0u), bn(1u));
   let uv_px = (vec2f(f32(pixel.x), f32(pixel.y)) + jitter) / uniforms.resolution;
   let ndc = uv_px * 2.0 - 1.0;
   let aspect = uniforms.resolution.x / uniforms.resolution.y;
@@ -2499,8 +2520,8 @@ fn main(@builtin(global_invocation_id) gid: vec3u) {
         let prev_px = vec2i(vec2f(prev_uv.x * uniforms.resolution.x, prev_uv.y * uniforms.resolution.y));
         let prev_idx = u32(prev_px.y) * res.x + u32(prev_px.x);
         var prev = read_reservoir_prev(prev_idx);
-        if prev.age < 30.0 && prev.M >= 1.0 {
-          prev.M = min(prev.M, 20.0);
+        if prev.age < 16.0 && prev.M >= 1.0 {
+          prev.M = min(prev.M, 10.0);  // shorter reservoir life: held samples correlate frames and read as sticky 'tracking' noise
           let p_hat_prev = gi_target_pdf(pt.normal, pt.hit_pos, prev);
           if p_hat_prev > 0.0 {
             let prev_W = prev.weight_sum;   // stored contribution weight W
@@ -2540,7 +2561,7 @@ fn main(@builtin(global_invocation_id) gid: vec3u) {
 
     var out_r = reservoir;
     out_r.weight_sum = W_store;             // store W, not wsum (merge convention)
-    out_r.M = min(reservoir.M, 20.0);
+    out_r.M = min(reservoir.M, 10.0);
     out_r.age = reservoir.age + 1.0;
     write_reservoir(idx, out_r);
   } else if uniforms.restir_enabled > 0u {
