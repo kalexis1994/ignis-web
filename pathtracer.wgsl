@@ -150,6 +150,10 @@ fn ray_offset(P: vec3f, Ng: vec3f) -> vec3f {
 const GI_INTENSITY: f32 = 1.5; // multiplier for indirect lighting (surface bounces + sky)
 const FILTER_GLOSSY: f32 = 1.0; // Cycles-style glossy blur: reduce noise in rough reflections after diffuse bounces
 const CLAMP_INDIRECT: f32 = 10.0; // Cycles-style sample clamp: prevent fireflies from extreme indirect samples
+// Direct SPECULAR clamp (diffuse direct is the shadow signal and stays unclamped).
+// GGX D spikes on glossy sun alignments produce 100+ luminance single-pixel whites
+// at 1 spp that no denoiser can reconstruct — cap them at the source.
+const CLAMP_DIRECT_SPEC: f32 = 24.0;
 
 // Cycles-style per-sample clamp: limit contribution magnitude to prevent fireflies
 fn clamp_contribution(L: vec3f, limit: f32) -> vec3f {
@@ -1858,6 +1862,12 @@ struct PathResult {
   sharc_rad: array<vec3f, 4>, sharc_dir: array<vec3f, 4>,
   sharc_count: u32,
   through_glass: bool,
+  // ReSTIR GI: secondary-surface sample (RTXDI integration model).
+  // gi_rad = incident radiance estimate FROM the secondary point (demodulated
+  // domain, primary lobe weight divided out); gi_own = the path's own indirect
+  // diffuse contribution (for exact replacement at shading time).
+  gi_pos: vec3f, gi_nrm: vec3f, gi_rad: vec3f, gi_own: vec3f,
+  gi_src_pdf: f32, gi_dscale: f32, gi_valid: u32,
 };
 
 var<private> g_depth_hint: f32; // G-buffer depth hint for first bounce acceleration
@@ -1894,6 +1904,14 @@ fn path_trace(primary_origin: vec3f, primary_dir: vec3f) -> PathResult {
   var medium_depth = 0u;
   var last_bsdf_pdf = 0.0; // tracked for env MIS on miss
   var min_ray_pdf = 1e6;   // Cycles filter glossy: minimum PDF along path
+  // ReSTIR GI capture state
+  var gi_pdw = 0.0;          // primary diffuse lobe weight (diffuse_scale / p_diff)
+  var gi_dscale_l = 0.0;     // diffuse_scale at the primary hit
+  var gi_src_pdf_l = 0.0;    // solid-angle pdf of the primary diffuse ray (incl. lobe prob)
+  var gi_pos_l = vec3f(0.0);
+  var gi_nrm_l = vec3f(0.0, 1.0, 0.0);
+  var gi_captured = false;
+  var diff_b0 = vec3f(0.0);  // diffuse accumulated by the end of bounce 0
 
   var bounce = 0u;
   loop {
@@ -2141,9 +2159,10 @@ fn path_trace(primary_origin: vec3f, primary_dir: vec3f) -> PathResult {
     let use_primary_split = bounce == 0u && !went_through_glass;
     if use_primary_split {
       let nee = sample_sun_nee_split(hit_pos, normal, geo_normal, V, td, mat, uv0, uv1, uv2, uv3, base_color, roughness, metallic, glass_transmission);
+      let nee_spec = clamp_contribution(nee.specular, CLAMP_DIRECT_SPEC);
       diff_rad += throughput * nee.diffuse;
-      spec_rad += throughput * nee.specular;
-      result.direct = nee.diffuse * base_color + nee.specular;
+      spec_rad += throughput * nee_spec;
+      result.direct = nee.diffuse * base_color + nee_spec;
     } else {
       let direct = sample_sun_nee(hit_pos, normal, geo_normal, V, td, mat, uv0, uv1, uv2, uv3, base_color, roughness, metallic, glass_transmission);
       let gi_scale = select(1.0, GI_INTENSITY, bounce > 0u); // boost indirect bounces
@@ -2152,6 +2171,12 @@ fn path_trace(primary_origin: vec3f, primary_dir: vec3f) -> PathResult {
       if is_diffuse_path { diff_rad += nee_contrib; }
       else { spec_rad += nee_contrib; }
       if bounce == 0u { result.direct = direct; }
+      // ReSTIR GI: capture the secondary surface (bounce-1 hit on the diffuse path)
+      if bounce == 1u && !gi_captured {
+        gi_pos_l = hit_pos;
+        gi_nrm_l = normal;
+        gi_captured = true;
+      }
       // SHaRC backpropagation with direction (for path guiding)
       if bounce > 0u && sharc_count < 4u {
         sharc_pos[sharc_count] = hit_pos;
@@ -2240,12 +2265,15 @@ fn path_trace(primary_origin: vec3f, primary_dir: vec3f) -> PathResult {
       let diffuse_scale = max((1.0 - metallic) * (1.0 - glass_transmission), 0.0);
       if bounce == 0u && !went_through_glass {
         throughput *= vec3f(diffuse_scale / p_diff);
+        gi_pdw = diffuse_scale / p_diff;       // ReSTIR GI: primary lobe weight
+        gi_dscale_l = diffuse_scale;
       } else {
         throughput *= base_color * diffuse_scale / p_diff;
       }
       if bounce == 0u { is_diffuse_path = true; }
       specular_bounce = false;
       last_bsdf_pdf = p_diff * max(dot(dir, normal), 0.0) * INV_PI; // cosine hemisphere PDF × selection prob
+      if bounce == 0u && gi_pdw > 0.0 { gi_src_pdf_l = last_bsdf_pdf; }
     }
 
     origin = ray_offset(hit_pos, normal);
@@ -2264,10 +2292,20 @@ fn path_trace(primary_origin: vec3f, primary_dir: vec3f) -> PathResult {
       if rand() > p { break; }
       throughput /= p;
     }
+    if bounce == 0u { diff_b0 = diff_rad; }   // ReSTIR GI: snapshot before indirect starts
     bounce += 1u;
   }
   result.diffuse = diff_rad;
   result.specular = spec_rad;
+  // ReSTIR GI export: own indirect (exact, for replacement) + secondary sample.
+  let gi_v = gi_captured && gi_pdw > 1.0e-6;
+  result.gi_valid = select(0u, 1u, gi_v);
+  result.gi_pos = gi_pos_l;
+  result.gi_nrm = gi_nrm_l;
+  result.gi_src_pdf = gi_src_pdf_l;
+  result.gi_dscale = gi_dscale_l;
+  result.gi_own = select(vec3f(0.0), max(diff_rad - diff_b0, vec3f(0.0)), gi_v);
+  result.gi_rad = select(vec3f(0.0), result.gi_own / max(gi_pdw, 1.0e-6), gi_v);
   result.sharc_pos = sharc_pos;
   result.sharc_nrm = sharc_nrm;
   result.sharc_rad = sharc_rad;
@@ -2431,51 +2469,80 @@ fn main(@builtin(global_invocation_id) gid: vec3u) {
     }
   }
 
-  // === ReSTIR GI: temporal radiance reuse ===
+  // === ReSTIR GI: temporal radiance reuse (RTXDI/Kajiya-style estimator) ===
+  // The reservoir stores the SECONDARY-surface sample: its position/normal and
+  // the incident radiance estimate from it (demodulated-diffuse domain). The
+  // resampled estimate REPLACES the path's own indirect diffuse (no 0.3 nerf),
+  // confidence-blended by M. The stored weight_sum slot holds the unbiased
+  // contribution weight W (Kajiya convention) so temporal merges are correct.
   if uniforms.restir_enabled > 0u && pt.depth < 1e5 {
-    // Build current reservoir from bounce-1 sample
     var reservoir = empty_reservoir();
-    if pt.hit_dist < 1e3 {
-      var gi_sample = empty_reservoir();
-      gi_sample.radiance = diff_color;
-      gi_sample.position = pt.hit_pos;
-      gi_sample.normal = pt.normal;
-      gi_sample.hit_dist = pt.hit_dist;
-      gi_sample.age = 0.0;
-      let p_hat = gi_target_pdf(pt.normal, pt.hit_pos, gi_sample);
-      if p_hat > 0.0 { reservoir_update(&reservoir, gi_sample, p_hat); }
+    let gi_ok = pt.gi_valid > 0u && pt.gi_src_pdf > 1.0e-6;
+
+    // Initial sample: RIS weight = target_pdf / source_pdf
+    if gi_ok {
+      var s = empty_reservoir();
+      s.radiance = pt.gi_rad;
+      s.position = pt.gi_pos;     // secondary surface (NOT the primary hit)
+      s.normal = pt.gi_nrm;
+      s.hit_dist = pt.hit_dist;
+      s.age = 0.0;
+      let p_hat = gi_target_pdf(pt.normal, pt.hit_pos, s);
+      if p_hat > 0.0 { reservoir_update(&reservoir, s, p_hat / pt.gi_src_pdf); }
     }
 
-    // Temporal reuse: reproject to previous frame, merge reservoir
+    // Temporal merge: reproject the primary point, pull previous reservoir.
+    // A stale/behind-surface sample re-evaluates to p_hat = 0 and self-rejects.
     if uniforms.frame_seed > 0u {
       let prev_uv = restir_reproject(pt.hit_pos);
       if prev_uv.x >= 0.0 && prev_uv.x < 1.0 && prev_uv.y >= 0.0 && prev_uv.y < 1.0 {
         let prev_px = vec2i(vec2f(prev_uv.x * uniforms.resolution.x, prev_uv.y * uniforms.resolution.y));
         let prev_idx = u32(prev_px.y) * res.x + u32(prev_px.x);
         var prev = read_reservoir_prev(prev_idx);
+        if prev.age < 30.0 && prev.M >= 1.0 {
+          prev.M = min(prev.M, 20.0);
+          let p_hat_prev = gi_target_pdf(pt.normal, pt.hit_pos, prev);
+          if p_hat_prev > 0.0 {
+            let prev_W = prev.weight_sum;   // stored contribution weight W
+            let old_M = reservoir.M;
+            reservoir_update(&reservoir, prev, p_hat_prev * prev_W * prev.M);
+            reservoir.M = old_M + prev.M;
+          }
+        }
 
-        // Validate: age < 20, normal similarity > 0.5
-        if prev.age < 20.0 && prev.M >= 1.0 && dot(pt.normal, prev.normal) > 0.5 {
-          prev.age += 1.0;
-          prev.M = min(prev.M, 20.0); // clamp M to prevent weight explosion
-          let prev_pdf = gi_target_pdf(pt.normal, pt.hit_pos, prev);
-          reservoir_merge(&reservoir, prev, prev_pdf);
+        // NOTE: fused spatial reuse was tried here and REVERTED — without the
+        // neighbour's primary-surface data the reuse Jacobian can't be evaluated
+        // properly, and the distance-band approximation produced visibly biased
+        // indirect lighting. A correct spatial pass needs a separate-pass design
+        // with a previous-frame G-buffer (see RTXDI SpatialResampling).
+      }
+    }
+
+    // Finalize contribution weight W, shade, replace own indirect
+    var W_store = 0.0;
+    if reservoir.M > 0.0 && reservoir.weight_sum > 0.0 {
+      let p_sel = gi_target_pdf(pt.normal, pt.hit_pos, reservoir);
+      if p_sel > 1.0e-6 {
+        let W = reservoir.weight_sum / (reservoir.M * p_sel);
+        W_store = W;
+        if gi_ok {
+          let dirS = normalize(reservoir.position - pt.hit_pos);
+          let cosS = max(dot(pt.normal, dirS), 0.0);
+          let gi_est = reservoir.radiance * (pt.gi_dscale * INV_PI) * cosS * W;
+          // M=1 reproduces the path's own sample exactly (identity); the blend
+          // only guards the first frames of history build-up.
+          let blend = clamp(reservoir.M / 8.0, 0.0, 1.0);
+          diff_color = max(diff_color - pt.gi_own * blend, vec3f(0.0))
+                     + clamp_contribution(gi_est, CLAMP_INDIRECT) * blend;
         }
       }
     }
 
-    // Apply reused GI to diffuse radiance
-    if reservoir.weight_sum > 0.0 && reservoir.M > 0.0 {
-      let final_pdf = gi_target_pdf(pt.normal, pt.hit_pos, reservoir);
-      if final_pdf > 0.0 {
-        let W = reservoir.weight_sum / (reservoir.M * final_pdf);
-        let reused_gi = reservoir.radiance * final_pdf * W;
-        let blend = clamp(reservoir.M / 10.0, 0.0, 0.5);
-        diff_color = mix(diff_color, diff_color + reused_gi * 0.3, blend);
-      }
-    }
-
-    write_reservoir(idx, reservoir);
+    var out_r = reservoir;
+    out_r.weight_sum = W_store;             // store W, not wsum (merge convention)
+    out_r.M = min(reservoir.M, 20.0);
+    out_r.age = reservoir.age + 1.0;
+    write_reservoir(idx, out_r);
   } else if uniforms.restir_enabled > 0u {
     // Sky pixel: write empty reservoir
     write_reservoir(idx, empty_reservoir());

@@ -132,7 +132,10 @@ fn pre_accumulate(@builtin(global_invocation_id) gid: vec3u) {
 
   let nd = textureLoad(in_nd, px, 0);
   let cz = nd.w;
-  let cur = textureLoad(in_diff, px, 0).rgb;
+  // Firefly-clamped read: with the 0.2 alpha floor a raw GI firefly would inject
+  // 20% of its energy into the accumulation instantly (even when still) and then
+  // decay slowly under the loose ghost gate -> wandering bright blobs.
+  let cur = read_diff_clamped(px, sz);
   if cz >= SKY_Z {
     textureStore(hist_out, px, vec4f(cur, 0.0));
     return;
