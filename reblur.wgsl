@@ -121,7 +121,7 @@ struct ReblurParams {
 @group(1) @binding(0) var history_diff: texture_2d<f32>;
 @group(1) @binding(1) var history_spec: texture_2d<f32>;
 @group(1) @binding(2) var linear_clamp: sampler;
-@group(1) @binding(3) var in_mv: texture_2d<f32>;                 // motion vectors (depth_tex reused)
+@group(1) @binding(3) var in_mv: texture_2d<f32>;                 // UNUSED layout placeholder (bound to normal tex, NOT real MVs — do not read)
 
 // Aliases for clarity in helper functions
 fn read_viewz(px: vec2i) -> f32 { return textureLoad(in_normal_roughness, px, 0).w; }
@@ -590,40 +590,54 @@ fn prepass(@builtin(global_invocation_id) gid: vec3u) {
 
   // Poisson pre-filter (radius = prepass blur radius, fixed nonLinear)
   let radius = gp.diff_prepass_blur_radius;
+  // Specular prepass radius shrinks with roughness — a flat mirror has uniform
+  // normal/depth, so geometry weights alone would fully blur its reflection.
+  let smc = get_spec_magic_curve(read_roughness(px));
+  let radius_s = radius * smc;
   let a = fract(f32((u32(px.x) & 3u) * 4u + (u32(px.y) & 3u)) / 16.0 + f32(gp.frame_index % 16u) / 16.0) * 6.2832;
   let rc = cos(a); let rs = sin(a);
 
   var d_sum = d_out;
   var s_sum = s_out;
-  var w_sum = 1.0;
+  var d_wsum = 1.0;
+  var s_wsum = 1.0;
 
   for (var i = 0u; i < 8u; i++) {
     let tap = POISSON8[i];
     let ox = tap.x * rc - tap.y * rs;
     let oy = tap.x * rs + tap.y * rc;
-    let sp = clamp(px + vec2i(vec2f(ox, oy) * radius + 0.5), vec2i(0), sz - 1);
-    let sn = read_normal(sp);
-    let sz2 = read_viewz(sp);
     let gauss = exp(-0.66 * tap.z * tap.z);
-    let wn = pow(max(dot(cn, sn), 0.0), 16.0); // soft for prepass
-    let wz = exp(-abs(cz - sz2) / (gz * max(radius, 1.0) + 0.01));
+
+    // --- Diffuse tap ---
+    // round(): vec2i() truncates toward zero, which would bias negative taps inward
+    let sp = clamp(px + vec2i(round(vec2f(ox, oy) * radius)), vec2i(0), sz - 1);
+    let nr = textureLoad(in_normal_roughness, sp, 0); // normal.xyz + viewZ.w in one load
+    let wn = pow(max(dot(cn, nr.xyz), 0.0), 16.0); // soft for prepass
+    let wz = exp(-abs(cz - nr.w) / (gz * max(radius, 1.0) + 0.01));
     let w = gauss * wn * wz;
 
-    // Clamp neighbors too
     var sd = textureLoad(in_diff, sp, 0).rgb;
     let sdl = luma(sd);
     if sdl > d_max && sdl > 0.005 { sd *= d_max / sdl; }
-    var ss = textureLoad(in_spec, sp, 0).rgb;
+    d_sum += sd * w;
+    d_wsum += w;
+
+    // --- Specular tap (roughness-scaled radius) ---
+    let sp_s = clamp(px + vec2i(round(vec2f(ox, oy) * radius_s)), vec2i(0), sz - 1);
+    let nr_s = textureLoad(in_normal_roughness, sp_s, 0);
+    let wn_s = pow(max(dot(cn, nr_s.xyz), 0.0), mix(64.0, 16.0, smc));
+    let wz_s = exp(-abs(cz - nr_s.w) / (gz * max(radius_s, 1.0) + 0.01));
+    let w_s = gauss * wn_s * wz_s;
+
+    var ss = textureLoad(in_spec, sp_s, 0).rgb;
     let ssl = luma(ss);
     if ssl > s_max && ssl > 0.005 { ss *= s_max / ssl; }
-
-    d_sum += sd * w;
-    s_sum += ss * w;
-    w_sum += w;
+    s_sum += ss * w_s;
+    s_wsum += w_s;
   }
 
-  textureStore(out_diff, px, vec4f(d_sum / w_sum, 1.0));
-  textureStore(out_spec, px, vec4f(s_sum / w_sum, cs.w));
+  textureStore(out_diff, px, vec4f(d_sum / d_wsum, 1.0));
+  textureStore(out_spec, px, vec4f(s_sum / s_wsum, cs.w));
 }
 
 // ============================================================
@@ -854,38 +868,55 @@ fn blur(@builtin(global_invocation_id) gid: vec3u) {
   let cn = read_normal(px);
   let cz = viewZ;
   let gz = max(cz * 0.01, 0.1);
-  let history_len = textureLoad(in_diff, px, 0).w;
+  let diff_c = textureLoad(in_diff, px, 0);
+  let spec_c = textureLoad(in_spec, px, 0);
+  let history_len = diff_c.w;
   let accumSpeed = max(history_len, 0.0);
   let nonLinear = 1.0 / (1.0 + accumSpeed);
   let radius = max(gp.max_blur_radius * sqrt(nonLinear), gp.min_blur_radius);
+  // Specular radius shrinks with roughness (NRD specMagicCurve): mirrors keep sharp reflections
+  let roughness = read_roughness(px);
+  let smc = get_spec_magic_curve(roughness);
+  let radius_s = radius * smc;
 
   // Per-pixel rotation
   let bayer = fract(f32((u32(px.x) & 3u) * 4u + (u32(px.y) & 3u)) / 16.0 + f32(gp.frame_index % 16u) / 16.0);
   let a = bayer * 6.2832;
   let rc = cos(a); let rs = sin(a);
 
-  var d_sum = textureLoad(in_diff, px, 0).rgb;
-  var s_sum = textureLoad(in_spec, px, 0).rgb;
-  var w_sum = 1.0;
+  var d_sum = diff_c.rgb;
+  var s_sum = spec_c.rgb;
+  var d_wsum = 1.0;
+  var s_wsum = 1.0;
 
   for (var i = 0u; i < 8u; i++) {
     let tap = POISSON8[i];
     let ox = tap.x * rc - tap.y * rs;
     let oy = tap.x * rs + tap.y * rc;
-    let sp = clamp(px + vec2i(vec2f(ox, oy) * radius + 0.5), vec2i(0), sz - 1);
-    let sn = read_normal(sp);
-    let sz2 = read_viewz(sp);
     let gauss = exp(-0.66 * tap.z * tap.z);
-    let wn = pow(max(dot(cn, sn), 0.0), 32.0);
-    let wz = exp(-abs(cz - sz2) / (gz * max(radius, 1.0) + 0.01));
+
+    // --- Diffuse tap ---
+    // round(): vec2i() truncates toward zero, which would bias negative taps inward
+    let sp = clamp(px + vec2i(round(vec2f(ox, oy) * radius)), vec2i(0), sz - 1);
+    let nr = textureLoad(in_normal_roughness, sp, 0); // normal.xyz + viewZ.w in one load
+    let wn = pow(max(dot(cn, nr.xyz), 0.0), 32.0);
+    let wz = exp(-abs(cz - nr.w) / (gz * max(radius, 1.0) + 0.01));
     let w = gauss * wn * wz;
     d_sum += textureLoad(in_diff, sp, 0).rgb * w;
-    s_sum += textureLoad(in_spec, sp, 0).rgb * w;
-    w_sum += w;
+    d_wsum += w;
+
+    // --- Specular tap (roughness-scaled radius, lobe-aware normal weight) ---
+    let sp_s = clamp(px + vec2i(round(vec2f(ox, oy) * radius_s)), vec2i(0), sz - 1);
+    let nr_s = textureLoad(in_normal_roughness, sp_s, 0);
+    let wn_s = pow(max(dot(cn, nr_s.xyz), 0.0), mix(128.0, 32.0, smc));
+    let wz_s = exp(-abs(cz - nr_s.w) / (gz * max(radius_s, 1.0) + 0.01));
+    let w_s = gauss * wn_s * wz_s;
+    s_sum += textureLoad(in_spec, sp_s, 0).rgb * w_s;
+    s_wsum += w_s;
   }
 
-  textureStore(out_diff, px, vec4f(d_sum / w_sum, history_len));
-  textureStore(out_spec, px, vec4f(s_sum / w_sum, textureLoad(in_spec, px, 0).w));
+  textureStore(out_diff, px, vec4f(d_sum / d_wsum, history_len));
+  textureStore(out_spec, px, vec4f(s_sum / s_wsum, spec_c.w));
 }
 
 // ============================================================
@@ -903,37 +934,53 @@ fn post_blur(@builtin(global_invocation_id) gid: vec3u) {
   let cn2 = read_normal(px);
   let cz2 = viewZ;
   let gz2 = max(cz2 * 0.01, 0.1);
-  let hl2 = textureLoad(in_diff, px, 0).w;
+  let diff_c2 = textureLoad(in_diff, px, 0);
+  let spec_c2 = textureLoad(in_spec, px, 0);
+  let hl2 = diff_c2.w;
   let accumSpeed2 = max(hl2, 0.0);
   let nonLinear2 = 1.0 / (1.0 + accumSpeed2);
   let radius2 = max(gp.max_blur_radius * REBLUR_POST_BLUR_RADIUS_SCALE * sqrt(nonLinear2), gp.min_blur_radius);
+  // Specular radius shrinks with roughness (NRD specMagicCurve)
+  let roughness2 = read_roughness(px);
+  let smc2 = get_spec_magic_curve(roughness2);
+  let radius2_s = radius2 * smc2;
 
   let bayer2 = fract(f32((u32(px.x) & 3u) * 4u + (u32(px.y) & 3u)) / 16.0 + f32((gp.frame_index + 8u) % 16u) / 16.0);
   let a2 = bayer2 * 6.2832;
   let rc2 = cos(a2); let rs2 = sin(a2);
 
-  var d_sum2 = textureLoad(in_diff, px, 0).rgb;
-  var s_sum2 = textureLoad(in_spec, px, 0).rgb;
-  var w_sum2 = 1.0;
+  var d_sum2 = diff_c2.rgb;
+  var s_sum2 = spec_c2.rgb;
+  var d_wsum2 = 1.0;
+  var s_wsum2 = 1.0;
 
   for (var i = 0u; i < 8u; i++) {
     let tap = POISSON8[i];
     let ox2 = tap.x * rc2 - tap.y * rs2;
     let oy2 = tap.x * rs2 + tap.y * rc2;
-    let sp2 = clamp(px + vec2i(vec2f(ox2, oy2) * radius2 + 0.5), vec2i(0), sz - 1);
-    let sn2 = read_normal(sp2);
-    let sz3 = read_viewz(sp2);
     let gauss2 = exp(-0.66 * tap.z * tap.z);
-    let wn2 = pow(max(dot(cn2, sn2), 0.0), 64.0); // tighter for postblur
-    let wz2 = exp(-abs(cz2 - sz3) / (gz2 * max(radius2, 1.0) + 0.01));
+
+    // --- Diffuse tap ---
+    let sp2 = clamp(px + vec2i(round(vec2f(ox2, oy2) * radius2)), vec2i(0), sz - 1);
+    let nr2 = textureLoad(in_normal_roughness, sp2, 0); // normal.xyz + viewZ.w in one load
+    let wn2 = pow(max(dot(cn2, nr2.xyz), 0.0), 64.0); // tighter for postblur
+    let wz2 = exp(-abs(cz2 - nr2.w) / (gz2 * max(radius2, 1.0) + 0.01));
     let w2 = gauss2 * wn2 * wz2;
     d_sum2 += textureLoad(in_diff, sp2, 0).rgb * w2;
-    s_sum2 += textureLoad(in_spec, sp2, 0).rgb * w2;
-    w_sum2 += w2;
+    d_wsum2 += w2;
+
+    // --- Specular tap (roughness-scaled radius, lobe-aware normal weight) ---
+    let sp2_s = clamp(px + vec2i(round(vec2f(ox2, oy2) * radius2_s)), vec2i(0), sz - 1);
+    let nr2_s = textureLoad(in_normal_roughness, sp2_s, 0);
+    let wn2_s = pow(max(dot(cn2, nr2_s.xyz), 0.0), mix(160.0, 64.0, smc2));
+    let wz2_s = exp(-abs(cz2 - nr2_s.w) / (gz2 * max(radius2_s, 1.0) + 0.01));
+    let w2_s = gauss2 * wn2_s * wz2_s;
+    s_sum2 += textureLoad(in_spec, sp2_s, 0).rgb * w2_s;
+    s_wsum2 += w2_s;
   }
 
-  textureStore(out_diff, px, vec4f(d_sum2 / w_sum2, hl2));
-  textureStore(out_spec, px, vec4f(s_sum2 / w_sum2, textureLoad(in_spec, px, 0).w));
+  textureStore(out_diff, px, vec4f(d_sum2 / d_wsum2, hl2));
+  textureStore(out_spec, px, vec4f(s_sum2 / s_wsum2, spec_c2.w));
 }
 
 // ============================================================
@@ -994,8 +1041,9 @@ fn temporal_stabilization(@builtin(global_invocation_id) gid: vec3u) {
   let pixelUv = (vec2f(px) + 0.5) * gp.rect_size_inv;
   let Xv = reconstruct_view_pos(pixelUv, viewZ);
   let X = rotate_vector_m(gp.view_to_world, Xv);
-  let mv = textureLoad(in_mv, px, 0).xyz;
-  let Xprev = X + mv;
+  // Static scene: no object motion vectors (in_mv is bound to the normal
+  // texture as a layout placeholder — reading it as MV corrupted reprojection).
+  let Xprev = X;
   let smbPixelUv = project_to_screen(gp.world_to_clip_prev, Xprev);
 
   var diff_hist_luma = diff_luma;

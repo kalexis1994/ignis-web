@@ -111,8 +111,9 @@ fn atrous(@builtin(global_invocation_id) gid: vec3u) {
   let cz = cnd.w;
   let diff_sample = textureLoad(in_color, px, 0);
   let cc = diff_sample.rgb;
-  let cs = textureLoad(in_spec, px, 0).rgb;
-  let hit_dist = textureLoad(in_spec, px, 0).a;
+  let spec_sample = textureLoad(in_spec, px, 0);
+  let cs = spec_sample.rgb;
+  let hit_dist = spec_sample.a; // SPECULAR hitT — must not influence the diffuse filter
   let roughness = textureLoad(albedo_tex, px, 0).a;
 
   // === Adaptive blur radius (ReBLUR core idea) ===
@@ -123,9 +124,11 @@ fn atrous(@builtin(global_invocation_id) gid: vec3u) {
   // Blur radius: large when new, small when converged
   // ReBLUR: blurRadius = radiusScale * sqrt(hitDistFactor * nonLinearAccumSpeed) * maxBlurRadius
   let maxBlurRadius = 20.0;
+  // hitFactor comes from the SPECULAR hit distance → only valid for the specular radius.
+  // The diffuse radius must not shrink where a nearby reflection happens to exist.
   let hitFactor = clamp(hit_dist, 0.1, 1.0);
   let smc = sqrt(max(roughness, 0.01)); // specMagicCurve approximation
-  let diffRadius = radiusScale * maxBlurRadius * sqrt(hitFactor * nonLinearAccumSpeed);
+  let diffRadius = radiusScale * maxBlurRadius * sqrt(nonLinearAccumSpeed);
   let specRadius = radiusScale * maxBlurRadius * sqrt(hitFactor * nonLinearAccumSpeed) * smc;
 
   // Minimum radius
@@ -154,8 +157,9 @@ fn atrous(@builtin(global_invocation_id) gid: vec3u) {
     // Rotate and scale offset by blur radius
     let ox = tap.x * rot_cos - tap.y * rot_sin;
     let oy = tap.x * rot_sin + tap.y * rot_cos;
-    let d_offset = vec2i(vec2f(ox, oy) * diff_blur_r + 0.5);
-    let s_offset = vec2i(vec2f(ox, oy) * spec_blur_r + 0.5);
+    // round(): vec2i() truncates toward zero, which would bias negative taps inward
+    let d_offset = vec2i(round(vec2f(ox, oy) * diff_blur_r));
+    let s_offset = vec2i(round(vec2f(ox, oy) * spec_blur_r));
 
     // Gaussian weight from Poisson radius
     let gauss_w = exp(-0.66 * tap.z * tap.z);
@@ -176,10 +180,9 @@ fn atrous(@builtin(global_invocation_id) gid: vec3u) {
     let d_lum_diff = abs(luma(cc) - luma(d_col));
     let d_lum_tol = max(luma(cc), 0.1) * (1.5 - tap.z);
     let d_wl = exp(-d_lum_diff * d_lum_diff / (d_lum_tol * d_lum_tol + 0.01));
-    // Hit distance weight (ReBLUR): preserves contact shadows
-    let d_hd = abs(hit_dist - textureLoad(in_spec, dp, 0).a);
-    let d_wh = exp(-d_hd * d_hd * 4.0 / max(nonLinearAccumSpeed, 0.01));
-    let d_w = gauss_w * d_wn * d_wz * d_wl * d_wh;
+    // NOTE: no hit-distance weight for diffuse — the only hitT available here is the
+    // SPECULAR one (in_spec.a), which is unrelated to the diffuse signal.
+    let d_w = gauss_w * d_wn * d_wz * d_wl;
 
     d_sum += d_col * d_w;
     d_wsum += d_w;
@@ -333,11 +336,11 @@ fn preblur(@builtin(global_invocation_id) gid: vec3u) {
   }
   let d_mean = d_m1 / 9.0;
   let d_std = sqrt(max(d_m2 / 9.0 - d_mean * d_mean, 0.0));
-  let d_max_lum = d_mean + 1.5 * d_std + 0.05;
+  let d_max_lum = d_mean + 3.0 * d_std + 0.05;
 
   let s_mean = s_m1 / 9.0;
   let s_std = sqrt(max(s_m2 / 9.0 - s_mean * s_mean, 0.0));
-  let s_max_lum = s_mean + 1.5 * s_std + 0.05;
+  let s_max_lum = s_mean + 3.0 * s_std + 0.05;
 
   // Anti-firefly clamp
   let cl_raw = luma(cc_raw);
@@ -351,7 +354,11 @@ fn preblur(@builtin(global_invocation_id) gid: vec3u) {
   // Large spatial filter BEFORE temporal → gives temporal a cleaner base on frame 1
   // Uses geometry-only weights (normal + depth plane) — no shadow bleeding
   let frustumSize = max(cz * 0.01, 0.01);
-  let prepassRadius = 15.0;
+  // Radius shrinks as the camera holds still: a wide prepass gives temporal a
+  // clean base on frame 1, but keeping it wide forever bakes permanent blur into
+  // the converged history. Ramp 15px (moving) → 3px (long-still) to recover detail.
+  let pre_t = 4.0 / (4.0 + params.frames_still);
+  let prepassRadius = mix(3.0, 15.0, pre_t);
   let pre_angle = f32(u32(params.frames_still * 73.0) % 256u) * (6.2832 / 256.0);
   let pre_cos = cos(pre_angle);
   let pre_sin = sin(pre_angle);
@@ -364,7 +371,7 @@ fn preblur(@builtin(global_invocation_id) gid: vec3u) {
     let tap = POISSON[i];
     let ox = tap.x * pre_cos - tap.y * pre_sin;
     let oy = tap.x * pre_sin + tap.y * pre_cos;
-    let offset = vec2i(vec2f(ox, oy) * prepassRadius + 0.5);
+    let offset = vec2i(round(vec2f(ox, oy) * prepassRadius));
     let sp = clamp(px + offset, vec2i(0), sz - 1);
 
     let snd = textureLoad(gbuf_nd, sp, 0);
@@ -445,10 +452,10 @@ fn preblur_sm(@builtin(global_invocation_id) gid: vec3u,
   }
   let d_mean = d_m1 / 9.0;
   let d_std = sqrt(max(d_m2 / 9.0 - d_mean * d_mean, 0.0));
-  let d_max_lum = d_mean + 1.5 * d_std + 0.05;
+  let d_max_lum = d_mean + 3.0 * d_std + 0.05;
   let s_mean = s_m1 / 9.0;
   let s_std = sqrt(max(s_m2 / 9.0 - s_mean * s_mean, 0.0));
-  let s_max_lum = s_mean + 1.5 * s_std + 0.05;
+  let s_max_lum = s_mean + 3.0 * s_std + 0.05;
 
   // Anti-firefly clamp
   let cl_raw = luma(cc_raw);
@@ -461,6 +468,9 @@ fn preblur_sm(@builtin(global_invocation_id) gid: vec3u,
   // === ReBLUR PrePass: 8-tap Poisson blur ===
   // Can't use shared memory here (radius=15 exceeds ±1 halo), so textureLoad directly
   let frustumSize_pb = max(cz * 0.01, 0.01);
+  // Ramp 15px (moving) → 3px (long-still) to avoid permanent blur in converged history
+  let pre_t_sm = 4.0 / (4.0 + params.frames_still);
+  let prepassRadius_sm = mix(3.0, 15.0, pre_t_sm);
   let pre_angle_sm = f32(u32(params.frames_still * 73.0) % 256u) * (6.2832 / 256.0);
   let pre_cos_sm = cos(pre_angle_sm);
   let pre_sin_sm = sin(pre_angle_sm);
@@ -473,7 +483,7 @@ fn preblur_sm(@builtin(global_invocation_id) gid: vec3u,
     let tap = POISSON[i];
     let ox = tap.x * pre_cos_sm - tap.y * pre_sin_sm;
     let oy = tap.x * pre_sin_sm + tap.y * pre_cos_sm;
-    let offset = vec2i(vec2f(ox, oy) * 15.0 + 0.5);
+    let offset = vec2i(round(vec2f(ox, oy) * prepassRadius_sm));
     let sp = clamp(px + offset, vec2i(0), sz - 1);
 
     let snd = textureLoad(gbuf_nd, sp, 0);
@@ -591,32 +601,62 @@ fn tonemap_standard(v: vec3f) -> vec3f {
   return clamp(v, vec3f(0.0), vec3f(1.0));
 }
 
+// Workgroup-local accumulators for auto-exposure: reduce 256 threads to a
+// single pair of global atomicAdds per workgroup (was 2 global atomics PER
+// pixel — a serialization hotspot on Adreno's contended global atomics).
+var<workgroup> wg_logLum_sum: atomic<u32>;
+var<workgroup> wg_lum_count: atomic<u32>;
+
 @compute @workgroup_size(16, 16)
-fn composite(@builtin(global_invocation_id) gid: vec3u) {
+fn composite(@builtin(global_invocation_id) gid: vec3u,
+             @builtin(local_invocation_index) lidx: u32) {
   let px = vec2i(gid.xy);
   let sz = vec2i(params.resolution);
-  if px.x >= sz.x || px.y >= sz.y { return; }
+  let valid = px.x < sz.x && px.y < sz.y;
 
-  let denoised_diff = textureLoad(in_color, px, 0).rgb;
-  let denoised_spec = textureLoad(in_spec, px, 0).rgb;
-  let albedo = textureLoad(albedo_tex, px, 0).rgb;
+  // Init workgroup accumulators (WebGPU zero-inits workgroup memory, but be explicit)
+  if lidx == 0u {
+    atomicStore(&wg_logLum_sum, 0u);
+    atomicStore(&wg_lum_count, 0u);
+  }
+  workgroupBarrier();
 
-  // Remodulate: albedo × diffuse_irradiance + specular_radiance
-  // When step_size < 0 (OIDN mode), diffuse IS the full denoised beauty pass — skip remodulation
-  var hdr: vec3f;
-  if params.step_size < 0.0 {
-    hdr = denoised_diff; // OIDN: already combined beauty pass
-  } else {
-    hdr = albedo * denoised_diff + denoised_spec;
+  var hdr = vec3f(0.0);
+  var albedo = vec3f(0.0);
+  if valid {
+    let denoised_diff = textureLoad(in_color, px, 0).rgb;
+    let denoised_spec = textureLoad(in_spec, px, 0).rgb;
+    albedo = textureLoad(albedo_tex, px, 0).rgb;
+
+    // Remodulate: albedo × diffuse_irradiance + specular_radiance
+    // When step_size < 0 (OIDN mode), diffuse IS the full denoised beauty pass — skip remodulation
+    if params.step_size < 0.0 {
+      hdr = denoised_diff; // OIDN: already combined beauty pass
+    } else {
+      hdr = albedo * denoised_diff + denoised_spec;
+    }
+
+    // Auto-exposure: accumulate into WORKGROUP memory (cheap, uncontended)
+    let lum = dot(hdr, vec3f(0.2126, 0.7152, 0.0722));
+    if lum > 0.001 && lum < 100.0 {
+      let logLum = log2(lum) + 20.0;
+      atomicAdd(&wg_logLum_sum, u32(logLum * 16.0));
+      atomicAdd(&wg_lum_count, 1u);
+    }
   }
 
-  // Auto-exposure: accumulate log2-luminance, excluding extreme outliers (sun disc)
-  let lum = dot(hdr, vec3f(0.2126, 0.7152, 0.0722));
-  if lum > 0.001 && lum < 100.0 {
-    let logLum = log2(lum) + 20.0;
-    atomicAdd(&exposure_buf[0], u32(logLum * 16.0));
-    atomicAdd(&exposure_buf[1], 1u);
+  // One global atomicAdd per workgroup instead of one per pixel (256× fewer)
+  workgroupBarrier();
+  if lidx == 0u {
+    let s = atomicLoad(&wg_logLum_sum);
+    let c = atomicLoad(&wg_lum_count);
+    if c > 0u {
+      atomicAdd(&exposure_buf[0], s);
+      atomicAdd(&exposure_buf[1], c);
+    }
   }
+
+  if !valid { return; }
 
   // 1. Exposure (pre-tonemap)
   hdr *= params.exposure;

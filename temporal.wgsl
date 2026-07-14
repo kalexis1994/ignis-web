@@ -242,29 +242,33 @@ fn temporal(@builtin(global_invocation_id) gid: vec3u) {
       let effective_max = mix(8.0, params.max_history, clamp(params.frames_still / 32.0, 0.0, 1.0));
       history_len = min(diff_hist_s.a + 1.0, effective_max);
 
-      // AABB ghosting rejection: only during motion (history < 32 frames)
-      // When still, skip AABB to preserve converged illumination
+      // AABB ghost/lag rejection — stays active even when converged, but the box
+      // WIDENS with history. Tight while moving (rejects reprojection ghosts);
+      // very loose once converged, so it only catches GROSS lighting changes (a
+      // light toggling, a shadow appearing) that would otherwise be stuck behind
+      // the alpha floor for ~2 s. The 4× expansion keeps it well above the 1-spp
+      // noise range, so converged detail is never clamped (no reintroduced jitter).
       var diff_hist = diff_hist_s.rgb;
       var spec_hist = spec_hist_s.rgb;
-      if history_len < 32.0 {
-        // Compute 3x3 AABB from current noisy input
-        var d_mn = diff_cur; var d_mx = diff_cur;
-        var s_mn = spec_cur; var s_mx = spec_cur;
-        for (var dy = -1; dy <= 1; dy++) {
-          for (var dx = -1; dx <= 1; dx++) {
-            let sp = clamp(px + vec2i(dx, dy), vec2i(0), sz - 1);
-            let sd = textureLoad(current_hdr, sp, 0).rgb;
-            let ss = textureLoad(current_spec, sp, 0).rgb;
-            d_mn = min(d_mn, sd); d_mx = max(d_mx, sd);
-            s_mn = min(s_mn, ss); s_mx = max(s_mx, ss);
-          }
+      // Compute 3x3 AABB from current noisy input
+      var d_mn = diff_cur; var d_mx = diff_cur;
+      var s_mn = spec_cur; var s_mx = spec_cur;
+      for (var dy = -1; dy <= 1; dy++) {
+        for (var dx = -1; dx <= 1; dx++) {
+          let sp = clamp(px + vec2i(dx, dy), vec2i(0), sz - 1);
+          let sd = textureLoad(current_hdr, sp, 0).rgb;
+          let ss = textureLoad(current_spec, sp, 0).rgb;
+          d_mn = min(d_mn, sd); d_mx = max(d_mx, sd);
+          s_mn = min(s_mn, ss); s_mx = max(s_mx, ss);
         }
-        // Expand AABB by 50% to tolerate noise while still rejecting ghosts
-        let d_expand = (d_mx - d_mn) * 0.5;
-        let s_expand = (s_mx - s_mn) * 0.5;
-        diff_hist = clip_aabb(d_mn - d_expand, d_mx + d_expand, diff_hist);
-        spec_hist = clip_aabb(s_mn - s_expand, s_mx + s_expand, spec_hist);
       }
+      // Expansion grows with history: 0.5× while moving → 4× when converged
+      let conv = clamp(history_len / 32.0, 0.0, 1.0);
+      let expand_k = mix(0.5, 4.0, conv);
+      let d_expand = (d_mx - d_mn) * expand_k;
+      let s_expand = (s_mx - s_mn) * expand_k;
+      diff_hist = clip_aabb(d_mn - d_expand, d_mx + d_expand, diff_hist);
+      spec_hist = clip_aabb(s_mn - s_expand, s_mx + s_expand, spec_hist);
 
       // AntiLag (ReBLUR): detect lighting change → reduce accumSpeed
       // Compare history luminance with current neighborhood mean
